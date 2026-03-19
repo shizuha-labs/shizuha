@@ -13,8 +13,8 @@ set -euo pipefail
 
 SHIZUHA_DIR="${SHIZUHA_DIR:-$HOME/.shizuha}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-VERSION="${SHIZUHA_VERSION:-0.1.0}"
-GITHUB_REPO="shizuha-labs/shizuha-rt"
+GITHUB_REPO="${SHIZUHA_REPO:-shizuha-labs/shizuha}"
+FALLBACK_VERSION="0.1.0"
 
 # ── Colors ───────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -192,10 +192,13 @@ exec node "$SHIZUHA_ROOT/lib/shizuha.js" "$@"
 WRAPPER
   chmod +x "$SHIZUHA_DIR/bin/shizuha"
 
-  # Store version
-  echo "$VERSION" > "$SHIZUHA_DIR/VERSION"
+  # Store version (read from package.json if available)
+  local src_version
+  src_version=$(node -e "console.log(require('$SOURCE_DIR/package.json').version)" 2>/dev/null || echo "$FALLBACK_VERSION")
+  echo "$src_version" > "$SHIZUHA_DIR/VERSION"
   echo "source" > "$SHIZUHA_DIR/INSTALL_MODE"
 
+  VERSION="$src_version"
   ok "Installed to $SHIZUHA_DIR"
 }
 
@@ -203,6 +206,22 @@ WRAPPER
 # MODE: BINARY — download prebuilt from GitHub
 # ════════════════════════════════════════════════════════════════════════
 install_from_binary() {
+  # Resolve version: user override > GitHub latest > fallback
+  if [ -n "${SHIZUHA_VERSION:-}" ]; then
+    VERSION="$SHIZUHA_VERSION"
+    info "Using specified version: v${VERSION}"
+  else
+    step "Checking latest version..."
+    VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
+      | grep '"tag_name"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/' || echo "")
+    if [ -z "$VERSION" ]; then
+      VERSION="$FALLBACK_VERSION"
+      warn "Could not detect latest version — using fallback v${VERSION}"
+    else
+      ok "Latest version: v${VERSION}"
+    fi
+  fi
+
   step "Downloading Shizuha Runtime v${VERSION}..."
 
   ARCHIVE_NAME="shizuha-${VERSION}-${TARGET}.tar.gz"
@@ -228,9 +247,14 @@ install_from_binary() {
   info "Extracting..."
   tar xzf "$TMPDIR_DL/$ARCHIVE_NAME" -C "$TMPDIR_DL"
 
+  # Try versioned directory first, then generic
   EXTRACTED_DIR="$TMPDIR_DL/shizuha-${VERSION}-${TARGET}"
   if [ ! -d "$EXTRACTED_DIR" ]; then
-    err "Archive format unexpected — missing directory ${EXTRACTED_DIR}"
+    # Some archives extract to a single top-level dir
+    EXTRACTED_DIR=$(find "$TMPDIR_DL" -maxdepth 1 -mindepth 1 -type d | head -1)
+  fi
+  if [ -z "$EXTRACTED_DIR" ] || [ ! -d "$EXTRACTED_DIR" ]; then
+    err "Archive format unexpected — no directory found after extraction"
     exit 1
   fi
 

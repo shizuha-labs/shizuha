@@ -1,0 +1,170 @@
+# Build and publish platform-specific release archives.
+#
+# Trigger: push a tag like v0.1.0
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Creates a GitHub Release with tarballs for:
+#   - linux-x64, linux-arm64, darwin-x64, darwin-arm64
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            node-arch: x64
+          - os: ubuntu-latest
+            target: linux-arm64
+            node-arch: arm64
+            cross: true
+          - os: macos-latest
+            target: darwin-arm64
+            node-arch: arm64
+          - os: macos-13
+            target: darwin-x64
+            node-arch: x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Set up QEMU for cross-compilation (linux-arm64 on x64 runner)
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.cross
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Package release archive
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          PLAT="${TARGET%-*}"
+          ARCH="${TARGET#*-}"
+          NODE_VERSION="22.14.0"
+          NAME="shizuha-${VERSION}-${TARGET}"
+
+          mkdir -p "release/${NAME}"/{bin,lib}
+
+          # Download Node.js for target platform
+          if [ "$PLAT" = "darwin" ]; then
+            EXT="tar.gz"
+            TAR_FLAG="xzf"
+          else
+            EXT="tar.xz"
+            TAR_FLAG="xJf"
+          fi
+          NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${PLAT}-${ARCH}.${EXT}"
+          echo "Downloading Node.js from ${NODE_URL}..."
+          curl -fSL "$NODE_URL" -o /tmp/node.tar
+          STRIP_DIR="node-v${NODE_VERSION}-${PLAT}-${ARCH}"
+          tar ${TAR_FLAG} /tmp/node.tar -C /tmp "${STRIP_DIR}/bin/node" "${STRIP_DIR}/bin/npm" "${STRIP_DIR}/bin/npx" "${STRIP_DIR}/lib/"
+          mv "/tmp/${STRIP_DIR}/bin/node" "release/${NAME}/bin/node"
+          mv "/tmp/${STRIP_DIR}/bin/npm" "release/${NAME}/bin/npm"
+          mv "/tmp/${STRIP_DIR}/bin/npx" "release/${NAME}/bin/npx"
+          cp -r "/tmp/${STRIP_DIR}/lib" "release/${NAME}/"
+
+          # Copy built JS bundle
+          cp dist/shizuha.js "release/${NAME}/lib/shizuha.js"
+
+          # Copy web dashboard
+          if [ -d dist/web ]; then
+            cp -r dist/web "release/${NAME}/lib/web"
+          fi
+
+          # Install production dependencies for target platform
+          cp package.json "release/${NAME}/lib/package.json"
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            docker run --rm --platform "linux/${ARCH}" \
+              -v "$(pwd)/release/${NAME}/lib:/build" -w /build \
+              node:${NODE_VERSION}-bookworm-slim \
+              sh -c "npm install --omit=dev --silent 2>&1 | tail -5"
+          else
+            (cd "release/${NAME}/lib" && PATH="$(pwd)/../bin:$PATH" npm install --omit=dev --silent 2>&1 | tail -5)
+          fi
+
+          # Create wrapper script
+          cat > "release/${NAME}/bin/shizuha" << 'WRAPPER'
+          #!/usr/bin/env bash
+          SHIZUHA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+          exec "$SHIZUHA_ROOT/bin/node" "$SHIZUHA_ROOT/lib/shizuha.js" "$@"
+          WRAPPER
+          chmod +x "release/${NAME}/bin/shizuha"
+
+          # Create self-installer
+          cat > "release/${NAME}/install" << 'INSTALLER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          SHIZUHA_DIR="${SHIZUHA_DIR:-$HOME/.shizuha}"
+          BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+          SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+          if [ "$SELF_DIR" != "$SHIZUHA_DIR" ]; then
+            mkdir -p "$SHIZUHA_DIR"
+            rm -rf "$SHIZUHA_DIR/bin" "$SHIZUHA_DIR/lib" "$SHIZUHA_DIR/dist" 2>/dev/null || true
+            cp -r "$SELF_DIR"/* "$SHIZUHA_DIR/"
+          fi
+          mkdir -p "$BIN_DIR"
+          cat > "$BIN_DIR/shizuha" << WRAPPER
+          #!/usr/bin/env bash
+          exec "$SHIZUHA_DIR/bin/shizuha" "\$@"
+          WRAPPER
+          chmod +x "$BIN_DIR/shizuha"
+          echo "Installed to $SHIZUHA_DIR"
+          INSTALLER
+          chmod +x "release/${NAME}/install"
+
+          # Version file
+          echo "$VERSION" > "release/${NAME}/VERSION"
+
+          # Create tarball
+          (cd release && tar czf "${NAME}.tar.gz" "${NAME}")
+          echo "archive=release/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "Built ${NAME}.tar.gz ($(du -sh "release/${NAME}.tar.gz" | cut -f1))"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: release/shizuha-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
