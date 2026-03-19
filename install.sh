@@ -315,11 +315,13 @@ fi
 # ── Set up PATH ─────────────────────────────────────────────────────────
 step "Configuring PATH..."
 
-# Create symlink in BIN_DIR
+# Create wrapper in BIN_DIR (not a symlink — symlinks break dirname resolution)
 mkdir -p "$BIN_DIR"
-if [ ! -f "$BIN_DIR/shizuha" ] || [ "$BIN_DIR/shizuha" -ot "$SHIZUHA_DIR/bin/shizuha" ]; then
-  ln -sf "$SHIZUHA_DIR/bin/shizuha" "$BIN_DIR/shizuha"
-fi
+cat > "$BIN_DIR/shizuha" << WRAPPER
+#!/usr/bin/env bash
+exec "$SHIZUHA_DIR/bin/shizuha" "\$@"
+WRAPPER
+chmod +x "$BIN_DIR/shizuha"
 
 PATH_ADDED=false
 if ! echo "$PATH" | tr ':' '\n' | grep -q "^$BIN_DIR$"; then
