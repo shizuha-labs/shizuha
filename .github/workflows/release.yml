@@ -31,7 +31,7 @@ jobs:
           - os: macos-latest
             target: darwin-arm64
             node-arch: arm64
-          - os: macos-13
+          - os: macos-latest
             target: darwin-x64
             node-arch: x64
 
