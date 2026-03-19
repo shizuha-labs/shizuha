@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+logs/
+results/
+reports/
+archives/
+benchmark.db
+swebench_data/
+swebench_predictions/
+swebench_results/

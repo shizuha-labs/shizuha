@@ -1,0 +1,32 @@
+model_list:
+  - model_name: gpt-5.3-codex
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/gpt-5.3-codex
+
+  - model_name: gpt-5.1-codex-max
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/gpt-5.1-codex-max
+
+  - model_name: gpt-5.1-codex
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/gpt-5.1-codex
+
+  # Claude models via GitHub Copilot (chat/completions, NOT responses)
+  # NOTE: Copilot uses dots in version numbers (4.6, 4.5), not hyphens
+  - model_name: claude-opus-4.6
+    litellm_params:
+      model: github_copilot/claude-opus-4.6
+
+  - model_name: claude-sonnet-4.6
+    litellm_params:
+      model: github_copilot/claude-sonnet-4.6
+
+  - model_name: claude-haiku-4.5
+    litellm_params:
+      model: github_copilot/claude-haiku-4.5

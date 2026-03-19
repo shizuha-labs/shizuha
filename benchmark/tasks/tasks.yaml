@@ -1,0 +1,2710 @@
+# AI Agent Benchmark Task Definitions
+# Each task defines a prompt for the agent and evaluation criteria.
+
+# ─── Easy Tier (2 min timeout) ───────────────────────────────────────────────
+
+- id: easy-fizzbuzz
+  tier: easy
+  name: FizzBuzz Implementation
+  prompt: |
+    Create a file called fizzbuzz.py that prints numbers from 1 to 100, one per line.
+    For multiples of 3, print "Fizz" instead of the number.
+    For multiples of 5, print "Buzz" instead of the number.
+    For multiples of both 3 and 5, print "FizzBuzz" instead of the number.
+    The program should run with: python3 fizzbuzz.py
+  evaluation:
+    - type: file_exists
+      path: fizzbuzz.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"fizzbuzz.py\", doraise=True)'"
+    - type: output_line_count
+      command: "python3 fizzbuzz.py"
+      expected: 100
+    - type: output_contains
+      command: "python3 fizzbuzz.py"
+      expected:
+        - "FizzBuzz"
+        - "Fizz"
+        - "Buzz"
+
+- id: easy-fibonacci
+  tier: easy
+  name: Fibonacci Function
+  prompt: |
+    Create a file called fibonacci.py that contains:
+    1. A function fibonacci(n) that returns the nth Fibonacci number (0-indexed, so fibonacci(0)=0, fibonacci(1)=1, fibonacci(10)=55).
+    2. When run directly, it should print the first 20 Fibonacci numbers, one per line.
+    The program should run with: python3 fibonacci.py
+  evaluation:
+    - type: file_exists
+      path: fibonacci.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"fibonacci.py\", doraise=True)'"
+    - type: output_contains
+      command: "python3 -c 'from fibonacci import fibonacci; print(fibonacci(10))'"
+      expected:
+        - "55"
+    - type: output_line_count
+      command: "python3 fibonacci.py"
+      expected: 20
+
+- id: easy-json-extractor
+  tier: easy
+  name: JSON Data Extractor
+  prompt: |
+    Create two files:
+    1. data.json - A JSON file containing an array of objects, each with "name" (string) and "age" (integer) fields.
+       Include at least 5 people with varied names and ages.
+    2. extract.py - A Python script that reads data.json, extracts all names, sorts them alphabetically,
+       and prints each name on its own line.
+    The program should run with: python3 extract.py
+  evaluation:
+    - type: file_exists
+      path: data.json
+    - type: file_exists
+      path: extract.py
+    - type: syntax_check
+      command: "python3 -c 'import json; json.load(open(\"data.json\"))'"
+    - type: run_command
+      command: "python3 extract.py"
+      exit_code: 0
+
+- id: easy-reverse-string
+  tier: easy
+  name: Reverse String Without Slicing
+  prompt: |
+    Create a file called reverse.py that contains:
+    1. A function reverse_string(s) that reverses a string WITHOUT using Python slice notation (no s[::-1]).
+       Use a loop or other approach.
+    2. A function test_reverse() that tests reverse_string with at least 4 test cases including:
+       empty string, single character, palindrome, and a regular word.
+       Each test should use assert statements.
+    3. When run directly, it should call test_reverse() and print "All tests passed!" if successful.
+    The program should run with: python3 reverse.py
+  evaluation:
+    - type: file_exists
+      path: reverse.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"reverse.py\", doraise=True)'"
+    - type: output_contains
+      command: "python3 reverse.py"
+      expected:
+        - "All tests passed"
+    - type: output_contains
+      command: "python3 -c 'from reverse import reverse_string; print(reverse_string(\"hello\"))'"
+      expected:
+        - "olleh"
+
+# ─── Medium Tier (5 min timeout) ─────────────────────────────────────────────
+
+- id: medium-tictactoe
+  tier: medium
+  name: Tic-Tac-Toe with AI
+  prompt: |
+    Create two files:
+    1. tictactoe.py - A Tic-Tac-Toe game engine with:
+       - A TicTacToe class with methods: make_move(row, col), get_winner(), is_full(), reset()
+       - The board is 3x3, players are 'X' and 'O', X goes first
+       - get_winner() returns 'X', 'O', or None
+       - An ai_move(board) function that returns (row, col) for a reasonable AI move
+    2. test_tictactoe.py - Tests using unittest with at least 6 test cases covering:
+       - Valid moves, invalid moves (occupied cell), win detection (row/col/diagonal),
+         draw detection, board reset, AI move validity
+    Run tests with: python3 -m pytest test_tictactoe.py -v
+  evaluation:
+    - type: file_exists
+      path: tictactoe.py
+    - type: file_exists
+      path: test_tictactoe.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"tictactoe.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_tictactoe.py -v"
+      exit_code: 0
+
+- id: medium-rest-api
+  tier: medium
+  name: REST API with Flask
+  prompt: |
+    Create two files:
+    1. app.py - A Flask REST API for managing a todo list with these endpoints:
+       - GET /todos - List all todos (JSON array)
+       - POST /todos - Create a todo (JSON body with "title", optional "done" boolean, defaults false)
+       - GET /todos/<id> - Get a single todo by ID
+       - PUT /todos/<id> - Update a todo (JSON body with "title" and/or "done")
+       - DELETE /todos/<id> - Delete a todo
+       Use an in-memory list/dict for storage. Each todo has: id (int), title (str), done (bool).
+       Return appropriate HTTP status codes (200, 201, 404).
+    2. test_app.py - Tests using the Flask test client with at least 5 test cases covering:
+       - Create a todo, list todos, get single todo, update todo, delete todo, 404 for missing todo
+    Run tests with: python3 -m pytest test_app.py -v
+  evaluation:
+    - type: file_exists
+      path: app.py
+    - type: file_exists
+      path: test_app.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"app.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_app.py -v"
+      exit_code: 0
+
+- id: medium-cli-search
+  tier: medium
+  name: CLI Search Tool
+  prompt: |
+    Create two files:
+    1. search.py - A command-line recursive text search tool (like a simple grep -r) using argparse:
+       - Usage: python3 search.py <pattern> <directory>
+       - Recursively searches all .txt and .py files in the directory
+       - Prints matching lines in format: "filename:line_number:line_content"
+       - Supports --ignore-case / -i flag for case-insensitive search
+       - Supports --count / -c flag to only print the total count of matches
+       - Handles missing directory gracefully with an error message
+    2. test_search.py - Tests that create a temporary directory with test files and verify:
+       - Basic search finds correct matches
+       - Case-insensitive search works
+       - Count mode returns correct number
+       - Missing directory shows error
+       Run with: python3 -m pytest test_search.py -v
+  evaluation:
+    - type: file_exists
+      path: search.py
+    - type: file_exists
+      path: test_search.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"search.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_search.py -v"
+      exit_code: 0
+
+- id: medium-csv-pipeline
+  tier: medium
+  name: CSV Data Pipeline
+  prompt: |
+    Create two files:
+    1. pipeline.py - A data processing pipeline that:
+       - Has a generate_data() function that creates sales_data.csv with 100 rows containing:
+         date (random dates in 2024), product (from: Widget, Gadget, Doohickey, Thingamajig),
+         quantity (1-50), unit_price (5.00-100.00 rounded to 2 decimals)
+       - Has an analyze_data() function that reads sales_data.csv and produces summary.json containing:
+         total_revenue, average_order_value, top_product (by total revenue),
+         monthly_totals (dict of YYYY-MM to revenue)
+       - When run directly, calls generate_data() then analyze_data() and prints "Pipeline complete"
+    2. test_pipeline.py - Tests covering:
+       - generate_data creates a valid CSV with correct columns and 100 rows
+       - analyze_data produces valid JSON with all required keys
+       - total_revenue is a positive number
+       - top_product is one of the valid product names
+       Run with: python3 -m pytest test_pipeline.py -v
+  evaluation:
+    - type: file_exists
+      path: pipeline.py
+    - type: file_exists
+      path: test_pipeline.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"pipeline.py\", doraise=True)'"
+    - type: output_contains
+      command: "python3 pipeline.py"
+      expected:
+        - "Pipeline complete"
+    - type: run_command
+      command: "python3 -m pytest test_pipeline.py -v"
+      exit_code: 0
+
+# ─── Hard Tier (15 min timeout) ──────────────────────────────────────────────
+
+- id: hard-portfolio
+  tier: hard
+  name: Full-Stack Portfolio Site
+  prompt: |
+    Create a full-stack personal portfolio website with these files:
+
+    1. server.py - A Flask web server that:
+       - Serves static files (HTML/CSS/JS) from a "static" directory
+       - Has a GET /api/projects endpoint returning a JSON array of at least 3 projects,
+         each with: id, title, description, technologies (list of strings), url
+       - Has a GET /api/about endpoint returning JSON with: name, bio, skills (list), contact_email
+       - Runs on port 5000
+
+    2. static/index.html - A responsive portfolio page with:
+       - Navigation bar with links to sections: About, Projects, Contact
+       - Hero section with name and tagline
+       - Projects section that fetches from /api/projects and renders project cards
+       - About section that fetches from /api/about
+       - Footer with copyright
+
+    3. static/style.css - Styling with:
+       - Responsive layout (flexbox or grid)
+       - Professional color scheme
+       - Mobile-friendly (media queries for < 768px)
+
+    4. static/app.js - Frontend JavaScript that:
+       - Fetches project data from /api/projects on page load
+       - Dynamically creates project cards in the DOM
+       - Fetches about data from /api/about and populates the about section
+
+    5. test_server.py - Tests verifying:
+       - /api/projects returns a list with at least 3 items
+       - Each project has required fields
+       - /api/about returns valid data with required fields
+       - Static index.html is served at /
+       Run with: python3 -m pytest test_server.py -v
+  evaluation:
+    - type: file_exists
+      path: server.py
+    - type: file_exists
+      path: static/index.html
+    - type: file_exists
+      path: static/style.css
+    - type: file_exists
+      path: static/app.js
+    - type: file_exists
+      path: test_server.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"server.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_server.py -v"
+      exit_code: 0
+    - type: server_check
+      start_command: "python3 server.py"
+      port: 5000
+      startup_wait: 3
+      checks:
+        - url: "http://localhost:5000/"
+          status: 200
+          contains: "<!DOCTYPE html>"
+        - url: "http://localhost:5000/api/projects"
+          status: 200
+          contains: "title"
+        - url: "http://localhost:5000/api/about"
+          status: 200
+          contains: "name"
+
+- id: hard-news-aggregator
+  tier: hard
+  name: News Aggregator Dashboard
+  prompt: |
+    Create a news aggregator web application with mock data:
+
+    1. app.py - Flask application with:
+       - A MockNewsSource class that generates realistic mock news articles with:
+         id, title, summary, source (from: TechCrunch, BBC, Reuters, HackerNews),
+         category (from: technology, business, science, world), published_date, url
+       - Generate at least 30 mock articles on startup
+       - GET / serves the dashboard HTML
+       - GET /api/articles returns all articles as JSON (supports ?category= and ?source= query params for filtering)
+       - GET /api/articles/search?q=<term> searches titles and summaries
+       - GET /api/stats returns JSON with article count per source and per category
+       - Serves static files from "static" directory
+
+    2. templates/dashboard.html - A responsive dashboard (Jinja2 template) with:
+       - Sidebar with category and source filters (clickable to filter)
+       - Main content area showing article cards in a grid
+       - Search bar at the top that filters articles as you type
+       - Each article card shows: title, summary (truncated), source badge, category tag, date
+       - Stats section showing article counts
+
+    3. static/dashboard.css - Styling with:
+       - CSS Grid layout for the dashboard
+       - Card styling with hover effects
+       - Color-coded source badges and category tags
+       - Responsive: sidebar collapses on mobile (< 768px)
+
+    4. static/dashboard.js - Frontend JavaScript that:
+       - Fetches articles from /api/articles on load
+       - Implements client-side search filtering with debounce
+       - Handles category and source filter clicks (fetches filtered data from API)
+       - Dynamically renders article cards
+
+    5. test_app.py - Tests covering:
+       - Article list endpoint returns 30+ articles
+       - Category filter returns only matching articles
+       - Source filter works correctly
+       - Search returns relevant results
+       - Stats endpoint has correct structure
+       Run with: python3 -m pytest test_app.py -v
+  evaluation:
+    - type: file_exists
+      path: app.py
+    - type: file_exists
+      path: templates/dashboard.html
+    - type: file_exists
+      path: static/dashboard.css
+    - type: file_exists
+      path: static/dashboard.js
+    - type: file_exists
+      path: test_app.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"app.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_app.py -v"
+      exit_code: 0
+    - type: server_check
+      start_command: "python3 app.py"
+      port: 5000
+      startup_wait: 3
+      checks:
+        - url: "http://localhost:5000/"
+          status: 200
+          contains: "<!DOCTYPE html>"
+        - url: "http://localhost:5000/api/articles"
+          status: 200
+          contains: "title"
+        - url: "http://localhost:5000/api/stats"
+          status: 200
+          contains: "source"
+
+- id: hard-chess-engine
+  tier: hard
+  name: Chess Engine
+  prompt: |
+    Implement a chess engine in Python with full rules enforcement:
+
+    1. chess_engine.py - Core engine with:
+       - Board class that represents an 8x8 chess board
+       - Standard starting position initialization
+       - Piece representation (King, Queen, Rook, Bishop, Knight, Pawn) for both colors
+       - Legal move generation for ALL piece types including:
+         - Sliding pieces (Rook, Bishop, Queen) with blocking
+         - Knight L-shaped moves
+         - Pawn single/double advance, diagonal captures, en passant
+         - King moves including castling (kingside and queenside)
+         - Pawn promotion (auto-promote to Queen)
+       - Move validation: a move is legal only if it doesn't leave own king in check
+       - Check detection: board.is_checkmate() returns True if current player's king is in check and no legal moves
+       - Stalemate detection: board.is_stalemate() returns True if current player is NOT in check and has no legal moves
+       - Move execution via board.make_move(notation) using algebraic notation (e.g., "e2e4", "g1f3", "e1g1" for castling). Returns True if legal, raises ValueError if illegal.
+       - FEN string export of current position
+       - FEN string import via Board.from_fen(fen_string) class method to set up arbitrary positions
+       - Move history tracking
+       - Turn management (white/black alternating)
+
+    2. test_chess.py - Comprehensive tests covering:
+       - Initial board setup is correct (all 32 pieces in right positions)
+       - Pawn moves: single advance, double advance from starting rank, diagonal capture
+       - Knight moves: L-shape, can jump over pieces
+       - Bishop moves: diagonal sliding, blocked by pieces
+       - Rook moves: horizontal/vertical sliding, blocked by pieces
+       - Queen moves: combines rook + bishop movement
+       - King moves: one square any direction
+       - Castling: kingside and queenside, blocked by pieces between, cannot castle through check, cannot castle after king/rook has moved
+       - En passant capture
+       - Pawn promotion to queen on reaching 8th rank
+       - Check detection: test a known check position
+       - Checkmate detection: Scholar's mate (1. e2e4 e7e5 2. f1c4 b8c6 3. d1h5 g8f6 4. h5f7 = checkmate)
+       - Stalemate detection: test a known stalemate position
+       - Illegal move rejection: cannot move into check, cannot ignore check, cannot move opponent's pieces
+       - Turn enforcement: white moves first, then alternating
+       Run with: python3 -m pytest test_chess.py -v --timeout=60
+
+    3. play_chess.py - Simple CLI interface that:
+       - Displays the board using Unicode chess symbols (♔♕♖♗♘♙ / ♚♛♜♝♞♟)
+       - Shows whose turn it is
+       - Accepts moves in algebraic notation (e.g., "e2e4")
+       - Validates and executes moves
+       - Announces check, checkmate, or stalemate
+       - Supports "quit" command to exit
+       - Supports "fen" command to print current FEN
+       - Supports "moves" command to list legal moves for current player
+
+    IMPORTANT — Required API contract (the Board class MUST implement these exact methods):
+       - board.legal_moves_algebraic() -> list[str]: Returns legal moves as coordinate strings
+         e.g., ["e2e4", "g1f3", "e1g1"]. Each move is 4 chars (from_square + to_square)
+         with optional 5th char for promotion piece (e.g., "a7a8q"). MUST return list of str.
+       - board.make_move(move_str) -> True/raises ValueError: Takes a coordinate string.
+       - board.to_fen() -> str: Standard FEN with ALL 6 fields:
+         <pieces> <turn> <castling> <en_passant> <halfmove_clock> <fullmove_number>
+         The halfmove clock MUST increment on non-pawn, non-capture moves and reset on
+         pawn moves and captures (this is critical for the 50-move rule).
+       - Board.from_fen(fen_str) -> Board: Class method. Must restore ALL state including
+         castling rights, en passant, halfmove clock, and fullmove number.
+       - board.is_checkmate() -> bool
+       - board.is_stalemate() -> bool
+       - board.is_in_check(color) -> bool: where color is "white" or "black" (or board.turn)
+
+    Focus on correctness over optimization. All chess rules must be properly enforced.
+  evaluation:
+    - type: file_exists
+      path: chess_engine.py
+    - type: file_exists
+      path: test_chess.py
+    - type: file_exists
+      path: play_chess.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"chess_engine.py\", doraise=True)'"
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"play_chess.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_chess.py -v --timeout=60"
+      exit_code: 0
+      timeout: 120
+    - type: run_command
+      command: |
+        python3 -c "
+        from chess_engine import Board
+        b = Board()
+        # Scholar's mate
+        for mv in ['e2e4','e7e5','f1c4','b8c6','d1h5','g8f6','h5f7']:
+            assert b.make_move(mv), f'Move {mv} should be legal'
+        assert b.is_checkmate(), 'Should be checkmate after Scholar s mate'
+        print('Scholar mate: PASS')
+        # Stalemate test: black king on a8, white queen b6 + king c6 = stalemate for black
+        b2 = Board.from_fen('k7/8/1QK5/8/8/8/8/8 b - - 0 1')
+        assert b2.is_stalemate(), 'Should be stalemate'
+        print('Stalemate: PASS')
+        print('ALL VERIFICATION PASSED')
+        "
+      exit_code: 0
+      timeout: 30
+    - type: run_command
+      command: |
+        python3 -c "
+        from chess_engine import Board
+        # Test API contract: legal_moves_algebraic returns list of strings
+        b = Board()
+        moves = b.legal_moves_algebraic()
+        assert isinstance(moves, list), f'legal_moves_algebraic must return list, got {type(moves)}'
+        assert len(moves) == 20, f'Initial position should have 20 legal moves, got {len(moves)}'
+        for m in moves:
+            assert isinstance(m, str), f'Each move must be a string, got {type(m)}: {m}'
+            assert len(m) >= 4, f'Move must be at least 4 chars, got: {m}'
+        print(f'legal_moves_algebraic: PASS ({len(moves)} moves, all strings)')
+
+        # Test FEN has all 6 fields and halfmove clock works
+        b.make_move('e2e4')
+        fen1 = b.to_fen()
+        parts = fen1.split()
+        assert len(parts) == 6, f'FEN must have 6 fields, got {len(parts)}: {fen1}'
+        assert parts[4] == '0', f'Halfmove clock should be 0 after pawn move, got {parts[4]}'
+        b.make_move('e7e5')
+        b.make_move('g1f3')  # non-pawn, non-capture
+        fen2 = b.to_fen()
+        parts2 = fen2.split()
+        assert parts2[4] == '1', f'Halfmove clock should be 1 after Nf3, got {parts2[4]}'
+        print(f'FEN halfmove clock: PASS')
+
+        # Test from_fen roundtrip
+        b3 = Board.from_fen(fen2)
+        assert b3.to_fen() == fen2, f'FEN roundtrip failed: {b3.to_fen()} != {fen2}'
+        print(f'FEN roundtrip: PASS')
+        print('API CONTRACT PASSED')
+        "
+      exit_code: 0
+      timeout: 30
+
+# ─── Extreme Tier (20 min timeout) ────────────────────────────────────────────
+
+- id: extreme-regex-engine
+  tier: extreme
+  name: Regex Engine from Scratch
+  prompt: |
+    Build a regex engine from scratch in Python. Do NOT use the `re` module or any regex library.
+
+    Create two files:
+
+    1. regex_engine.py — A module with:
+       - A `match(pattern, text)` function that returns True if the pattern matches the ENTIRE text
+       - A `search(pattern, text)` function that returns the first Match object (with .group(), .start(), .end()) or None
+       - Supported syntax:
+         - Literal characters
+         - `.` matches any single character
+         - `*` zero or more of the preceding element
+         - `+` one or more of the preceding element
+         - `?` zero or one of the preceding element
+         - `|` alternation (e.g., `cat|dog`)
+         - `()` grouping (e.g., `(ab)+` matches "abab")
+         - `[a-z]` character classes with ranges (e.g., `[A-Za-z0-9]`)
+         - `[^...]` negated character classes
+         - `\d` digit, `\w` word character, `\s` whitespace
+         - `^` start anchor, `$` end anchor
+       - Implementation approach: parse the regex into an NFA or use recursive descent.
+
+    2. test_regex.py — At least 20 test cases using pytest, covering:
+       - Literal matching: `match("hello", "hello")` is True
+       - Dot: `match("h.llo", "hello")` is True
+       - Star: `match("ab*c", "ac")` and `match("ab*c", "abbc")` are True
+       - Plus: `match("ab+c", "abc")` is True, `match("ab+c", "ac")` is False
+       - Question: `match("colou?r", "color")` and `match("colou?r", "colour")` both True
+       - Alternation: `match("cat|dog", "cat")` and `match("cat|dog", "dog")` True
+       - Grouping: `match("(ab)+", "abab")` True, `match("(ab)+", "aba")` False
+       - Character classes: `match("[a-z]+", "hello")` True, `match("[a-z]+", "Hello")` False
+       - Negated classes: `match("[^0-9]+", "hello")` True
+       - Shortcuts: `match("\\d+", "123")` True, `match("\\w+", "hello_123")` True
+       - Anchors: `search("^hello", "hello world")` finds "hello", `search("world$", "hello world")` finds "world"
+       - Complex: `match("(a|b)*c", "aababc")` True
+       - Edge cases: empty pattern, empty text, nested groups
+
+    Run tests with: python3 -m pytest test_regex.py -v
+  evaluation:
+    - type: file_exists
+      path: regex_engine.py
+    - type: file_exists
+      path: test_regex.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"regex_engine.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c 'from regex_engine import match, search; assert match(\"hello\", \"hello\"); assert not match(\"hello\", \"world\"); print(\"basic ok\")'"
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c 'from regex_engine import match; assert match(\"ab*c\", \"ac\"); assert match(\"ab*c\", \"abbc\"); assert match(\"a.c\", \"axc\"); print(\"quantifiers ok\")'"
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c 'from regex_engine import match; assert match(\"(ab)+\", \"abab\"); assert match(\"cat|dog\", \"dog\"); assert match(\"[a-z]+\", \"hello\"); print(\"advanced ok\")'"
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_regex.py -v"
+      exit_code: 0
+
+- id: extreme-orm-query-builder
+  tier: extreme
+  name: SQL Query Builder (Mini ORM)
+  prompt: |
+    Build a SQL query builder with a fluent (method-chaining) API in Python.
+
+    Create two files:
+
+    1. query_builder.py — A module with a `Query` class supporting:
+       - `Query("users")` — sets the table
+       - `.select("name", "email")` — columns to select (default: *)
+       - `.where("age > ?", 25)` — WHERE clause with parameterized values (can chain multiple, ANDed)
+       - `.or_where("status = ?", "active")` — OR conditions
+       - `.join("orders", "users.id = orders.user_id")` — INNER JOIN
+       - `.left_join("profiles", "users.id = profiles.user_id")` — LEFT JOIN
+       - `.group_by("category")` — GROUP BY clause
+       - `.having("COUNT(*) > ?", 5)` — HAVING clause
+       - `.order_by("name")` and `.order_by("age", "DESC")` — ORDER BY
+       - `.limit(10)` and `.offset(20)` — pagination
+       - `.to_sql()` — returns tuple of (sql_string, params_list)
+       - `.insert({"name": "Alice", "age": 30})` — returns (INSERT INTO ... VALUES ..., params)
+       - `.update({"name": "Bob"})` — returns (UPDATE ... SET ..., params), must have where clause
+       - `.delete()` — returns (DELETE FROM ..., params), must have where clause
+       - Subqueries: `.where_in("id", Query("orders").select("user_id").where("total > ?", 100))`
+       - All methods return self for chaining (except to_sql/insert/update/delete)
+       - Validate: update/delete without where raises ValueError
+
+    2. test_query_builder.py — At least 15 test cases with pytest:
+       - Simple select: `Query("users").to_sql()` → ("SELECT * FROM users", [])
+       - Select with columns: ("SELECT name, email FROM users", [])
+       - Where clause with params: ("SELECT * FROM users WHERE age > ?", [25])
+       - Multiple wheres (AND): WHERE age > ? AND status = ?
+       - OR where: WHERE age > ? OR status = ?
+       - JOIN: SELECT ... FROM users INNER JOIN orders ON ...
+       - LEFT JOIN
+       - GROUP BY + HAVING
+       - ORDER BY with direction
+       - LIMIT + OFFSET
+       - INSERT generation
+       - UPDATE with where
+       - DELETE with where
+       - Update without where raises ValueError
+       - Subquery in WHERE IN
+       - Complex chained query with join + where + order + limit
+
+    Run tests with: python3 -m pytest test_query_builder.py -v
+  evaluation:
+    - type: file_exists
+      path: query_builder.py
+    - type: file_exists
+      path: test_query_builder.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"query_builder.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from query_builder import Query; sql, p = Query('users').select('name').where('age > ?', 25).order_by('name').limit(10).to_sql(); print(sql); assert 'SELECT' in sql and 'WHERE' in sql and 'LIMIT' in sql\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c \"from query_builder import Query; sql, p = Query('users').insert({'name': 'Alice', 'age': 30}); print(sql); assert 'INSERT' in sql\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_query_builder.py -v"
+      exit_code: 0
+
+- id: extreme-async-web-scraper
+  tier: extreme
+  name: Async Web Scraper Framework
+  prompt: |
+    Build an async web scraper framework with rate limiting, retries, and SQLite storage.
+
+    Create two files:
+
+    1. scraper.py — An async scraper framework with:
+       - class `Scraper` with `async def scrape(urls: list[str]) -> list[Result]`
+       - Constructor takes: `max_concurrent=5`, `rate_limit=2.0` (requests/second), `max_retries=3`, `timeout=10`
+       - Uses `aiohttp` for HTTP requests
+       - Rate limiting: enforces max requests per second across all concurrent tasks
+       - Retry with exponential backoff: wait 1s, 2s, 4s between retries on failure
+       - Concurrent request pool: asyncio.Semaphore limits to max_concurrent
+       - Each Result has: url, status_code, content_length, title (extracted from <title> tag), elapsed_time, success (bool), error (str or None)
+       - Results stored in SQLite database (scraper_results.db): url, status_code, title, content_length, scraped_at, success, error
+       - `async def get_report()` returns dict with: total_urls, successful, failed, avg_response_time, results_by_status (count per status code)
+       - Handle: connection errors, timeouts, HTTP errors (4xx/5xx treated as failures for retry)
+       - Uses `beautifulsoup4` for title extraction
+
+    2. test_scraper.py — At least 12 test cases using pytest + pytest-asyncio:
+       - Mock aiohttp with aioresponse or custom mock server
+       - Test successful scrape of multiple URLs
+       - Test rate limiting (N requests take at least N/rate_limit seconds)
+       - Test retry on failure (mock first 2 calls fail, 3rd succeeds)
+       - Test max retries exhausted → result marked as failed
+       - Test concurrent limit (verify semaphore behavior)
+       - Test timeout handling
+       - Test title extraction from HTML
+       - Test SQLite storage (query db after scrape)
+       - Test report generation
+       - Test mixed results (some succeed, some fail)
+       - Test empty URL list
+
+    Install deps if needed: pip install aiohttp beautifulsoup4 pytest-asyncio aioresponses
+    Run tests with: python3 -m pytest test_scraper.py -v
+  evaluation:
+    - type: file_exists
+      path: scraper.py
+    - type: file_exists
+      path: test_scraper.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"scraper.py\", doraise=True)'"
+    - type: run_command
+      command: "pip install pytest-asyncio aioresponses aiosqlite 2>/dev/null; python3 -m pytest test_scraper.py -v"
+      exit_code: 0
+      timeout: 60
+
+- id: extreme-git-diff-parser
+  tier: extreme
+  name: Git Unified Diff Parser
+  prompt: |
+    Build a parser for Git's unified diff format that can parse diffs into structured data
+    and reconstruct patched files.
+
+    Create two files:
+
+    1. diff_parser.py — A module with:
+       - `parse_diff(diff_text: str) -> DiffResult` — parses a unified diff string
+       - DiffResult has:
+         - `files: list[FileDiff]` — one per file changed
+         - `stats: DiffStats` — total insertions, deletions, files_changed
+       - FileDiff has:
+         - `old_path, new_path` — file paths (handle a/ b/ prefixes)
+         - `change_type` — "added", "deleted", "modified", "renamed"
+         - `old_mode, new_mode` — file modes (if present)
+         - `is_binary` — bool
+         - `hunks: list[Hunk]`
+         - `insertions, deletions` — per-file counts
+       - Hunk has:
+         - `old_start, old_count, new_start, new_count` — from @@ line
+         - `lines: list[DiffLine]`
+         - `header` — optional function/class context from @@ line
+       - DiffLine has:
+         - `type` — "context", "added", "deleted"
+         - `content` — the line content (without +/- prefix)
+         - `old_line_no, new_line_no` — line numbers (None for added/deleted respectively)
+       - `apply_diff(original: str, diff_text: str, file_path: str) -> str` — applies the diff to reconstruct the patched file
+       - `generate_stats(result: DiffResult) -> str` — returns a summary string like git's "3 files changed, 10 insertions(+), 5 deletions(-)"
+
+    2. test_diff_parser.py — At least 15 test cases with pytest:
+       - Parse a simple single-file diff (one hunk)
+       - Parse multi-hunk diff
+       - Parse multi-file diff
+       - Correctly count insertions and deletions
+       - Handle file additions (--- /dev/null)
+       - Handle file deletions (+++ /dev/null)
+       - Handle renames (rename from/to)
+       - Handle binary files (Binary files differ)
+       - Handle mode changes
+       - Parse @@ header with function context
+       - Line numbers are correct for context/added/deleted lines
+       - apply_diff reconstructs a simple patched file correctly
+       - apply_diff with multiple hunks
+       - generate_stats produces correct summary
+       - Edge case: empty diff
+       Tests should include actual diff text fixtures (inline or in variables).
+
+    Run tests with: python3 -m pytest test_diff_parser.py -v
+  evaluation:
+    - type: file_exists
+      path: diff_parser.py
+    - type: file_exists
+      path: test_diff_parser.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"diff_parser.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_diff_parser.py -v"
+      exit_code: 0
+
+- id: extreme-interpreter
+  tier: extreme
+  name: Programming Language Interpreter
+  prompt: |
+    Build an interpreter for a simple programming language called "Mini".
+
+    Create two files:
+
+    1. mini.py — A complete interpreter with:
+       - Lexer: tokenizes source code into tokens (NUMBER, STRING, IDENTIFIER, OPERATOR, KEYWORD, etc.)
+       - Parser: builds an AST from tokens (recursive descent parser)
+       - Interpreter: walks the AST and executes
+
+       Language features:
+       - Variables: `x = 10`, `name = "hello"` (dynamic typing: int, float, string, bool)
+       - Arithmetic: `+`, `-`, `*`, `/`, `%` with correct precedence (* / % before + -)
+       - Comparisons: `==`, `!=`, `<`, `>`, `<=`, `>=`
+       - Boolean logic: `and`, `or`, `not`
+       - String concatenation with `+`
+       - Print: `print(expression)` and `print(expr1, expr2)` (space-separated)
+       - If/else:
+           ```
+           if x > 10:
+               print("big")
+           else:
+               print("small")
+           end
+           ```
+       - While loops:
+           ```
+           while x > 0:
+               print(x)
+               x = x - 1
+           end
+           ```
+       - Functions with parameters and return:
+           ```
+           func add(a, b):
+               return a + b
+           end
+           result = add(3, 4)
+           ```
+       - Nested function calls and recursion
+       - Comments: lines starting with `#`
+       - `run(source: str) -> list[str]` — executes source code, returns list of printed output lines
+       - `run_file(path: str) -> list[str]` — reads and executes a file
+
+    2. test_mini.py — At least 20 test cases with pytest:
+       - Variable assignment and usage
+       - Arithmetic with correct precedence: `2 + 3 * 4` = 14
+       - String variables and concatenation
+       - Print statement captures output
+       - If/else branching (true and false paths)
+       - Nested if/else
+       - While loop with counter
+       - While loop with break condition
+       - Function definition and call
+       - Function with return value
+       - Recursive function (factorial)
+       - Fibonacci via recursion
+       - Multiple function parameters
+       - Comparison operators (all 6)
+       - Boolean logic (and, or, not)
+       - Nested function calls: `print(add(1, mul(2, 3)))`
+       - Variable scoping (function params don't leak)
+       - Division and modulo
+       - String and number in same program
+       - Error handling: undefined variable raises error
+       - Comments are ignored
+
+    Run tests with: python3 -m pytest test_mini.py -v
+  evaluation:
+    - type: file_exists
+      path: mini.py
+    - type: file_exists
+      path: test_mini.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"mini.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from mini import run; out = run('x = 5\\nprint(x * 2)'); assert out == ['10'], f'got {out}'\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c \"from mini import run; out = run('func fact(n):\\n    if n <= 1:\\n        return 1\\n    end\\n    return n * fact(n - 1)\\nend\\nprint(fact(5))'); assert out == ['120'], f'got {out}'\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_mini.py -v"
+      exit_code: 0
+
+# ─── Nightmare Tier (30 min timeout) ──────────────────────────────────────────
+
+- id: nightmare-event-sourcing
+  tier: nightmare
+  name: Event-Sourced Bank System
+  prompt: |
+    Build a complete event-sourced bank account system with CQRS pattern.
+
+    Create these files:
+
+    1. event_store.py — Append-only event store:
+       - class `EventStore` backed by SQLite (bank_events.db)
+       - `append(stream_id: str, events: list[Event], expected_version: int) -> None`
+         — appends events to a stream; raises `ConcurrencyError` if expected_version doesn't match current
+       - `get_events(stream_id: str, after_version: int = 0) -> list[StoredEvent]`
+       - `get_all_events(after_position: int = 0) -> list[StoredEvent]` — global ordering
+       - Event has: event_type (str), data (dict), metadata (dict)
+       - StoredEvent adds: stream_id, version, position (global), timestamp
+
+    2. bank.py — Domain model:
+       - class `BankAccount` (aggregate):
+         - Reconstitutes state by replaying events
+         - Commands: `open(owner, initial_deposit)`, `deposit(amount)`, `withdraw(amount)`, `transfer_to(target_account_id, amount)`
+         - Each command validates business rules THEN produces events (not stored yet)
+         - Business rules: no negative balance, no withdrawal > balance, minimum deposit $0.01, account must be open
+         - Events: AccountOpened, MoneyDeposited, MoneyWithdrawn, TransferSent, TransferReceived
+       - class `BankService`:
+         - Uses EventStore to load/save aggregates
+         - `open_account(owner, initial_deposit) -> account_id`
+         - `deposit(account_id, amount)`
+         - `withdraw(account_id, amount)`
+         - `transfer(from_id, to_id, amount)` — atomic: both sides succeed or neither does
+         - Optimistic concurrency: reload + retry on ConcurrencyError (max 3 retries)
+
+    3. projections.py — Read models:
+       - class `BalanceProjection`: maintains dict of account_id → current_balance
+       - class `TransactionHistoryProjection`: maintains list of transactions per account
+       - class `ProjectionEngine`:
+         - Subscribes to event store
+         - `rebuild()` — replays all events from scratch
+         - `process_new_events()` — processes only events after last checkpoint
+       - Snapshot support: `save_snapshot(account_id)` saves current state to avoid full replay
+       - `load_with_snapshot(account_id)` loads snapshot + events after snapshot
+
+    4. test_bank.py — Comprehensive tests with pytest (at least 20):
+       - Open account, verify balance
+       - Deposit increases balance
+       - Withdraw decreases balance
+       - Withdraw more than balance raises error
+       - Transfer between two accounts
+       - Transfer updates both balances correctly
+       - Event store records all events in order
+       - Replay events reconstructs correct state
+       - Concurrent modification raises ConcurrencyError
+       - Optimistic retry succeeds after conflict
+       - Balance projection matches aggregate state
+       - Transaction history shows all operations
+       - Snapshot saves and loads correctly
+       - Rebuild projection from scratch matches incremental
+       - Multiple accounts with interleaved operations
+       - Account cannot be used before opening
+       - Transfer with insufficient funds fails atomically (neither side modified)
+       - Event ordering is globally consistent
+       - Metadata includes timestamp and correlation ID
+       - Stress test: 100 operations on same account
+
+    Run tests with: python3 -m pytest test_bank.py -v
+  evaluation:
+    - type: file_exists
+      path: event_store.py
+    - type: file_exists
+      path: bank.py
+    - type: file_exists
+      path: projections.py
+    - type: file_exists
+      path: test_bank.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"event_store.py\", doraise=True); py_compile.compile(\"bank.py\", doraise=True); py_compile.compile(\"projections.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_bank.py -v"
+      exit_code: 0
+      timeout: 60
+
+- id: nightmare-lsp-server
+  tier: nightmare
+  name: LSP Server for Config Language
+  prompt: |
+    Build a Language Server Protocol (LSP) server for a custom config language (.cfg files).
+
+    The config language syntax:
+    ```
+    # Comment
+    database.host = "localhost"
+    database.port = 3306
+    database.name = "myapp"
+
+    server.host = "0.0.0.0"
+    server.port = ${database.port}   # variable reference
+
+    include "other.cfg"               # file inclusion
+
+    # Sections
+    [logging]
+    level = "info"
+    file = "/var/log/app.log"
+    ```
+
+    Create these files:
+
+    1. cfg_parser.py — Config language parser:
+       - `parse(source: str, filename: str = "<stdin>") -> CfgDocument`
+       - CfgDocument has: assignments (list), includes (list), sections (list), diagnostics (list)
+       - Assignment: key (dotted path), value (string/number/bool/reference), line, column
+       - Reference: `${key}` resolved to another key's value
+       - Section: `[name]` groups subsequent assignments under that prefix
+       - Diagnostics: syntax errors with line/column/message/severity
+       - `resolve(doc: CfgDocument) -> dict` — resolves all references, returns flat key→value dict
+       - Handle errors gracefully: unknown references, circular references, syntax errors
+
+    2. lsp_server.py — JSON-RPC based LSP server:
+       - Communicates over stdin/stdout using JSON-RPC 2.0
+       - Implements these LSP methods:
+         - `initialize` — returns server capabilities
+         - `textDocument/didOpen` — parse and validate document, send diagnostics
+         - `textDocument/didChange` — re-parse, update diagnostics
+         - `textDocument/completion` — auto-complete key names (suggest known keys, section names)
+         - `textDocument/hover` — show resolved value and documentation for a key
+         - `textDocument/definition` — go-to-definition for `${ref}` references
+         - `textDocument/diagnostic` — push syntax errors and unresolved references
+       - class `ConfigIndex` — maintains parsed state for all open documents
+       - Handle Content-Length header framing for LSP messages
+       - Send `textDocument/publishDiagnostics` on parse errors
+
+    3. test_cfg_parser.py — Parser tests (at least 10):
+       - Parse simple assignment
+       - Parse dotted key
+       - Parse string, number, boolean values
+       - Parse reference ${key}
+       - Parse sections
+       - Resolve references correctly
+       - Detect circular references
+       - Detect syntax errors (missing value, unclosed quote)
+       - Parse comments (ignored)
+       - Multiple diagnostics in one document
+
+    4. test_lsp.py — LSP server tests (at least 10):
+       - Simulate LSP client by writing JSON-RPC messages to server stdin
+       - Initialize handshake returns capabilities
+       - didOpen triggers diagnostics for valid document (no errors)
+       - didOpen triggers diagnostics for document with errors
+       - Completion returns known keys
+       - Hover returns resolved value
+       - Definition for reference returns source location
+       - didChange updates diagnostics
+       - Content-Length framing parses correctly
+       - Multiple documents can be open simultaneously
+
+    Run tests with: python3 -m pytest test_cfg_parser.py test_lsp.py -v
+  evaluation:
+    - type: file_exists
+      path: cfg_parser.py
+    - type: file_exists
+      path: lsp_server.py
+    - type: file_exists
+      path: test_cfg_parser.py
+    - type: file_exists
+      path: test_lsp.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"cfg_parser.py\", doraise=True); py_compile.compile(\"lsp_server.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_cfg_parser.py test_lsp.py -v"
+      exit_code: 0
+      timeout: 60
+
+- id: nightmare-distributed-kv
+  tier: nightmare
+  name: Distributed Key-Value Store
+  prompt: |
+    Build a simulated distributed key-value store with consistent hashing, replication,
+    quorum reads/writes, and anti-entropy — all in-memory, single-process simulation.
+
+    Create these files:
+
+    1. consistent_hash.py — Consistent hashing ring:
+       - class `HashRing`:
+         - `add_node(node_id: str, virtual_nodes: int = 150)` — adds a node with virtual nodes
+         - `remove_node(node_id: str)` — removes a node and its virtual nodes
+         - `get_node(key: str) -> str` — returns the node responsible for a key
+         - `get_nodes(key: str, count: int) -> list[str]` — returns N nodes for replication (preference list)
+         - Uses SHA-256 hashing, handles wrap-around on the ring
+         - Rebalancing: when nodes are added/removed, only affected key ranges move
+
+    2. kv_store.py — Distributed KV store simulation:
+       - class `KVNode`:
+         - Local storage: dict of key → `VersionedValue(value, vector_clock, timestamp)`
+         - `put(key, value, vector_clock=None) -> VersionedValue`
+         - `get(key) -> VersionedValue | None`
+         - `delete(key, vector_clock) -> bool`
+         - Handles vector clock merging for conflict resolution
+       - class `Cluster`:
+         - Manages N nodes (default 5) with consistent hash ring
+         - `replication_factor = 3` — each key stored on 3 nodes
+         - `read_quorum = 2`, `write_quorum = 2` (configurable)
+         - `put(key, value)` — writes to W nodes, returns success if quorum met
+         - `get(key)` — reads from R nodes, returns latest value by vector clock
+         - `delete(key)` — tombstone-based deletion with quorum
+         - Simulated network: dict of node_id → KVNode (no actual networking)
+         - `partition(node_ids: list[str])` — simulates network partition (isolated nodes can't communicate)
+         - `heal_partition()` — restores connectivity
+         - Anti-entropy: `sync_nodes(node_a, node_b)` — Merkle tree comparison + exchange of missing/outdated keys
+       - class `VectorClock`:
+         - `increment(node_id)`, `merge(other)`, `compare(other)` → "before", "after", "concurrent", "equal"
+         - Correct partial ordering
+
+    3. membership.py — Gossip protocol:
+       - class `GossipProtocol`:
+         - Each node maintains a membership list with heartbeat counters
+         - `gossip_round()` — each node picks a random peer and exchanges membership state
+         - `detect_failures(timeout: int)` — marks nodes as suspected/failed after timeout
+         - `join(node_id)` / `leave(node_id)` — voluntary join/leave
+         - Convergence: after enough rounds, all nodes agree on membership
+
+    4. test_kv.py — Comprehensive tests (at least 20):
+       - HashRing: keys distribute across nodes, adding node rebalances correctly
+       - HashRing: virtual nodes improve distribution uniformity
+       - HashRing: get_nodes returns correct replication set (no duplicates)
+       - KVNode: basic put/get
+       - VectorClock: increment, merge, compare (all cases)
+       - Cluster: put + get returns correct value
+       - Cluster: value replicates to 3 nodes
+       - Cluster: read quorum reads from 2 nodes
+       - Cluster: write with node down still succeeds (if quorum met)
+       - Cluster: write fails if too many nodes down (quorum not met)
+       - Cluster: network partition isolates nodes
+       - Cluster: after heal, anti-entropy syncs data
+       - Cluster: concurrent writes to same key detected via vector clock
+       - Cluster: delete with tombstone
+       - Cluster: tombstone propagates via anti-entropy
+       - Gossip: membership converges after enough rounds
+       - Gossip: failure detection marks unresponsive node
+       - Gossip: node rejoin after failure
+       - Cluster: 100 random puts/gets maintain consistency
+       - Cluster: rebalance after node addition moves only affected keys
+
+    Run tests with: python3 -m pytest test_kv.py -v
+  evaluation:
+    - type: file_exists
+      path: consistent_hash.py
+    - type: file_exists
+      path: kv_store.py
+    - type: file_exists
+      path: membership.py
+    - type: file_exists
+      path: test_kv.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"consistent_hash.py\", doraise=True); py_compile.compile(\"kv_store.py\", doraise=True); py_compile.compile(\"membership.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_kv.py -v"
+      exit_code: 0
+      timeout: 60
+
+# ─── Impossible Tier (60 min timeout) ─────────────────────────────────────────
+# Tasks where even SOTA agents score <25%. Inspired by FeatureBench, SWE-bench Pro,
+# CVE-Bench, KernelBench research. These require deep algorithmic knowledge,
+# correct implementation of complex subsystems, and extensive testing.
+
+- id: impossible-compiler-optimizer
+  tier: impossible
+  name: Python Bytecode Optimizer
+  prompt: |
+    Build a Python bytecode optimizer that takes a function, disassembles its bytecode,
+    applies peephole optimizations, reassembles it, and verifies correctness.
+
+    Create two files:
+
+    1. optimizer.py — A bytecode optimization module with:
+       - class `BytecodeOptimizer`:
+         - `optimize(func) -> func` — takes a Python function, returns an optimized version
+         - Optimizations to implement:
+           a) **Constant folding**: Evaluate constant expressions at compile time
+              (e.g., `x = 2 * 3 * 7` → `x = 42`, `s = "hello" + " " + "world"` → `s = "hello world"`)
+           b) **Dead code elimination**: Remove code after unconditional return/raise
+           c) **Strength reduction**: Replace expensive ops with cheaper ones
+              (e.g., `x * 2` → `x + x`, `x ** 2` → `x * x`, `x * 1` → `x`, `x + 0` → `x`)
+           d) **Jump threading**: Optimize chains of jumps (jump to jump → direct jump)
+         - `get_stats() -> dict` — returns counts of each optimization applied
+         - Must handle: nested functions, closures, generators, default arguments
+         - The optimized function MUST produce identical results to the original for all inputs
+       - Uses the `dis`, `types`, and `opcode` modules from the standard library
+       - class `BytecodeVerifier`:
+         - `verify(original, optimized, test_inputs: list[tuple]) -> bool`
+         - Runs both functions with all test_inputs and verifies identical outputs
+         - Also checks: same exceptions raised, same side effects (via mock)
+
+    2. test_optimizer.py — At least 20 test cases with pytest:
+       - Constant folding: arithmetic expressions simplified
+       - Constant folding: string concatenation folded
+       - Dead code after return is removed
+       - Dead code after raise is removed
+       - Strength reduction: multiply by 2 → add
+       - Strength reduction: power of 2 → multiply
+       - Identity operations removed (x*1, x+0)
+       - Jump threading reduces instruction count
+       - Optimized function returns same results as original (10+ test functions)
+       - Closures still work after optimization
+       - Default arguments preserved
+       - Generator functions still yield correctly
+       - Recursive functions work after optimization
+       - Exception handling blocks preserved
+       - Verifier catches incorrect optimization (negative test)
+       - Stats correctly count optimizations applied
+       - Complex function with multiple optimization opportunities
+       - Optimization is idempotent (optimizing twice gives same result)
+       - Functions with decorators work
+       - Empty function optimization doesn't crash
+
+    Run tests with: python3 -m pytest test_optimizer.py -v
+  evaluation:
+    - type: file_exists
+      path: optimizer.py
+    - type: file_exists
+      path: test_optimizer.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"optimizer.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from optimizer import BytecodeOptimizer; opt = BytecodeOptimizer(); f = opt.optimize(lambda x: x * 2 + 0); print(f(21)); assert f(21) == 42\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_optimizer.py -v"
+      exit_code: 0
+      timeout: 60
+
+- id: impossible-database-engine
+  tier: impossible
+  name: Mini Relational Database Engine
+  prompt: |
+    Build a mini relational database from scratch with B-tree storage, SQL parser,
+    query planner, and ACID transactions.
+
+    Create four files:
+
+    1. storage.py — B-tree storage engine:
+       - class `BTree`:
+         - Order-configurable B-tree (default order=4)
+         - `insert(key, value)`, `get(key) -> value`, `delete(key) -> bool`
+         - `range_scan(start_key, end_key) -> list[tuple]` — inclusive range query
+         - `scan_all() -> list[tuple]` — full scan in key order
+         - Supports string and integer keys with proper comparison
+       - class `Table`:
+         - Backed by a BTree (primary key index)
+         - Schema: table name, column definitions (name, type: str/int/float/bool, nullable, default)
+         - `insert_row(row: dict)`, `get_row(pk) -> dict`, `delete_row(pk) -> bool`, `update_row(pk, updates: dict)`
+         - `scan(predicate=None) -> list[dict]` — full scan with optional filter
+         - Auto-increment primary key support
+         - Secondary indexes: `create_index(column)` → creates a BTree index for faster lookups
+
+    2. parser.py — SQL parser:
+       - `parse(sql: str) -> Statement` — parses SQL into AST
+       - Supported SQL:
+         - `SELECT col1, col2 FROM table WHERE cond ORDER BY col [ASC|DESC] LIMIT n`
+         - `SELECT ... FROM t1 JOIN t2 ON t1.col = t2.col`
+         - `SELECT col, COUNT(*), SUM(col), AVG(col) FROM table GROUP BY col HAVING cond`
+         - `INSERT INTO table (col1, col2) VALUES (val1, val2)`
+         - `UPDATE table SET col1 = val1 WHERE cond`
+         - `DELETE FROM table WHERE cond`
+         - `CREATE TABLE name (col1 type, col2 type, PRIMARY KEY (col))`
+         - WHERE conditions: `=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `LIKE`, `IN`, `IS NULL`, `IS NOT NULL`
+       - Handles: string literals, numbers, NULL, boolean values
+       - Returns meaningful parse errors with position
+
+    3. planner.py — Query optimizer:
+       - class `QueryPlanner`:
+         - `plan(statement, tables: dict) -> QueryPlan`
+         - Chooses between index scan vs full scan based on available indexes
+         - Cost estimation: index scan = O(log n), full scan = O(n)
+         - JOIN strategy: nested loop join (with index if available) vs hash join for equality
+         - Predicate pushdown: push WHERE filters as close to scan as possible
+       - class `QueryPlan`:
+         - Tree of plan nodes: Scan, IndexScan, Filter, Join, Sort, Limit, Aggregate, Project
+         - `explain() -> str` — human-readable execution plan (like EXPLAIN in Postgres)
+
+    4. engine.py — Query execution engine:
+       - class `Database`:
+         - `execute(sql: str) -> Result` — parse, plan, execute
+         - `create_table(sql)`, `insert(sql)`, `select(sql)`, `update(sql)`, `delete(sql)`
+         - Transaction support:
+           - `begin()`, `commit()`, `rollback()`
+           - WAL (Write-Ahead Log): operations logged before applied
+           - Isolation: snapshot reads within a transaction
+         - `Result` has: rows (list[dict]), affected_count, columns, execution_time
+       - Thread-safe for concurrent readers (single writer via lock)
+
+    Also create:
+    5. test_database.py — At least 25 test cases with pytest:
+       - BTree insert/get/delete
+       - BTree range scan
+       - Table insert and retrieve row
+       - Table update row
+       - Table delete row
+       - Auto-increment PK
+       - Secondary index speeds up lookup
+       - SQL: simple SELECT
+       - SQL: SELECT with WHERE
+       - SQL: SELECT with JOIN
+       - SQL: SELECT with GROUP BY and aggregate
+       - SQL: SELECT with ORDER BY
+       - SQL: SELECT with LIMIT
+       - SQL: INSERT
+       - SQL: UPDATE with WHERE
+       - SQL: DELETE with WHERE
+       - SQL: CREATE TABLE
+       - WHERE with AND/OR
+       - WHERE with LIKE
+       - NULL handling
+       - Transaction commit
+       - Transaction rollback
+       - Query plan uses index when available
+       - Query explain output is readable
+       - Concurrent readers don't block
+
+    Run tests with: python3 -m pytest test_database.py -v
+  evaluation:
+    - type: file_exists
+      path: storage.py
+    - type: file_exists
+      path: parser.py
+    - type: file_exists
+      path: planner.py
+    - type: file_exists
+      path: engine.py
+    - type: file_exists
+      path: test_database.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"storage.py\", doraise=True); py_compile.compile(\"parser.py\", doraise=True); py_compile.compile(\"planner.py\", doraise=True); py_compile.compile(\"engine.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from engine import Database; db = Database(); db.execute('CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)'); db.execute(\\\"INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)\\\"); r = db.execute('SELECT * FROM users'); print(r.rows); assert len(r.rows) == 1\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_database.py -v"
+      exit_code: 0
+      timeout: 60
+
+- id: impossible-type-checker
+  tier: impossible
+  name: TypeScript Type Checker
+  prompt: |
+    Build a type checker for a subset of TypeScript that can parse type annotations,
+    perform type inference, and detect type errors.
+
+    Create three files:
+
+    1. ts_lexer.py — Lexer/tokenizer:
+       - `tokenize(source: str) -> list[Token]`
+       - Token types: NUMBER, STRING, IDENTIFIER, KEYWORD, OPERATOR, PUNCTUATION, TYPE_ANNOTATION, EOF
+       - Keywords: let, const, function, return, if, else, class, interface, type, extends, implements, new, null, undefined, true, false, void, any, never
+       - Operators: =, ==, ===, !=, !==, <, >, <=, >=, +, -, *, /, %, &&, ||, !, :, ?, =>, |, &, .
+       - Type-related: <, >, [] (for generics and arrays)
+       - Handle: template literals (backtick strings), arrow functions, optional chaining (?.)
+       - Track line and column for error reporting
+
+    2. ts_parser.py — Parser producing typed AST:
+       - `parse(tokens: list[Token]) -> Program`
+       - AST nodes for:
+         - Variable declarations: `let x: number = 5`, `const s: string = "hello"`
+         - Function declarations: `function add(a: number, b: number): number { return a + b; }`
+         - Arrow functions: `const fn = (x: number): string => x.toString()`
+         - Type annotations: primitives (number, string, boolean, null, undefined, void, any, never)
+         - Array types: `number[]`, `Array<string>`
+         - Object types: `{ name: string, age: number }`
+         - Union types: `string | number`
+         - Intersection types: `A & B`
+         - Generic types: `Array<T>`, `Map<K, V>`
+         - Interface declarations: `interface User { name: string; age?: number; }`
+         - Type aliases: `type ID = string | number`
+         - Function types: `(a: number) => string`
+         - If/else, return, assignment, binary expressions, call expressions
+       - Error recovery: continue parsing after errors, collect all diagnostics
+
+    3. ts_checker.py — Type checker:
+       - class `TypeChecker`:
+         - `check(program: Program) -> list[Diagnostic]`
+         - Type environment (scope chain) for variable lookups
+         - **Type inference**:
+           - Infer variable types from initializers: `let x = 5` → x is number
+           - Infer function return types from return statements
+           - Infer array element types: `[1, 2, 3]` → number[]
+         - **Type checking rules**:
+           - Assignment: RHS must be assignable to LHS type
+           - Function calls: argument types must match parameter types
+           - Argument count must match parameter count
+           - Return type must match declared return type
+           - Property access: object must have the property
+           - Union narrowing: `if (typeof x === "string")` narrows x to string in the block
+           - Null checks: `if (x !== null)` narrows away null
+         - **Generic instantiation**:
+           - `Array<number>` — substitute T=number in Array<T>
+           - `Map<string, number>` — substitute K=string, V=number
+           - Infer generic type arguments from usage
+         - **Structural typing**: interface compatibility based on shape (duck typing)
+         - **Optional properties**: `age?: number` means `number | undefined`
+         - Diagnostic has: message, line, column, severity (error/warning)
+         - `format_diagnostics() -> str` — pretty-print errors like tsc output
+
+    Also create:
+    4. test_checker.py — At least 25 test cases with pytest:
+       - Primitive type assignment (valid)
+       - Type mismatch error (number = string)
+       - Function parameter type mismatch
+       - Function argument count mismatch
+       - Return type mismatch
+       - Type inference for variables
+       - Type inference for function return
+       - Array type checking
+       - Union type assignment (valid)
+       - Union type narrowing with typeof
+       - Null check narrowing
+       - Object property access (valid)
+       - Missing property error
+       - Optional property handling
+       - Interface structural compatibility
+       - Interface incompatibility error
+       - Generic type instantiation
+       - Generic type inference from arguments
+       - Type alias resolution
+       - Nested scope variable lookup
+       - Const reassignment error
+       - Arrow function type checking
+       - Complex: function taking union type, returning conditional
+       - Any type is compatible with everything
+       - Never type is assignable to nothing
+
+    Run tests with: python3 -m pytest test_checker.py -v
+  evaluation:
+    - type: file_exists
+      path: ts_lexer.py
+    - type: file_exists
+      path: ts_parser.py
+    - type: file_exists
+      path: ts_checker.py
+    - type: file_exists
+      path: test_checker.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"ts_lexer.py\", doraise=True); py_compile.compile(\"ts_parser.py\", doraise=True); py_compile.compile(\"ts_checker.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from ts_lexer import tokenize; from ts_parser import parse; from ts_checker import TypeChecker; tokens = tokenize('let x: number = 5;'); prog = parse(tokens); tc = TypeChecker(); diags = tc.check(prog); print(f'{len(diags)} errors'); assert len(diags) == 0\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_checker.py -v"
+      exit_code: 0
+      timeout: 60
+
+- id: impossible-concurrent-data-structures
+  tier: impossible
+  name: Lock-Free Concurrent Data Structures
+  prompt: |
+    Implement thread-safe, lock-free data structures with linearizability tests
+    under heavy concurrent stress.
+
+    Create two files:
+
+    1. concurrent_ds.py — Lock-free data structures using only `threading` and `ctypes`
+       (no `queue.Queue` or `multiprocessing` high-level structures):
+
+       a) **Treiber Stack** (lock-free stack using CAS):
+          - class `LockFreeStack`:
+            - `push(value)` — atomic push using compare-and-swap loop
+            - `pop() -> value | None` — atomic pop using CAS
+            - `peek() -> value | None`
+            - `size() -> int` (approximate, not linearizable)
+            - `is_empty() -> bool`
+          - Uses AtomicReference class wrapping a node pointer with CAS operation
+          - Handles ABA problem with tagged pointers (version counter)
+
+       b) **Michael-Scott Queue** (lock-free FIFO queue):
+          - class `LockFreeQueue`:
+            - `enqueue(value)` — lock-free enqueue with CAS on tail
+            - `dequeue() -> value | None` — lock-free dequeue with CAS on head
+            - `peek() -> value | None`
+            - `size() -> int` (approximate)
+          - Sentinel node design (dummy head node)
+          - Handles the tricky case where tail falls behind
+
+       c) **Concurrent Skip List** (lock-free sorted structure):
+          - class `ConcurrentSkipList`:
+            - `insert(key, value)` — lock-free insert with CAS at each level
+            - `search(key) -> value | None` — wait-free search
+            - `delete(key) -> bool` — logical deletion then physical removal
+            - `range_query(low, high) -> list[tuple]` — range scan
+            - `size() -> int`
+          - Max 16 levels, probabilistic level assignment (p=0.5)
+
+       d) **ReaderWriterLock** with writer starvation prevention:
+          - class `FairRWLock`:
+            - `acquire_read()` / `release_read()`
+            - `acquire_write()` / `release_write()`
+            - Context managers: `read_lock()`, `write_lock()` (for `with` statement)
+            - Writers get priority: once a writer is waiting, no new readers enter
+            - Prevents writer starvation via an arrival-order ticket system
+
+       Each data structure must include docstrings explaining the linearizability
+       argument (proof sketch) for its key operations.
+
+    2. test_concurrent_ds.py — At least 25 test cases with pytest:
+       - Stack: basic push/pop single-threaded
+       - Stack: push N items, pop N items, verify LIFO order
+       - Stack: 50 threads pushing 200 items each, all items accounted for
+       - Stack: 50 threads doing mixed push/pop, no crashes or lost items
+       - Stack: ABA problem doesn't corrupt state
+       - Queue: basic enqueue/dequeue single-threaded
+       - Queue: enqueue N items, dequeue N items, verify FIFO order
+       - Queue: 50 threads enqueuing 200 items, all dequeued correctly
+       - Queue: 50 threads doing mixed enqueue/dequeue
+       - Queue: empty dequeue returns None
+       - SkipList: basic insert/search
+       - SkipList: insert 1000 keys, all searchable
+       - SkipList: delete removes key
+       - SkipList: range_query returns correct range
+       - SkipList: 20 threads inserting different keys concurrently
+       - SkipList: concurrent insert + search
+       - RWLock: multiple readers can hold lock simultaneously
+       - RWLock: writer has exclusive access
+       - RWLock: writer waits for readers to finish
+       - RWLock: writer starvation prevention (writer gets priority over new readers)
+       - RWLock: context manager works correctly
+       - RWLock: 10 reader threads + 5 writer threads, data consistency
+       - Stress: 100 threads, 1000 operations each on stack, verify total count
+       - Stress: 100 threads, 1000 operations each on queue, verify total count
+       - Linearizability: sequential specification matches concurrent execution
+
+    Run tests with: python3 -m pytest test_concurrent_ds.py -v
+  evaluation:
+    - type: file_exists
+      path: concurrent_ds.py
+    - type: file_exists
+      path: test_concurrent_ds.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"concurrent_ds.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from concurrent_ds import LockFreeStack, LockFreeQueue; s = LockFreeStack(); s.push(1); s.push(2); assert s.pop() == 2; q = LockFreeQueue(); q.enqueue('a'); assert q.dequeue() == 'a'; print('basic ok')\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_concurrent_ds.py -v"
+      exit_code: 0
+      timeout: 120
+
+- id: impossible-network-protocol
+  tier: impossible
+  name: Reliable Transport Protocol
+  prompt: |
+    Implement a TCP-like reliable transport protocol over a simulated unreliable channel
+    that drops 20% of packets, reorders them, and introduces duplicates.
+
+    Create three files:
+
+    1. channel.py — Unreliable network channel simulator:
+       - class `UnreliableChannel`:
+         - `__init__(loss_rate=0.2, reorder_rate=0.1, duplicate_rate=0.05, delay_range=(0.001, 0.01))`
+         - `send(packet: bytes, dest: str)` — simulates sending; may drop, reorder, duplicate, delay
+         - `receive(timeout: float = 1.0) -> tuple[bytes, str] | None` — blocking receive
+         - Internal: uses threading + queues to simulate async network
+         - Configurable: can set loss_rate=0 for testing reliability in ideal conditions
+       - class `Packet`:
+         - `seq_num: int` — sequence number
+         - `ack_num: int` — acknowledgment number
+         - `flags: set` — SYN, ACK, FIN, RST
+         - `window_size: int` — receive window
+         - `data: bytes`
+         - `sack_blocks: list[tuple[int, int]]` — selective ACK ranges
+         - `checksum: int` — CRC32 checksum
+         - `serialize() -> bytes` / `@staticmethod deserialize(data: bytes) -> Packet`
+         - Checksum validation to detect corruption
+
+    2. transport.py — Reliable transport protocol:
+       - class `ReliableTransport`:
+         - **Connection establishment**: 3-way handshake (SYN, SYN-ACK, ACK)
+         - `connect(peer: str)` — active open (client)
+         - `listen()` / `accept() -> Connection` — passive open (server)
+         - **Reliable delivery**:
+           - Sliding window protocol with configurable window size
+           - Selective ACK (SACK): receiver reports gaps so sender retransmits only lost segments
+           - Cumulative ACK: acknowledges all data up to ack_num
+           - Retransmission timeout (RTO): adaptive based on RTT estimation (Jacobson/Karels algorithm)
+           - Fast retransmit: retransmit on 3 duplicate ACKs without waiting for timeout
+         - **Congestion control**:
+           - Slow start: cwnd starts at 1 MSS, doubles each RTT until ssthresh
+           - Congestion avoidance: linear increase after ssthresh (additive increase)
+           - On packet loss (timeout): ssthresh = cwnd/2, cwnd = 1 MSS (multiplicative decrease)
+           - On 3 dup ACKs: fast recovery (ssthresh = cwnd/2, cwnd = ssthresh + 3)
+         - **Data transfer**:
+           - `send(data: bytes)` — segments data into MSS-sized chunks, sends reliably
+           - `receive(size: int) -> bytes` — receives data reliably, returns in-order bytes
+           - Handles out-of-order delivery using receive buffer
+           - Flow control: receiver advertises window size
+         - **Connection teardown**: 4-way FIN handshake (FIN, ACK, FIN, ACK)
+         - `close()` — graceful shutdown
+
+    3. test_transport.py — At least 20 test cases with pytest:
+       - 3-way handshake completes successfully
+       - Send and receive small message (< 1 MSS)
+       - Send and receive message spanning multiple segments
+       - Send 1MB data reliably over lossy channel (verify byte-for-byte match)
+       - Send 10MB data reliably (99.9% delivery)
+       - Packet loss triggers retransmission
+       - Selective ACK fills gaps correctly
+       - Fast retransmit on 3 duplicate ACKs
+       - Congestion window grows during slow start
+       - Congestion window decreases on loss
+       - RTT estimation adapts to channel conditions
+       - Flow control: sender respects receiver window
+       - Connection teardown completes cleanly
+       - Simultaneous close (both sides FIN)
+       - Data integrity: checksum detects corruption
+       - Duplicate packets are handled (not delivered twice)
+       - Out-of-order packets are reordered
+       - Zero-loss channel: all data delivered with maximum throughput
+       - High-loss channel (50%): still delivers all data
+       - Stress: 100 concurrent connections, each sending 10KB
+
+    Run tests with: python3 -m pytest test_transport.py -v
+  evaluation:
+    - type: file_exists
+      path: channel.py
+    - type: file_exists
+      path: transport.py
+    - type: file_exists
+      path: test_transport.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"channel.py\", doraise=True); py_compile.compile(\"transport.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -m pytest test_transport.py -v --timeout=120"
+      exit_code: 0
+      timeout: 600
+
+- id: impossible-constraint-solver
+  tier: impossible
+  name: SAT/CSP Constraint Solver
+  prompt: |
+    Build a SAT solver implementing DPLL with conflict-driven clause learning (CDCL)
+    and apply it to solve constraint satisfaction problems.
+
+    Create two files:
+
+    1. solver.py — CDCL SAT solver:
+       - class `CDCLSolver`:
+         - `solve(clauses: list[list[int]]) -> dict[int, bool] | None`
+           — Takes CNF formula as list of clauses (each clause is a list of signed integers,
+             positive = true, negative = negated). Returns satisfying assignment or None if UNSAT.
+         - **DPLL with CDCL**:
+           a) **Unit propagation**: If a clause has one unassigned literal, assign it
+           b) **Pure literal elimination**: If a variable appears with only one polarity, assign it
+           c) **VSIDS branching heuristic**: Score variables by recent conflict involvement,
+              decay scores periodically, pick highest-scored unassigned variable
+           d) **Conflict analysis**: On conflict, analyze implication graph to find the
+              first UIP (Unique Implication Point) and learn a conflict clause
+           e) **Non-chronological backtracking**: Backtrack to the second-highest decision
+              level in the learned clause (not just one level up)
+           f) **Learned clause minimization**: Remove redundant literals from learned clauses
+         - `solve_dimacs(text: str) -> dict[int, bool] | None` — parse DIMACS CNF format
+         - `get_stats() -> dict` — returns: decisions, propagations, conflicts, learned_clauses, restarts
+         - **Restart strategy**: Luby sequence restarts
+
+       - class `CSPSolver`:
+         - `solve(variables, domains, constraints) -> dict | None`
+           — Encodes CSP as SAT and solves
+         - Built-in constraint types:
+           - `all_different(variables)` — all must have different values
+           - `exactly_one(variables)` — exactly one is true
+           - `at_most_k(variables, k)` — at most k are true
+
+       - Application functions (using CSPSolver):
+         - `solve_sudoku(grid: list[list[int]]) -> list[list[int]] | None`
+           — 9x9 grid, 0 = empty. Returns solved grid or None.
+         - `solve_nqueens(n: int) -> list[int] | None`
+           — Returns list of column positions for queens, or None. Solve for N=12.
+         - `solve_graph_coloring(adj: dict, n_colors: int) -> dict[str, int] | None`
+           — Returns node→color mapping or None.
+         - `parse_dimacs(text: str) -> list[list[int]]` — parse DIMACS CNF format
+
+    2. test_solver.py — At least 25 test cases with pytest:
+       - Unit propagation simplifies formula
+       - Pure literal elimination works
+       - Simple SAT instance (2 variables, 3 clauses)
+       - Simple UNSAT instance (1 variable, contradictory clauses)
+       - VSIDS picks most active variable
+       - Conflict clause learning adds useful clause
+       - Non-chronological backtracking jumps correctly
+       - DIMACS format parsing
+       - Solve known SAT instance (pigeonhole small case)
+       - Prove known UNSAT instance (pigeonhole principle for n+1 pigeons, n holes, small n)
+       - Sudoku: solve easy puzzle
+       - Sudoku: solve hard puzzle
+       - Sudoku: detect unsolvable puzzle returns None
+       - N-Queens: solve N=8 correctly
+       - N-Queens: solve N=12
+       - Graph coloring: 3-color a planar graph
+       - Graph coloring: detect un-colorable graph
+       - all_different constraint works
+       - exactly_one constraint works
+       - at_most_k constraint works
+       - Random 3-SAT instance (50 vars, 200 clauses) solved or proved UNSAT
+       - Restart actually occurs (stats show restarts > 0 for hard instance)
+       - Learned clause count grows during solving
+       - Stats reporting works
+       - Solver handles empty formula (trivially SAT)
+       - Solver handles single-clause formula
+       - Large instance: 100 variables, 400 clauses, solves in < 30s
+
+    Run tests with: python3 -m pytest test_solver.py -v
+  evaluation:
+    - type: file_exists
+      path: solver.py
+    - type: file_exists
+      path: test_solver.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"solver.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from solver import CDCLSolver; s = CDCLSolver(); r = s.solve([[1, 2], [-1, 2], [1, -2]]); print(r); assert r is not None and r[2] == True\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c \"from solver import solve_sudoku; grid = [[5,3,0,0,7,0,0,0,0],[6,0,0,1,9,5,0,0,0],[0,9,8,0,0,0,0,6,0],[8,0,0,0,6,0,0,0,3],[4,0,0,8,0,3,0,0,1],[7,0,0,0,2,0,0,0,6],[0,6,0,0,0,0,2,8,0],[0,0,0,4,1,9,0,0,5],[0,0,0,0,8,0,0,7,9]]; r = solve_sudoku(grid); print(r[0]); assert all(sum(row) == 45 for row in r)\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_solver.py -v"
+      exit_code: 0
+      timeout: 120
+
+# ─── Shizuha-Favorable Tasks ────────────────────────────────────────────────
+# Tasks designed to favor iterative agents with error-aware continuation,
+# multi-file operations, and test-driven debugging workflows.
+# These require multiple fix-test cycles to achieve 100% pass rate.
+
+- id: extreme-debug-marathon
+  tier: extreme
+  name: Debug Marathon (10 Seeded Bugs)
+  prompt: |
+    You are given a buggy expression evaluator. Create the file `evaluator.py` with
+    EXACTLY the following buggy code (copy it precisely, bugs and all), then create
+    a comprehensive test file, find ALL 10 bugs, and fix them.
+
+    Here is the buggy evaluator.py — create this file first:
+
+    ```python
+    """Expression evaluator with 10 seeded bugs. Find and fix them all."""
+    import operator
+    import math
+
+    class Token:
+        def __init__(self, type_, value):
+            self.type = type_
+            self.value = value
+        def __repr__(self):
+            return f"Token({self.type}, {self.value!r})"
+
+    class Lexer:
+        def __init__(self, text):
+            self.text = text
+            self.pos = 0
+
+        def tokenize(self):
+            tokens = []
+            while self.pos < len(self.text):
+                ch = self.text[self.pos]
+                if ch.isspace():
+                    self.pos += 1
+                elif ch.isdigit() or ch == '.':
+                    tokens.append(self._number())
+                elif ch.isalpha() or ch == '_':
+                    tokens.append(self._identifier())
+                elif ch in '+-*/%^':
+                    tokens.append(Token('OP', ch))
+                    self.pos += 1
+                elif ch == '(':
+                    tokens.append(Token('LPAREN', ch))
+                    self.pos += 1
+                elif ch == ')':
+                    tokens.append(Token('RPAREN', ch))
+                    self.pos += 1
+                elif ch == ',':
+                    tokens.append(Token('COMMA', ch))
+                    self.pos += 1
+                # BUG 1: negative numbers not handled (e.g., "-3" as unary minus)
+                else:
+                    raise SyntaxError(f"Unexpected character: {ch!r} at position {self.pos}")
+            tokens.append(Token('EOF', None))
+            return tokens
+
+        def _number(self):
+            start = self.pos
+            has_dot = False
+            while self.pos < len(self.text) and (self.text[self.pos].isdigit() or self.text[self.pos] == '.'):
+                if self.text[self.pos] == '.':
+                    if has_dot:
+                        break  # second dot ends the number
+                    has_dot = True
+                self.pos += 1
+            # BUG 2: always returns int, even for floats like "3.14"
+            return Token('NUMBER', int(self.text[start:self.pos]))
+
+        def _identifier(self):
+            start = self.pos
+            while self.pos < len(self.text) and (self.text[self.pos].isalnum() or self.text[self.pos] == '_'):
+                self.pos += 1
+            return Token('ID', self.text[start:self.pos])
+
+    class Parser:
+        """Recursive descent parser for expressions."""
+        def __init__(self, tokens):
+            self.tokens = tokens
+            self.pos = 0
+
+        def parse(self):
+            result = self.expression()
+            if self.current().type != 'EOF':
+                raise SyntaxError(f"Unexpected token: {self.current()}")
+            return result
+
+        def current(self):
+            return self.tokens[self.pos]
+
+        def eat(self, type_):
+            tok = self.current()
+            if tok.type != type_:
+                raise SyntaxError(f"Expected {type_}, got {tok}")
+            self.pos += 1
+            return tok
+
+        def expression(self):
+            return self.addition()
+
+        def addition(self):
+            left = self.multiplication()
+            while self.current().type == 'OP' and self.current().value in ('+', '-'):
+                op = self.eat('OP').value
+                right = self.multiplication()
+                if op == '+':
+                    left = left + right
+                else:
+                    # BUG 3: subtraction is reversed (right - left instead of left - right)
+                    left = right - left
+            return left
+
+        def multiplication(self):
+            left = self.power()
+            while self.current().type == 'OP' and self.current().value in ('*', '/', '%'):
+                op = self.eat('OP').value
+                right = self.power()
+                if op == '*':
+                    left = left * right
+                elif op == '/':
+                    if right == 0:
+                        raise ZeroDivisionError("Division by zero")
+                    # BUG 4: integer division used instead of true division
+                    left = left // right
+                else:
+                    left = left % right
+            return left
+
+        def power(self):
+            base = self.unary()
+            # BUG 5: power is left-associative (should be right-associative)
+            # e.g., 2^3^2 should be 2^(3^2)=512, not (2^3)^2=64
+            while self.current().type == 'OP' and self.current().value == '^':
+                self.eat('OP')
+                exp = self.unary()
+                base = base ** exp
+            return base
+
+        def unary(self):
+            if self.current().type == 'OP' and self.current().value in ('+', '-'):
+                op = self.eat('OP').value
+                val = self.unary()
+                # BUG 6: unary minus doesn't negate (returns val instead of -val)
+                return val if op == '+' else val
+            return self.primary()
+
+        def primary(self):
+            tok = self.current()
+            if tok.type == 'NUMBER':
+                self.eat('NUMBER')
+                return tok.value
+            elif tok.type == 'LPAREN':
+                self.eat('LPAREN')
+                result = self.expression()
+                self.eat('RPAREN')
+                return result
+            elif tok.type == 'ID':
+                name = self.eat('ID').value
+                if self.current().type == 'LPAREN':
+                    return self.function_call(name)
+                return self.variable_lookup(name)
+            raise SyntaxError(f"Unexpected token: {tok}")
+
+        def function_call(self, name):
+            self.eat('LPAREN')
+            args = []
+            if self.current().type != 'RPAREN':
+                args.append(self.expression())
+                while self.current().type == 'COMMA':
+                    self.eat('COMMA')
+                    args.append(self.expression())
+            self.eat('RPAREN')
+            return self.call_function(name, args)
+
+        def variable_lookup(self, name):
+            constants = {'pi': math.pi, 'e': math.e, 'tau': math.tau}
+            if name in constants:
+                return constants[name]
+            raise NameError(f"Undefined variable: {name}")
+
+        def call_function(self, name, args):
+            functions = {
+                'abs': (1, abs),
+                'sqrt': (1, math.sqrt),
+                'sin': (1, math.sin),
+                'cos': (1, math.cos),
+                'tan': (1, math.tan),
+                'log': (1, math.log),  # BUG 7: log should support 1 or 2 args (log(x) and log(x, base))
+                'max': (2, max),
+                'min': (2, min),
+                'pow': (2, pow),
+                'round': (1, round),  # BUG 8: round should support 1 or 2 args (round(x) and round(x, ndigits))
+            }
+            if name not in functions:
+                raise NameError(f"Unknown function: {name}")
+            expected_args, func = functions[name]
+            # BUG 9: strict arg count check prevents variable-arg functions from working
+            if len(args) != expected_args:
+                raise TypeError(f"{name}() expects {expected_args} args, got {len(args)}")
+            return func(*args)
+
+
+    class Evaluator:
+        """Main evaluator class."""
+        def __init__(self):
+            self.variables = {}
+
+        def evaluate(self, expression):
+            """Evaluate a mathematical expression string."""
+            if not expression or not expression.strip():
+                # BUG 10: returns None instead of raising an error for empty input
+                return None
+            lexer = Lexer(expression.strip())
+            tokens = lexer.tokenize()
+            parser = Parser(tokens)
+            return parser.parse()
+
+        def set_variable(self, name, value):
+            self.variables[name] = value
+    ```
+
+    After creating the file with the buggy code above, do the following:
+
+    1. Create `test_evaluator.py` with at least 30 test cases using pytest that cover:
+       - Basic arithmetic: addition, subtraction, multiplication, division, modulo
+       - Floating point numbers: 3.14, 0.5, etc.
+       - Operator precedence: 2 + 3 * 4 = 14, not 20
+       - Power operator: 2^10 = 1024, right-associativity (2^3^2 = 512)
+       - Unary minus: -5, -(3+2), -(-3)
+       - Parentheses: (2 + 3) * 4 = 20
+       - Functions: sqrt(16)=4, abs(-5)=5, sin(0)=0, max(3,7)=7
+       - Variable-arg functions: log(100, 10) = 2.0, round(3.14159, 2) = 3.14
+       - Constants: pi, e, tau
+       - Division: 7/2 = 3.5 (NOT 3), 10/3 ≈ 3.333...
+       - Nested expressions: sqrt(abs(-16)), max(2^3, 3^2)
+       - Empty input: should raise an error, NOT return None
+       - Division by zero: should raise ZeroDivisionError
+       - Complex: (2 + 3) * -4 = -20, -2^2 = -4 (unary minus has lower precedence than power)
+       - Edge cases: very large numbers, very small decimals
+
+    2. Run the tests — they should initially fail on the bugs.
+
+    3. Fix ALL 10 bugs in evaluator.py:
+       - Bug 1: Handle negative number literals in lexer (or ensure unary minus works in all positions)
+       - Bug 2: Return float when number contains a decimal point
+       - Bug 3: Fix subtraction order (left - right, not right - left)
+       - Bug 4: Use true division (/) not integer division (//)
+       - Bug 5: Make power right-associative
+       - Bug 6: Make unary minus actually negate the value
+       - Bug 7: Make log() accept 1 or 2 arguments
+       - Bug 8: Make round() accept 1 or 2 arguments
+       - Bug 9: Fix arg count checking to allow variable-arg functions
+       - Bug 10: Raise ValueError for empty input instead of returning None
+
+    4. Run tests again — ALL tests must pass.
+
+    The final evaluator.py must work correctly for all the above cases.
+    Run tests with: python3 -m pytest test_evaluator.py -v
+  evaluation:
+    - type: file_exists
+      path: evaluator.py
+    - type: file_exists
+      path: test_evaluator.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"evaluator.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from evaluator import Evaluator; e = Evaluator(); assert e.evaluate('2 + 3') == 5; assert e.evaluate('7 / 2') == 3.5; assert e.evaluate('3.14') == 3.14; print('basic ok')\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c \"from evaluator import Evaluator; e = Evaluator(); assert e.evaluate('10 - 3') == 7; assert e.evaluate('2^3^2') == 512; assert e.evaluate('-5') == -5; print('ops ok')\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c \"from evaluator import Evaluator; e = Evaluator(); import math; assert e.evaluate('sqrt(16)') == 4; assert abs(e.evaluate('log(100, 10)') - 2.0) < 0.001; assert e.evaluate('round(3.14159, 2)') == 3.14; print('funcs ok')\""
+      exit_code: 0
+    - type: run_command
+      command: |
+        python3 << 'PYEOF'
+        from evaluator import Evaluator
+        e = Evaluator()
+        try:
+            e.evaluate('')
+            assert False, 'should raise'
+        except (ValueError, SyntaxError):
+            pass
+        print('empty ok')
+        PYEOF
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_evaluator.py -v"
+      exit_code: 0
+
+- id: nightmare-property-testing
+  tier: nightmare
+  name: Property-Based Testing Framework
+  prompt: |
+    Build a property-based testing framework (like a mini Hypothesis) from scratch.
+    Do NOT use the `hypothesis` library.
+
+    Create two files:
+
+    1. proptest.py — A property-based testing framework with:
+
+       **Strategies (data generators)**:
+       - class `Strategy`: base class with `generate(random: Random, size: int) -> value`
+       - `integers(min_val=None, max_val=None)` → generates random ints in range
+       - `floats(min_val=None, max_val=None, allow_nan=False, allow_inf=False)` → random floats
+       - `booleans()` → True/False
+       - `text(min_size=0, max_size=None, alphabet=None)` → random strings
+       - `binary(min_size=0, max_size=None)` → random bytes
+       - `lists(element_strategy, min_size=0, max_size=None)` → random lists
+       - `tuples(*strategies)` → tuple of values from each strategy
+       - `dictionaries(keys, values, min_size=0, max_size=None)` → random dicts
+       - `one_of(*strategies)` → picks one strategy randomly
+       - `just(value)` → always returns the same value
+       - `none()` → always returns None
+       - `sampled_from(elements)` → picks from a list
+       - `builds(target_class, *arg_strategies, **kwarg_strategies)` → constructs objects
+       - `recursive(base, extend, max_leaves=50)` → recursive data (e.g., JSON-like trees)
+       - `.map(fn)` → transform generated values
+       - `.filter(predicate)` → reject values that don't match (with retry limit)
+
+       **Shrinking** (find minimal failing example):
+       - Each strategy has a `shrink(value) -> Iterable[value]` method
+       - Integer shrinking: binary search toward 0
+       - String shrinking: remove characters, reduce character values
+       - List shrinking: remove elements, shrink individual elements
+       - Tuple shrinking: shrink each component
+       - Dict shrinking: remove keys, shrink values
+       - Shrinking preserves the property failure (only keeps shrinks that still fail)
+       - Maximum 1000 shrink attempts to prevent infinite loops
+
+       **Test runner**:
+       - `@given(*strategies)` decorator that runs the test function with random data
+       - Default: 100 examples per test (configurable via `settings(max_examples=N)`)
+       - Seeds are reproducible: `@settings(seed=42)` gives deterministic results
+       - On failure:
+         1. Record the failing example
+         2. Shrink to find minimal failing example
+         3. Raise `PropertyFailed` with: original example, shrunk example, seed, num_examples_tried
+       - `@settings(max_examples=N, seed=S, deadline=T)` — configuration
+       - `find(strategy, predicate)` — find a value satisfying the predicate
+       - `assume(condition)` — skip example if condition is False (like Hypothesis assume)
+
+       **Stateful testing**:
+       - class `RuleBasedStateMachine`:
+         - Define rules as methods decorated with `@rule(arg=strategy)`
+         - `@initialize(...)` — setup method
+         - `@invariant` — checked after every rule
+         - `run_state_machine(machine_class, max_steps=50)` — execute random sequence of rules
+         - Shrinking for stateful tests: remove steps from the sequence
+
+    2. test_proptest.py — At least 30 test cases with pytest:
+       - integers() generates ints in specified range
+       - floats() generates floats, respects nan/inf flags
+       - text() generates strings with correct alphabet and size
+       - lists() generates lists with correct element type and size
+       - one_of() picks from different strategies
+       - map() transforms values correctly
+       - filter() rejects non-matching values, raises on too many rejections
+       - @given with single strategy runs 100 examples
+       - @given with multiple strategies passes multiple args
+       - @given detects failure: property that ints > 100 (will find counterexample)
+       - Shrinking: failing int is shrunk toward minimal value
+       - Shrinking: failing list is shrunk to minimal size
+       - Shrinking: failing string is shrunk to minimal
+       - Reproducible: same seed gives same examples
+       - settings(max_examples=10) only runs 10 examples
+       - assume() skips examples without counting as failure
+       - find() locates a value satisfying the predicate
+       - dictionaries() generates correct structure
+       - tuples() generates correct shape
+       - recursive() generates nested structures
+       - builds() constructs objects correctly
+       - sampled_from() picks from list
+       - PropertyFailed contains original and shrunk examples
+       - PropertyFailed is raised (not swallowed)
+       - Stateful: simple counter machine (increment/decrement, invariant >= 0)
+       - Stateful: list machine (append/pop, invariant: len matches count)
+       - Stateful: finds bug when invariant is violated
+       - Stateful: shrinks step sequence to minimal
+       - binary() generates correct size bytes
+       - Edge: empty range integers raises or handles gracefully
+       - Stress: 1000-example run completes in < 10 seconds
+       - Shrinking converges: doesn't infinite loop
+
+    Run tests with: python3 -m pytest test_proptest.py -v
+  evaluation:
+    - type: file_exists
+      path: proptest.py
+    - type: file_exists
+      path: test_proptest.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"proptest.py\", doraise=True)'"
+    - type: run_command
+      command: |
+        python3 << 'PYEOF'
+        from proptest import given, integers, text, settings
+        @given(integers(1, 100))
+        @settings(max_examples=50, seed=42)
+        def test_pos(n):
+            assert n > 0
+        test_pos()
+        print('basic ok')
+        PYEOF
+      exit_code: 0
+    - type: run_command
+      command: |
+        python3 << 'PYEOF'
+        from proptest import given, integers, PropertyFailed
+        failed = False
+        @given(integers())
+        def test_bound(n):
+            assert -50 < n < 50
+        try:
+            test_bound()
+        except PropertyFailed as e:
+            failed = True
+            print(f'shrunk={e.shrunk_example}')
+        assert failed, 'should have found counterexample'
+        print('shrink ok')
+        PYEOF
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c \"from proptest import lists, integers; s = lists(integers(0,100), min_size=1, max_size=10); import random; r = random.Random(42); vals = [s.generate(r, 10) for _ in range(20)]; assert all(isinstance(v, list) and 1 <= len(v) <= 10 for v in vals); print('lists ok')\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_proptest.py -v"
+      exit_code: 0
+      timeout: 120
+
+- id: impossible-static-analyzer
+  tier: impossible
+  name: Python Static Analyzer
+  prompt: |
+    Build a Python static analysis tool (like a mini pylint/flake8) that detects common
+    code issues using the `ast` module from the standard library.
+
+    Create two files:
+
+    1. analyzer.py — A static analysis tool with:
+
+       **Core engine**:
+       - class `Analyzer`:
+         - `analyze(source: str, filename: str = "<stdin>") -> list[Diagnostic]`
+         - `analyze_file(path: str) -> list[Diagnostic]`
+         - Configurable: enable/disable specific rules via `Config` object
+       - class `Diagnostic`:
+         - `rule: str` (rule code like "W001")
+         - `message: str` (human-readable description)
+         - `filename: str`
+         - `line: int`, `col: int`
+         - `severity: str` ("error", "warning", "info")
+         - `suggestion: str | None` (fix suggestion)
+       - class `Config`:
+         - `disabled_rules: set[str]` — rules to skip
+         - `max_line_length: int = 100`
+         - `max_complexity: int = 10`
+
+       **Detection rules (must implement ALL of these)**:
+
+       **E001 - Undefined names**: Variable/function used but never defined in scope.
+       Use scope analysis: track assignments, function defs, imports, comprehension
+       variables, class definitions. Handle: global, nonlocal, builtins, star imports.
+
+       **E002 - Unused imports**: Import that is never referenced in the file.
+       Handle: `import x`, `from x import y`, `from x import y as z`.
+       Don't flag imports used in type annotations (string or direct).
+
+       **E003 - Unused variables**: Variable assigned but never read.
+       Exclude: variables starting with `_`, loop variables in `for _ in`, augmented
+       assignments to attributes. Handle: tuple unpacking, walrus operator.
+
+       **W001 - Shadowed builtins**: Variable name that shadows a Python builtin
+       (print, list, dict, str, int, len, type, id, map, filter, etc.).
+       Only flag in assignment/def context, not usage.
+
+       **W002 - Unreachable code**: Code after `return`, `raise`, `break`, `continue`
+       within the same block. Handle: try/except (code after bare raise in except IS
+       reachable from the except handler). Don't flag `if False:` as unreachable.
+
+       **W003 - Mutable default argument**: Function parameter with default value
+       that is a mutable type (`[]`, `{}`, `set()`, `list()`, `dict()`).
+       Suggest using `None` and initializing in the function body.
+
+       **W004 - Bare except**: `except:` without specifying an exception type.
+       Suggest `except Exception:` instead.
+
+       **W005 - Comparison to None/True/False**: Using `== None`, `!= None`,
+       `== True`, `== False` instead of `is None`, `is not None`, `is True`, `is False`.
+
+       **W006 - f-string without placeholders**: f-string that contains no `{}`
+       expressions. Suggest using a regular string.
+
+       **W007 - Star import**: `from module import *` — flag as bad practice.
+
+       **C001 - Cyclomatic complexity**: Function/method with cyclomatic complexity
+       exceeding the configured threshold (default 10). Count: if, elif, for, while,
+       and, or, except, with, assert, ternary (IfExp), comprehension-if.
+
+       **C002 - Too many arguments**: Function with more than 5 parameters
+       (excluding self/cls). Configurable threshold.
+
+       **C003 - Too many return statements**: Function with more than 6 return
+       statements. Suggests refactoring.
+
+       **C004 - Nested depth**: Nesting depth exceeding 4 levels of
+       if/for/while/with/try. Suggests extracting to helper function.
+
+       **Format output**:
+       - `format_diagnostics(diagnostics) -> str` — format like pylint:
+         `filename:line:col: E001 Undefined name 'foo'`
+       - `summary(diagnostics) -> str` — "Found 5 issues (2 errors, 2 warnings, 1 convention)"
+
+    2. test_analyzer.py — At least 35 test cases with pytest:
+       - E001: detect undefined variable
+       - E001: don't flag builtins (print, len, range, etc.)
+       - E001: don't flag imported names
+       - E001: handle function parameters as defined
+       - E001: handle comprehension variables
+       - E001: handle global/nonlocal
+       - E002: detect unused import
+       - E002: don't flag import used in code
+       - E002: detect unused from-import
+       - E002: handle import-as aliasing
+       - E003: detect unused variable
+       - E003: don't flag variables starting with _
+       - E003: handle augmented assignment (x += 1 counts as both read and write)
+       - W001: detect shadowed builtin (list, dict, str, etc.)
+       - W001: don't flag builtin usage (only assignment)
+       - W002: detect unreachable code after return
+       - W002: detect unreachable code after raise
+       - W002: don't flag code in different branch of if/else
+       - W003: detect mutable default list
+       - W003: detect mutable default dict
+       - W003: don't flag immutable defaults (None, True, 1, "str", tuple())
+       - W004: detect bare except
+       - W005: detect == None, suggest is None
+       - W005: detect == True, suggest is True
+       - W006: detect f-string without placeholders
+       - W007: detect star import
+       - C001: detect high cyclomatic complexity
+       - C001: simple function is under threshold
+       - C002: detect too many arguments
+       - C003: detect too many return statements
+       - C004: detect deep nesting
+       - Config: disabled rule is not reported
+       - Diagnostic: correct line/col numbers
+       - Format: output matches expected format
+       - Summary: correct counts per severity
+       - Multiple issues in same file all detected
+       - No false positives on clean, correct code
+       - Handle syntax errors gracefully (return empty or error diagnostic)
+
+    Run tests with: python3 -m pytest test_analyzer.py -v
+  evaluation:
+    - type: file_exists
+      path: analyzer.py
+    - type: file_exists
+      path: test_analyzer.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"analyzer.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from analyzer import Analyzer; a = Analyzer(); ds = a.analyze('import os\\nx = 1\\nprint(y)'); rules = [d.rule for d in ds]; print(rules); assert 'E001' in rules; assert 'E002' in rules; assert 'E003' in rules; print('detect ok')\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c \"from analyzer import Analyzer; a = Analyzer(); ds = a.analyze('def f(x=[]):\\n    pass'); rules = [d.rule for d in ds]; print(rules); assert 'W003' in rules; print('mutable ok')\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c \"from analyzer import Analyzer; a = Analyzer(); ds = a.analyze('x = None\\nif x == None:\\n    pass'); rules = [d.rule for d in ds]; print(rules); assert 'W005' in rules; print('compare ok')\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -m pytest test_analyzer.py -v"
+      exit_code: 0
+      timeout: 120
+
+- id: impossible-ml-framework
+  tier: impossible
+  name: Mini Deep Learning Framework
+  prompt: |
+    Build a mini deep learning framework with automatic differentiation (autograd),
+    neural network layers, loss functions, and optimizers. Do NOT use numpy, pytorch,
+    tensorflow, or any ML library — implement everything from scratch using only
+    Python's standard library and the `math` module.
+
+    Create three files:
+
+    1. autograd.py — Automatic differentiation engine:
+       - class `Tensor`:
+         - Wraps a scalar value (float) or nested list of floats (for vectors/matrices)
+         - `data` — the value (float, list, or list of lists)
+         - `grad` — accumulated gradient (same shape as data), initially None
+         - `requires_grad: bool` — whether to track gradients
+         - `_backward: Callable` — function to compute gradients during backprop
+         - `_prev: set[Tensor]` — parent tensors in computation graph
+         - Shape support: `shape` property returns tuple of dimensions
+         - Basic shapes: scalar (), vector (n,), matrix (n,m)
+
+       - **Operations** (each creates a new Tensor with backward function):
+         - Arithmetic: `+`, `-`, `*`, `/` (element-wise for matching shapes)
+         - Matrix multiply: `matmul(other)` or `@` operator
+         - Power: `**`
+         - Negation: `-tensor`
+         - Comparison: `>`, `<`, `>=`, `<=` (returns bool, no grad)
+         - Reduction: `sum()`, `mean()`
+         - Activation: `relu()`, `sigmoid()`, `tanh()`
+         - `exp()`, `log()` (natural)
+         - `reshape(shape)`, `transpose()` (for 2D)
+         - Broadcasting: scalar op tensor, vector op matrix (like numpy)
+
+       - **Backward pass**:
+         - `backward()` — topological sort, then reverse-order gradient computation
+         - Chain rule: each operation's _backward computes ∂loss/∂input from ∂loss/∂output
+         - Handles multiple paths (gradient accumulation with +=)
+         - `zero_grad()` — reset all gradients in the computation graph
+
+       - **Utilities**:
+         - `Tensor.zeros(shape)`, `Tensor.ones(shape)`, `Tensor.randn(shape, seed=None)`
+         - `Tensor.from_list(nested_list)`
+         - `no_grad()` context manager — disables gradient tracking temporarily
+
+    2. nn.py — Neural network building blocks:
+       - class `Module` (base):
+         - `parameters() -> list[Tensor]` — all trainable parameters
+         - `zero_grad()` — zero all parameter gradients
+         - `__call__(*args)` calls `forward(*args)`
+         - `train()` / `eval()` — switch mode (affects dropout)
+
+       - **Layers**:
+         - `Linear(in_features, out_features, bias=True)` — y = Wx + b
+           - Weights initialized with Xavier/Glorot: uniform(-sqrt(6/(fan_in+fan_out)), sqrt(6/(fan_in+fan_out)))
+           - Bias initialized to zeros
+         - `ReLU()` — max(0, x)
+         - `Sigmoid()` — 1/(1+exp(-x))
+         - `Tanh()` — (exp(x)-exp(-x))/(exp(x)+exp(-x))
+         - `Softmax(dim=-1)` — exp(x_i) / sum(exp(x_j))
+         - `Dropout(p=0.5)` — randomly zero elements during training
+         - `BatchNorm1d(num_features)` — batch normalization (running mean/var)
+         - `Sequential(*layers)` — chain layers: Sequential(Linear(2,4), ReLU(), Linear(4,1))
+
+       - **Loss functions**:
+         - `MSELoss()` — mean squared error: mean((pred - target)^2)
+         - `CrossEntropyLoss()` — softmax + negative log likelihood
+         - `BCELoss()` — binary cross-entropy
+
+       - **Optimizers**:
+         - class `Optimizer` (base): `step()`, `zero_grad()`
+         - `SGD(params, lr=0.01, momentum=0.0)` — with optional momentum
+         - `Adam(params, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8)` — Adam optimizer
+
+    3. test_ml.py — At least 30 test cases with pytest:
+       - Tensor: create from scalar, list, nested list
+       - Tensor: addition, subtraction, multiplication, division
+       - Tensor: shape property correct for scalar, vector, matrix
+       - Tensor: matrix multiply gives correct result
+       - Tensor: backward on simple expression (y = x*2 + 3, dy/dx = 2)
+       - Tensor: backward with multiple operations (chain rule)
+       - Tensor: gradient accumulation (diamond graph)
+       - Tensor: relu forward and backward
+       - Tensor: sigmoid forward and backward (verify numerical gradient)
+       - Tensor: sum/mean reduction with gradients
+       - Tensor: broadcasting scalar * vector
+       - Tensor: no_grad context manager prevents tracking
+       - Linear: correct output shape
+       - Linear: forward pass computes Wx + b
+       - Linear: parameters include weight and bias
+       - Sequential: chains layers correctly
+       - ReLU: negative values become 0
+       - Softmax: output sums to 1.0
+       - MSELoss: correct loss value
+       - CrossEntropyLoss: correct loss for known input
+       - BCELoss: correct loss value
+       - SGD: single step updates parameters
+       - SGD: with momentum accumulates velocity
+       - Adam: updates with adaptive learning rate
+       - Train XOR: network learns XOR function (loss < 0.1 after 1000 epochs)
+       - Train linear regression: learns y = 2x + 1 (loss < 0.01 after 500 epochs)
+       - Dropout: zeros some elements during training, passes all during eval
+       - BatchNorm: normalizes to approximately mean=0, std=1
+       - Numerical gradient check: compare autograd vs finite differences for 5 operations
+       - Zero grad: all gradients reset to zero/None
+       - Tensor zeros/ones/randn: correct shapes and values
+
+    Run tests with: python3 -m pytest test_ml.py -v
+  evaluation:
+    - type: file_exists
+      path: autograd.py
+    - type: file_exists
+      path: nn.py
+    - type: file_exists
+      path: test_ml.py
+    - type: syntax_check
+      command: "python3 -c 'import py_compile; py_compile.compile(\"autograd.py\", doraise=True); py_compile.compile(\"nn.py\", doraise=True)'"
+    - type: run_command
+      command: "python3 -c \"from autograd import Tensor; x = Tensor(3.0, requires_grad=True); y = x * x + x * 2 + 1; y.backward(); print(f'y={y.data}, dy/dx={x.grad}'); assert y.data == 16.0; assert x.grad == 8.0; print('autograd ok')\""
+      exit_code: 0
+    - type: run_command
+      command: "python3 -c \"from nn import Linear, Sequential, ReLU, MSELoss, SGD; from autograd import Tensor; model = Sequential(Linear(2, 4), ReLU(), Linear(4, 1)); loss_fn = MSELoss(); opt = SGD(model.parameters(), lr=0.01); x = Tensor.from_list([[1.0, 0.0]]); y = model(x); print(f'output shape works: {y.data}'); print('nn ok')\""
+      exit_code: 0
+    - type: run_command
+      command: |
+        python3 << 'PYEOF'
+        from autograd import Tensor
+        from nn import Linear, Sequential, ReLU, Sigmoid, MSELoss, SGD
+        import random
+        random.seed(42)
+        model = Sequential(Linear(2, 8), ReLU(), Linear(8, 1), Sigmoid())
+        loss_fn = MSELoss()
+        opt = SGD(model.parameters(), lr=0.5)
+        xor_data = [([0,0],0), ([0,1],1), ([1,0],1), ([1,1],0)]
+        for epoch in range(2000):
+            total_loss = 0
+            for inp, target in xor_data:
+                x = Tensor.from_list([inp])
+                y = Tensor(float(target))
+                pred = model(x)
+                loss = loss_fn(pred, y)
+                total_loss += loss.data if isinstance(loss.data, float) else loss.data
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        print(f"final loss: {total_loss/4:.4f}")
+        assert total_loss/4 < 0.15, f"XOR not learned: loss={total_loss/4}"
+        print("xor ok")
+        PYEOF
+      exit_code: 0
+      timeout: 60
+    - type: run_command
+      command: "python3 -m pytest test_ml.py -v"
+      exit_code: 0
+      timeout: 120
+
+# ─── Vision Tier (5 min timeout) ──────────────────────────────────────────────
+
+- id: medium-vision-analysis
+  tier: medium
+  name: Visual Image Understanding
+  timeout: 300
+  files:
+    - source: tasks/vision/bar_chart.png
+      dest: bar_chart.png
+    - source: tasks/vision/text_overlay.png
+      dest: text_overlay.png
+    - source: tasks/vision/shapes.png
+      dest: shapes.png
+    - source: tasks/vision/pie_chart.png
+      dest: pie_chart.png
+    - source: tasks/vision/table_image.png
+      dest: table_image.png
+  prompt: |
+    You have 5 PNG images in the current workspace directory. Analyze each one and
+    write your answers to a file called analysis.json. The JSON must contain exactly
+    these keys with string values:
+
+    1. "bar_chart_tallest" — Look at bar_chart.png. Which category (letter) has the
+       tallest bar, and what is its numeric value? Format: "<letter> <value>"
+       (e.g. "D 85")
+
+    2. "text_overlay_text" — Look at text_overlay.png. What is the exact text shown
+       in the image? Write it in ALL CAPS exactly as displayed.
+
+    3. "shapes_count" — Look at shapes.png. Count each type of shape and its color.
+       Format: "<N> red circles, <N> blue squares, <N> green triangles"
+       (e.g. "5 red circles, 4 blue squares, 3 green triangles")
+
+    4. "pie_chart_largest" — Look at pie_chart.png. Which sector has the largest
+       share, and what percentage is it? Format: "<sector> <percent>%"
+       (e.g. "Healthcare 55%")
+
+    5. "table_total" — Look at table_image.png. What is the Grand Total in the
+       last row of the Total column? Just the number as a string (e.g. "320").
+
+    Write the file as valid JSON. Example structure:
+    {
+      "bar_chart_tallest": "D 85",
+      "text_overlay_text": "HELLO WORLD TEST",
+      "shapes_count": "5 red circles, 4 blue squares, 3 green triangles",
+      "pie_chart_largest": "Healthcare 55%",
+      "table_total": "320"
+    }
+  ground_truth: |
+    The correct answers (from the generated test images) are:
+    - bar_chart_tallest: "B 42" — Category B has the tallest bar at value 42
+    - text_overlay_text: "BENCHMARK 2026 VISION" — exact text in red on dark background
+    - shapes_count: "3 red circles, 2 blue squares, 1 green triangles" — exactly 3/2/1
+    - pie_chart_largest: "Technology 40%" — Technology sector is 40% of pie chart
+    - table_total: "150" — Grand Total in the last row of the Total column
+    Note: The example values in the prompt (D 85, HELLO WORLD TEST, etc.) are deliberately
+    DIFFERENT from the actual answers to prevent agents from copying examples.
+  evaluation:
+    - type: file_exists
+      path: analysis.json
+    - type: run_command
+      command: |
+        python3 << 'PYEOF'
+        import json, sys
+
+        with open("analysis.json") as f:
+            data = json.load(f)
+
+        score = 0
+        total = 5
+        details = []
+
+        # 1. Bar chart: tallest bar is B with value 42
+        ans = data.get("bar_chart_tallest", "")
+        if "B" in ans.upper() and "42" in ans:
+            score += 1
+            details.append("bar_chart: PASS")
+        else:
+            details.append(f"bar_chart: FAIL (got: {ans!r})")
+
+        # 2. Text overlay: BENCHMARK 2026 VISION
+        ans = data.get("text_overlay_text", "")
+        if "BENCHMARK" in ans.upper() and "2026" in ans and "VISION" in ans.upper():
+            score += 1
+            details.append("text_overlay: PASS")
+        else:
+            details.append(f"text_overlay: FAIL (got: {ans!r})")
+
+        # 3. Shapes: 3 red circles, 2 blue squares, 1 green triangle
+        ans = data.get("shapes_count", "").lower()
+        if "3" in ans and "red" in ans and "circle" in ans \
+           and "2" in ans and "blue" in ans and "square" in ans \
+           and "1" in ans and "green" in ans and "triangle" in ans:
+            score += 1
+            details.append("shapes: PASS")
+        else:
+            details.append(f"shapes: FAIL (got: {data.get('shapes_count', '')!r})")
+
+        # 4. Pie chart: Technology at 40%
+        ans = data.get("pie_chart_largest", "").lower()
+        if "technology" in ans and "40" in ans:
+            score += 1
+            details.append("pie_chart: PASS")
+        else:
+            details.append(f"pie_chart: FAIL (got: {data.get('pie_chart_largest', '')!r})")
+
+        # 5. Table total: 150
+        ans = data.get("table_total", "")
+        if "150" in str(ans):
+            score += 1
+            details.append("table_total: PASS")
+        else:
+            details.append(f"table_total: FAIL (got: {ans!r})")
+
+        print(f"Vision score: {score}/{total}")
+        for d in details:
+            print(f"  {d}")
+
+        if score < 4:
+            print(f"FAIL: need at least 4/5, got {score}/5")
+            sys.exit(1)
+        print("PASS")
+        PYEOF
+      exit_code: 0
+      timeout: 30
+
+# ─── Chess Web Interface (hard, 3 min timeout) ─────────────────────────────
+
+- id: hard-chess-web
+  tier: hard
+  name: Chess Web Interface
+  files:
+    - source: reference_engine/chess_engine.py
+      dest: chess_engine.py
+  prompt: |
+    You have a file chess_engine.py in the workspace — a complete chess engine with full rules
+    enforcement. DO NOT modify chess_engine.py. Read it to understand its API, then build a web
+    interface around it.
+
+    The chess_engine.py module provides a Board class with these key methods:
+    - Board() — creates a new game (standard starting position)
+    - board.turn — 'white' or 'black'
+    - board.legal_moves_algebraic() — returns list of legal moves like ['e2e4', 'd2d4', ...]
+    - board.make_move('e2e4') — executes a move (raises ValueError if illegal)
+    - board.to_fen() — returns FEN string of current position
+    - board.is_checkmate() — True if current player is checkmated
+    - board.is_stalemate() — True if stalemate
+    - board.is_in_check(color) — True if given color is in check
+    - board.move_history — list of moves played so far
+    - PIECE_SYMBOLS dict — maps piece chars to Unicode symbols (e.g. 'K' -> '♔')
+
+    Create server.py — a Flask web application on port 5000 with:
+
+    **API Endpoints:**
+    - GET / — serves the HTML chess page
+    - GET /api/state — returns JSON with: fen, turn, legal_moves, is_check, is_checkmate,
+      is_stalemate, move_history
+    - POST /api/move — accepts JSON {"move": "e2e4"}, returns updated state or 400 error
+    - POST /api/reset — resets the game, returns fresh state
+
+    **HTML Page (served at /):**
+    - An 8x8 chess board rendered with alternating light/dark squares
+    - Unicode chess pieces on the board (♔♕♖♗♘♙♚♛♜♝♞♟) using the engine's PIECE_SYMBOLS
+    - A turn indicator showing whose turn it is (e.g. "White to move")
+    - A text input field for entering moves in coordinate notation (e.g. "e2e4")
+    - A move history panel showing all moves played
+    - A status area showing check/checkmate/stalemate messages
+    - A "New Game" button that resets the board
+    - Two chess clocks (timers) displayed showing "10:00" each (just static display, no countdown needed)
+
+    The page must use JavaScript to call the API endpoints and update the board dynamically
+    (no full page reloads for moves).
+
+    Run with: python3 server.py
+  ground_truth: |
+    The agent must:
+    1. Read chess_engine.py without modifying it — understand the Board API
+    2. Create server.py with Flask serving on port 5000
+    3. GET /api/state must return JSON with fen (FEN string), turn (white/black),
+       legal_moves (list of algebraic strings), is_check, is_checkmate, is_stalemate,
+       move_history
+    4. POST /api/move with {"move": "e2e4"} must make the move and return updated state;
+       illegal moves must return 400 with an error message
+    5. POST /api/reset must reset to starting position
+    6. GET / must return HTML with:
+       - 8x8 board with Unicode chess pieces (♔♕♖♗♘♙ for white, ♚♛♜♝♞♟ for black)
+       - Turn indicator
+       - Move input field
+       - Move history display
+       - Status area for check/checkmate/stalemate
+       - New Game button
+       - Two chess clocks showing "10:00"
+    7. Initial state: white to move, 20 legal moves, FEN starts with
+       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
+    8. After e2e4: black to move, FEN reflects pawn on e4
+    9. Illegal moves (e.g. "e2e5" from starting position) must return 400
+  evaluation:
+    - type: file_exists
+      path: chess_engine.py
+    - type: file_exists
+      path: server.py
+    - type: server_check
+      start_command: "python3 server.py"
+      port: 5000
+      startup_wait: 3
+      checks:
+        - url: "http://localhost:5000/"
+          status: 200
+          contains: "move"
+        - url: "http://localhost:5000/api/state"
+          status: 200
+          contains: "fen"
+    - type: run_command
+      command: |
+        python3 << 'PYEOF'
+        import subprocess, time, sys, json, urllib.request, urllib.error
+
+        # Start the server
+        proc = subprocess.Popen(
+            ["python3", "server.py"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        time.sleep(4)
+
+        score = 0
+        total = 6
+        details = []
+
+        def api_get(path):
+            url = f"http://localhost:5000{path}"
+            req = urllib.request.Request(url)
+            resp = urllib.request.urlopen(req, timeout=5)
+            return json.loads(resp.read())
+
+        def api_post(path, data):
+            url = f"http://localhost:5000{path}"
+            body = json.dumps(data).encode()
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            return urllib.request.urlopen(req, timeout=5)
+
+        try:
+            # 1. Check initial state
+            state = api_get("/api/state")
+            if state.get("turn") in ("white", "w") and "rnbqkbnr" in state.get("fen", "").lower():
+                moves = state.get("legal_moves", [])
+                if len(moves) == 20:
+                    score += 1
+                    details.append("initial_state: PASS")
+                else:
+                    details.append(f"initial_state: FAIL (legal_moves count={len(moves)}, expected 20)")
+            else:
+                details.append(f"initial_state: FAIL (turn={state.get('turn')}, fen={state.get('fen','')[:30]})")
+
+            # 2. Make move e2e4 and verify
+            resp = api_post("/api/move", {"move": "e2e4"})
+            state2 = json.loads(resp.read())
+            turn2 = state2.get("turn", "")
+            if turn2 in ("black", "b"):
+                score += 1
+                details.append("make_move: PASS")
+            else:
+                details.append(f"make_move: FAIL (turn after e2e4={turn2}, expected black)")
+
+            # 3. Illegal move — should return 400
+            try:
+                api_post("/api/move", {"move": "e7e5"})
+                # After e2e4, it's black's turn, so e7e5 is actually legal for black
+                # Try a truly illegal move instead
+                pass
+            except urllib.error.HTTPError:
+                pass
+            # Reset and try a clear illegal move
+            api_post("/api/reset", {})
+            try:
+                api_post("/api/move", {"move": "e2e5"})
+                details.append("illegal_move: FAIL (e2e5 accepted, should be 400)")
+            except urllib.error.HTTPError as e:
+                if e.code == 400:
+                    score += 1
+                    details.append("illegal_move: PASS")
+                else:
+                    details.append(f"illegal_move: FAIL (status={e.code}, expected 400)")
+
+            # 4. Reset and verify clean state
+            resp = api_post("/api/reset", {})
+            state3 = json.loads(resp.read())
+            turn3 = state3.get("turn", "")
+            fen3 = state3.get("fen", "")
+            if turn3 in ("white", "w") and "rnbqkbnr" in fen3.lower():
+                score += 1
+                details.append("reset: PASS")
+            else:
+                details.append(f"reset: FAIL (turn={turn3}, fen={fen3[:30]})")
+
+            # 5. HTML contains chess pieces (Unicode symbols)
+            req = urllib.request.Request("http://localhost:5000/")
+            resp = urllib.request.urlopen(req, timeout=5)
+            html = resp.read().decode("utf-8", errors="replace")
+            has_pieces = any(sym in html for sym in ["♔", "♚", "♙", "♟"])
+            # Also accept HTML entities or JavaScript rendering — check for "chess" keyword at minimum
+            if has_pieces:
+                score += 1
+                details.append("chess_pieces: PASS")
+            else:
+                details.append(f"chess_pieces: FAIL (no Unicode chess symbols in HTML)")
+
+            # 6. Check for clock display "10:00"
+            if "10:00" in html:
+                score += 1
+                details.append("clock_display: PASS")
+            else:
+                details.append("clock_display: FAIL (no '10:00' found in HTML)")
+
+        except Exception as e:
+            details.append(f"ERROR: {e}")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+        print(f"Chess web score: {score}/{total}")
+        for d in details:
+            print(f"  {d}")
+
+        if score < 5:
+            print(f"FAIL: need at least 5/{total}, got {score}/{total}")
+            sys.exit(1)
+        print("PASS")
+        PYEOF
+      exit_code: 0
+      timeout: 60

@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+node_modules.broken*/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Credentials / secrets
+.env
+.env.*
+!.env.example
+benchmark/.env
+benchmark/.env.local
+
+# Databases (generated at runtime)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Benchmark artifacts
+benchmark/logs/
+benchmark/results/
+benchmark/reports/
+benchmark/__pycache__/
+benchmark/*.pyc
+
+# Test artifacts
+test-results/
+coverage/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Screenshots
+*.png
+
+# Runtime state
+.shizuha/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Lock files (npm — keep package-lock.json, exclude others)
+pnpm-lock.yaml
+bun.lockb

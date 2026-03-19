@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl jq && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    flask requests pytest pytest-timeout pytest-asyncio \
+    sqlalchemy aiohttp pydantic \
+    beautifulsoup4 lxml cryptography \
+    httpx celery redis websockets aioresponses \
+    aiosqlite
+
+WORKDIR /workspace
+
+CMD ["bash"]

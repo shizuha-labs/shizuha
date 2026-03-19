@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Agent Benchmark Report — {{ timestamp }}</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+    --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    padding: 2rem;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.3rem; margin: 2rem 0 1rem; color: var(--accent); }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; }
+
+  .meta { color: var(--text-muted); margin-bottom: 2rem; }
+  .meta span { margin-right: 2rem; }
+
+  /* Agent info table */
+  .agent-table { width: 100%; border-collapse: collapse; margin-bottom: 2rem; }
+  .agent-table th, .agent-table td {
+    padding: 0.6rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .agent-table th { color: var(--text-muted); font-weight: 500; }
+
+  /* Summary chart */
+  .chart-container { display: flex; gap: 3rem; margin: 1.5rem 0; flex-wrap: wrap; }
+  .chart-group { flex: 1; min-width: 300px; }
+  .bar-chart { display: flex; flex-direction: column; gap: 0.8rem; }
+  .bar-row { display: flex; align-items: center; gap: 0.75rem; }
+  .bar-label { width: 80px; font-size: 0.85rem; text-align: right; color: var(--text-muted); }
+  .bar-track { flex: 1; height: 28px; background: var(--surface); border-radius: 4px; overflow: hidden; position: relative; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; display: flex; align-items: center; justify-content: flex-end; padding-right: 8px; font-size: 0.8rem; font-weight: 600; min-width: 40px; }
+  .bar-fill.agent-0 { background: var(--accent); }
+  .bar-fill.agent-1 { background: var(--green); }
+  .bar-fill.agent-2 { background: var(--purple); }
+
+  /* Results matrix */
+  .matrix { width: 100%; border-collapse: collapse; margin: 1rem 0 2rem; }
+  .matrix th, .matrix td {
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    text-align: center;
+    font-size: 0.9rem;
+  }
+  .matrix th { background: var(--surface); color: var(--text-muted); font-weight: 500; }
+  .matrix td.task-name { text-align: left; font-weight: 500; }
+  .matrix td.tier { text-align: center; font-size: 0.8rem; }
+
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+  .badge-pass { background: rgba(63, 185, 80, 0.2); color: var(--green); }
+  .badge-fail { background: rgba(248, 81, 73, 0.2); color: var(--red); }
+  .badge-timeout { background: rgba(210, 153, 34, 0.2); color: var(--orange); }
+  .badge-skip { background: rgba(139, 148, 158, 0.2); color: var(--text-muted); }
+
+  .tier-badge { padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+  .tier-easy { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+  .tier-medium { background: rgba(210, 153, 34, 0.15); color: var(--orange); }
+  .tier-hard { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+  .tier-extreme { background: rgba(188, 140, 255, 0.15); color: var(--purple); }
+  .tier-nightmare { background: rgba(248, 81, 73, 0.3); color: #ff6b6b; }
+  .tier-impossible { background: rgba(255, 0, 0, 0.25); color: #ff4444; font-weight: 800; }
+
+  .time { font-size: 0.8rem; color: var(--text-muted); display: block; }
+
+  /* Expandable details */
+  details { margin: 0.5rem 0; }
+  summary {
+    cursor: pointer;
+    padding: 0.5rem 0.75rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.9rem;
+    user-select: none;
+  }
+  summary:hover { border-color: var(--accent); }
+  .detail-content {
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 6px 6px;
+    background: var(--surface);
+  }
+  .eval-list { list-style: none; padding: 0; }
+  .eval-list li { padding: 0.3rem 0; font-size: 0.85rem; }
+  .eval-list .check-icon { margin-right: 0.5rem; }
+
+  pre {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.75rem;
+    font-size: 0.8rem;
+    overflow-x: auto;
+    max-height: 300px;
+    margin: 0.5rem 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .files-list { font-size: 0.85rem; color: var(--text-muted); }
+
+  .legend { display: flex; gap: 1.5rem; margin: 1rem 0; font-size: 0.85rem; }
+  .legend-item { display: flex; align-items: center; gap: 0.4rem; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; }
+
+  /* Jury verdict styling */
+  .jury-verdict {
+    margin: 0.75rem 0;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+  }
+  .jury-verdict h4 { font-size: 0.9rem; margin-bottom: 0.5rem; }
+  .jury-scores {
+    display: flex;
+    gap: 1.5rem;
+    margin: 0.5rem 0;
+    font-size: 0.85rem;
+  }
+  .jury-scores .score-item { display: flex; gap: 0.3rem; }
+  .jury-scores .score-label { color: var(--text-muted); }
+  .jury-scores .score-value { font-weight: 600; }
+  .jury-reasoning {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-top: 0.4rem;
+    font-style: italic;
+  }
+  .jury-model {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-weight: 400;
+    margin-left: 0.5rem;
+    font-family: monospace;
+  }
+  .jury-details {
+    margin-top: 0.75rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border);
+  }
+  .jury-detail-item {
+    margin-bottom: 0.5rem;
+  }
+  .jury-detail-label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    display: block;
+    margin-bottom: 0.15rem;
+  }
+  .jury-detail-text {
+    font-size: 0.82rem;
+    color: var(--text);
+    line-height: 1.5;
+    padding-left: 0.75rem;
+    border-left: 2px solid var(--border);
+    display: block;
+  }
+  .badge-partial { background: rgba(210, 153, 34, 0.2); color: var(--orange); }
+
+  .jury-summary-table { width: 100%; border-collapse: collapse; margin: 1rem 0 2rem; }
+  .jury-summary-table th, .jury-summary-table td {
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    text-align: center;
+    font-size: 0.9rem;
+  }
+  .jury-summary-table th { color: var(--text-muted); font-weight: 500; }
+  .jury-summary-table td:first-child { text-align: left; font-weight: 500; }
+
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 0.8rem; }
+</style>
+</head>
+<body>
+
+<h1>AI Agent Benchmark Report</h1>
+<div class="meta">
+  <span>Run: {{ timestamp }}</span>
+  <span>Tasks: {{ task_count }}</span>
+  <span>Agents: {{ agents | length }}</span>
+</div>
+
+<h2>Agents</h2>
+<table class="agent-table">
+  <thead>
+    <tr><th>Agent</th><th>Model</th><th>Version</th></tr>
+  </thead>
+  <tbody>
+    {% for a in agents %}
+    <tr>
+      <td><strong>{{ a.name }}</strong></td>
+      <td>{{ a.model }}</td>
+      <td>{{ a.version }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2>Overall Pass Rate</h2>
+<div class="legend">
+  {% for a in agents %}
+  <div class="legend-item">
+    <div class="legend-swatch agent-{{ loop.index0 }}" style="background: {{ ['#58a6ff','#3fb950','#bc8cff'][loop.index0 % 3] }};"></div>
+    {{ a.name }}
+  </div>
+  {% endfor %}
+</div>
+<div class="chart-container">
+  <div class="chart-group">
+    <h3>Overall</h3>
+    <div class="bar-chart">
+      {% for a in agents %}
+      <div class="bar-row">
+        <div class="bar-label">{{ a.name }}</div>
+        <div class="bar-track">
+          <div class="bar-fill agent-{{ loop.index0 }}" style="width: {{ a.overall_pct }}%">
+            {{ a.overall_passed }}/{{ a.overall_total }}
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% for tier_name in ["easy", "medium", "hard", "extreme", "nightmare", "impossible"] %}
+  {% set ns = namespace(any_tasks=false) %}
+  {% for a in agents %}{% if a.tier_stats.get(tier_name) %}{% set ns.any_tasks = true %}{% endif %}{% endfor %}
+  {% if ns.any_tasks %}
+  <div class="chart-group">
+    <h3>{{ tier_name | capitalize }}</h3>
+    <div class="bar-chart">
+      {% for a in agents %}
+      {% set tier_data = a.tier_stats.get(tier_name, {"passed": 0, "total": 0, "pct": 0}) %}
+      <div class="bar-row">
+        <div class="bar-label">{{ a.name }}</div>
+        <div class="bar-track">
+          <div class="bar-fill agent-{{ loop.index0 }}" style="width: {{ tier_data.pct }}%">
+            {{ tier_data.passed }}/{{ tier_data.total }}
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+  {% endfor %}
+</div>
+
+{% set has_jury = agents | selectattr("jury_stats") | list | length > 0 %}
+{% if has_jury %}
+<h2>Jury Evaluation Summary</h2>
+<table class="jury-summary-table">
+  <thead>
+    <tr>
+      <th>Agent</th>
+      <th>Pass</th>
+      <th>Partial</th>
+      <th>Fail</th>
+      <th>Pass Rate</th>
+      <th>Avg Rating</th>
+      <th>Correctness</th>
+      <th>Completeness</th>
+      <th>Code Quality</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for a in agents %}
+    {% if a.jury_stats %}
+    <tr>
+      <td>{{ a.name }}</td>
+      <td><span class="badge badge-pass">{{ a.jury_stats.pass }}</span></td>
+      <td><span class="badge badge-partial">{{ a.jury_stats.partial }}</span></td>
+      <td><span class="badge badge-fail">{{ a.jury_stats.fail }}</span></td>
+      <td>{{ a.jury_stats.pct }}%</td>
+      <td>{{ a.jury_stats.avg_rating }}/5</td>
+      <td>{{ a.jury_stats.avg_correctness }}/5</td>
+      <td>{{ a.jury_stats.avg_completeness }}/5</td>
+      <td>{{ a.jury_stats.avg_code_quality }}/5</td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>Results Matrix</h2>
+<table class="matrix">
+  <thead>
+    <tr>
+      <th>Task</th>
+      <th>Tier</th>
+      {% for a in agents %}
+      <th>{{ a.name }}</th>
+      {% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for task in tasks %}
+    <tr>
+      <td class="task-name">{{ task.name }}</td>
+      <td class="tier"><span class="tier-badge tier-{{ task.tier }}">{{ task.tier }}</span></td>
+      {% for a in agents %}
+      {% set r = results_map.get(task.id, {}).get(a.name) %}
+      <td>
+        {% if r is none %}
+          <span class="badge badge-skip">SKIP</span>
+        {% elif r.timed_out %}
+          <span class="badge badge-timeout">TIMEOUT</span>
+          <span class="time">{{ r.elapsed_seconds }}s</span>
+        {% elif r.passed %}
+          <span class="badge badge-pass">PASS</span>
+          <span class="time">{{ r.elapsed_seconds }}s</span>
+        {% else %}
+          <span class="badge badge-fail">FAIL</span>
+          <span class="time">{{ r.elapsed_seconds }}s</span>
+        {% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2>Detailed Results</h2>
+{% for task in tasks %}
+<details>
+  <summary>
+    <span class="tier-badge tier-{{ task.tier }}">{{ task.tier }}</span>
+    <strong>{{ task.name }}</strong> ({{ task.id }})
+  </summary>
+  <div class="detail-content">
+    <h3>Prompt</h3>
+    <pre>{{ task.prompt }}</pre>
+
+    {% for a in agents %}
+    {% set r = results_map.get(task.id, {}).get(a.name) %}
+    {% if r %}
+    <h3>{{ a.name }}
+      {% if r.timed_out %}
+        <span class="badge badge-timeout">TIMEOUT</span>
+      {% elif r.passed %}
+        <span class="badge badge-pass">PASS</span>
+      {% else %}
+        <span class="badge badge-fail">FAIL</span>
+      {% endif %}
+      <span class="time">{{ r.elapsed_seconds }}s</span>
+    </h3>
+
+    <p class="files-list"><strong>Files created:</strong> {{ r.workspace_files | join(', ') or 'none' }}</p>
+
+    <ul class="eval-list">
+      {% for ev in r.evaluations %}
+      <li>
+        <span class="check-icon">{% if ev.passed %}&#x2705;{% else %}&#x274C;{% endif %}</span>
+        <strong>{{ ev.type }}</strong>: {{ ev.detail }}
+      </li>
+      {% endfor %}
+    </ul>
+
+    {% if r.get("jury_verdict") %}
+    {% set jv = r.jury_verdict %}
+    <div class="jury-verdict">
+      <h4>Jury Verdict:
+        {% if jv.verdict == "pass" %}
+          <span class="badge badge-pass">PASS</span>
+        {% elif jv.verdict == "partial" %}
+          <span class="badge badge-partial">PARTIAL</span>
+        {% else %}
+          <span class="badge badge-fail">FAIL</span>
+        {% endif %}
+        <span class="jury-model">{{ jv.get("jury_model", "") }}</span>
+      </h4>
+      <div class="jury-scores">
+        <div class="score-item"><span class="score-label">Rating:</span> <span class="score-value">{{ jv.rating }}/5</span></div>
+        <div class="score-item"><span class="score-label">Correctness:</span> <span class="score-value">{{ jv.correctness }}/5</span></div>
+        <div class="score-item"><span class="score-label">Completeness:</span> <span class="score-value">{{ jv.completeness }}/5</span></div>
+        <div class="score-item"><span class="score-label">Code Quality:</span> <span class="score-value">{{ jv.code_quality }}/5</span></div>
+      </div>
+      <div class="jury-reasoning">{{ jv.reasoning }}</div>
+      {% if jv.get("correctness_reasoning") or jv.get("completeness_reasoning") or jv.get("code_quality_reasoning") %}
+      <div class="jury-details">
+        {% if jv.get("correctness_reasoning") %}
+        <div class="jury-detail-item">
+          <span class="jury-detail-label">Correctness:</span>
+          <span class="jury-detail-text">{{ jv.correctness_reasoning }}</span>
+        </div>
+        {% endif %}
+        {% if jv.get("completeness_reasoning") %}
+        <div class="jury-detail-item">
+          <span class="jury-detail-label">Completeness:</span>
+          <span class="jury-detail-text">{{ jv.completeness_reasoning }}</span>
+        </div>
+        {% endif %}
+        {% if jv.get("code_quality_reasoning") %}
+        <div class="jury-detail-item">
+          <span class="jury-detail-label">Code Quality:</span>
+          <span class="jury-detail-text">{{ jv.code_quality_reasoning }}</span>
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {% if r.stdout %}
+    <details>
+      <summary>Agent stdout</summary>
+      <pre>{{ r.stdout }}</pre>
+    </details>
+    {% endif %}
+    {% if r.stderr %}
+    <details>
+      <summary>Agent stderr</summary>
+      <pre>{{ r.stderr }}</pre>
+    </details>
+    {% endif %}
+    {% endif %}
+    {% endfor %}
+  </div>
+</details>
+{% endfor %}
+
+<footer>
+  Generated by AI Agent Benchmark Framework &mdash; {{ timestamp }}
+</footer>
+
+</body>
+</html>

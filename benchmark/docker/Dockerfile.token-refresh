@@ -1,0 +1,4 @@
+FROM python:3.12-slim
+COPY codex-token-refresh.py /app/codex-token-refresh.py
+WORKDIR /app
+CMD ["python3", "-u", "codex-token-refresh.py", "--daemon"]
