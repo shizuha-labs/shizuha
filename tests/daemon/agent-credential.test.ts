@@ -1530,7 +1530,7 @@ describe('AgentCredential schema migration', () => {
   it('preserves HTTPS for authenticated S10 credential-seed verification', async () => {
     expect(credentialSeedVerificationPlatformUrl('https://platform.example/')).toBe('https://platform.example');
     expect(credentialSeedVerificationPlatformUrl('https://platform.example/agent/api/')).toBe('https://platform.example');
-    expect(credentialSeedVerificationPlatformUrl('http://shizuha.com/')).toBe('http://shizuha.com');
+    expect(credentialSeedVerificationPlatformUrl('http://s1.tail.shizuha.com/')).toBe('http://s1.tail.shizuha.com');
 
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
       ok: true,

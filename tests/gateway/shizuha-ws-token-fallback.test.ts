@@ -69,7 +69,7 @@ describe('ShizuhaWSChannel agent-token fallback', () => {
   beforeEach(() => {
     wsInstances.length = 0;
     process.env['AGENT_USERNAME'] = 'mika';
-    process.env['SHIZUHA_PLATFORM_URL'] = 'https://shizuha.com';
+    process.env['SHIZUHA_PLATFORM_URL'] = 'https://s1.tail.shizuha.com';
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'scli-163-'));
     process.env['HOME'] = home;
     writeCachedAgentToken(home, 'agent-token-from-cache');

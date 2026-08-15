@@ -47,6 +47,18 @@ describe('GLM thinking required for tool parser — static + behavioral', () => 
     expect(source).toContain('recipientEmail ? undefined : target.username');
   });
 
+  it('Connect talk-seat persist keeps assistant text when the stream event raced unsub', () => {
+    const channel = read('src/gateway/channels/connect.ts');
+    expect(channel).toContain('ensureBufferedReply');
+    expect(channel).toContain('conversationId: threadId');
+    const gateway = read('src/gateway/agent-process.ts');
+    expect(gateway).toContain('forwardChain');
+    expect(gateway).toContain('ensureBufferedReply');
+    const dm = read('src/platform/connect-dm.ts');
+    expect(dm).toContain('conversationId');
+    expect(dm).toContain('/messages/');
+  });
+
   it('fleet gateway talk seats suppress tools and one-shot the inbox', () => {
     const source = read('src/gateway/agent-process.ts');
     expect(source).toContain('talkSeatSuppressesTools');

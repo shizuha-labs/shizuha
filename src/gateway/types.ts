@@ -109,7 +109,9 @@ export interface Channel {
    * Signal that the agent has finished processing the current message.
    * The channel should finalize the response (close SSE stream, etc.).
    */
-  sendComplete(threadId: string): void;
+  sendComplete(threadId: string, fallbackText?: string): void;
+  /** Talk-seat persist: keep this text if no streamed content arrived. */
+  ensureBufferedReply?(threadId: string, text: string): void;
 
   /** Acknowledge durable completion of one inbound platform message. */
   ackProcessed?(messageId: string): Promise<boolean> | boolean;

@@ -785,9 +785,13 @@ export async function executeTurn(
 
   // On stream abort: return partial result (text only, no orphaned tool_use blocks)
   if (streamAborted) {
+    const spoken = (text || '').trim();
+    if (!spoken) {
+      emitter.emit({ type: 'content', text: '(interrupted)', timestamp: Date.now() });
+    }
     const partialMsg: Message = {
       role: 'assistant',
-      content: text || '(interrupted)',
+      content: spoken || '(interrupted)',
       timestamp: Date.now(),
     };
     return {

@@ -264,7 +264,7 @@ describe('getPlatformMcpConfigs: SHIZUHA_MCP_STDIO_PROXY flag', () => {
   beforeEach(() => { for (const k of ENV_KEYS) { saved[k] = process.env[k]; delete process.env[k]; } });
   afterEach(() => { for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]!; } });
 
-  const baseOpts = { bearerToken: 'jwt-abc', platformUrl: 'https://shizuha.com' };
+  const baseOpts = { bearerToken: 'jwt-abc', platformUrl: 'https://s1.tail.shizuha.com' };
 
   it('default ON: every entry uses the stdio-proxy form', () => {
     const cfgs = getPlatformMcpConfigs({ ...baseOpts, allowList: ['pulse'] });
@@ -275,7 +275,7 @@ describe('getPlatformMcpConfigs: SHIZUHA_MCP_STDIO_PROXY flag', () => {
     expect(pulse.args).toContain('mcp-proxy');
     expect(pulse.args).toContain('pulse');
     const i = pulse.args.indexOf('--upstream-url');
-    expect(pulse.args[i + 1]).toBe('https://shizuha.com/mcp/pulse/mcp');
+    expect(pulse.args[i + 1]).toBe('https://s1.tail.shizuha.com/mcp/pulse/mcp');
     expect(pulse.env.MCP_UPSTREAM_BEARER).toBe('jwt-abc');
   });
 
@@ -293,7 +293,7 @@ describe('getPlatformMcpConfigs: SHIZUHA_MCP_STDIO_PROXY flag', () => {
     expect(pulse.args).toContain('pulse');
     // upstream-url is the SAME url the HTTP form would have used.
     const i = pulse.args.indexOf('--upstream-url');
-    expect(pulse.args[i + 1]).toBe('https://shizuha.com/mcp/pulse/mcp');
+    expect(pulse.args[i + 1]).toBe('https://s1.tail.shizuha.com/mcp/pulse/mcp');
     // bearer passed via env (read fresh by the proxy), org id forwarded.
     expect(pulse.env.MCP_UPSTREAM_BEARER).toBe('jwt-abc');
     expect(pulse.env.MCP_UPSTREAM_ORG).toBe('3');

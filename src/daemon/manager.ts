@@ -1290,7 +1290,7 @@ export function resolveDindMode(): [boolean, 'sysbox' | 'privileged' | 'none'] {
   if (!isDockerAvailable()) return [false, 'none'];
   // Always use privileged DinD — sysbox containers get DNS from host's legacy
   // resolv.conf instead of Docker's internal resolver (127.0.0.11), which breaks
-  // Tailscale hostname resolution (shizuha.com) and causes network
+  // Tailscale hostname resolution (s1.tail.shizuha.com) and causes network
   // isolation issues with internal services.
   return [true, 'privileged'];
 }

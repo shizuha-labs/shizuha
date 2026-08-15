@@ -122,9 +122,19 @@ export class ConnectChannel implements Channel {
     }
   }
 
-  sendComplete(threadId: string): void {
+  ensureBufferedReply(threadId: string, text: string): void {
     if (!this.autoReply) return;
     if (!this.convThreads.has(threadId)) return;
+    const spoken = (text || '').trim();
+    if (!spoken) return;
+    if ((this.replyBuf.get(threadId) || '').trim()) return;
+    this.replyBuf.set(threadId, spoken);
+  }
+
+  sendComplete(threadId: string, fallbackText?: string): void {
+    if (!this.autoReply) return;
+    if (!this.convThreads.has(threadId)) return;
+    this.ensureBufferedReply(threadId, fallbackText || '');
     const text = (this.replyBuf.get(threadId) || '').trim();
     this.replyBuf.delete(threadId);
     this.flushedLen.delete(threadId);
@@ -160,8 +170,9 @@ export class ConnectChannel implements Channel {
       return;
     }
     let lastError = '';
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
       const result = await sendConnectDm({
+        conversationId: threadId,
         recipientEmail,
         recipientUsername,
         content: text,
@@ -171,7 +182,10 @@ export class ConnectChannel implements Channel {
       lastError = result.error || `status ${result.status}`;
       logger.warn({ threadId, attempt, error: lastError, status: result.status }, 'connect auto-reply send failed');
       if (result.status === 400 || result.status === 403 || result.status === 404) break;
-      await new Promise((r) => setTimeout(r, 400 * attempt));
+      const waitMs = result.status === 429
+        ? Math.min(result.retryAfterMs || 21_000, 25_000)
+        : 400 * attempt;
+      await new Promise((r) => setTimeout(r, waitMs));
     }
     logger.error({ threadId, error: lastError }, 'connect auto-reply exhausted retries');
   }

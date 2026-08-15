@@ -128,7 +128,7 @@ export interface PlatformMcpConfigOptions {
    */
   mcpHost?: string;
   /**
-   * Full backend URL (e.g. https://shizuha.com). Used to build remote
+   * Full backend URL (e.g. https://s1.tail.shizuha.com). Used to build remote
    * `/mcp/{service}/mcp` paths. Defaults to SHIZUHA_PLATFORM_URL env.
    */
   platformUrl?: string;

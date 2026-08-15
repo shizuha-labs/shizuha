@@ -806,7 +806,7 @@ export function useChat(options: UseChatOptions = {}) {
   }
 
   function handleWsMessage(msg: Record<string, unknown>) {
-    // Chat tab = pure Connect DMs (mirrors the Kotlin app and shizuha.com/c).
+    // Chat tab = pure Connect DMs (mirrors the Kotlin app and s1.tail.shizuha.com/c).
     // The agent's LLM-turn output — thoughts, tool calls, reasoning, per-token
     // streaming — is private. It belongs in the Activity tab, never in chat.
     //
@@ -1594,7 +1594,7 @@ export function useChat(options: UseChatOptions = {}) {
     //
     // `crypto.randomUUID()` is only available in secure contexts (HTTPS or
     // localhost). When the dashboard is accessed over plain HTTP on a non-local
-    // host (e.g. http://shizuha.com:8016/), it's undefined — fall back
+    // host (e.g. http://s1.tail.shizuha.com:8016/), it's undefined — fall back
     // to a UUID v4 built from `crypto.getRandomValues`, which is available in
     // insecure contexts.
     const requestId = generateUuidV4();

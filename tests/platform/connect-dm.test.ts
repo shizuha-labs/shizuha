@@ -40,4 +40,34 @@ describe('Connect DM client message IDs', () => {
     const body = JSON.parse(String(request.body));
     expect(body.client_message_id).toBe(normalizeConnectClientMessageId('scli-195-Kumo-1784210762153'));
   });
+
+  it('posts an in-thread reply when conversationId is set', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      expect(url).toContain('/connect/api/conversations/conv-abc/messages/');
+      return {
+        ok: true,
+        status: 201,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({ id: 'm2', content: 'pong' }),
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await sendConnectDm({
+      conversationId: 'conv-abc',
+      recipientEmail: 'hothritik1@gmail.com',
+      content: 'pong',
+      platformUrl: 'https://connect.example.test',
+      token: 'test-token',
+    });
+
+    expect(result.ok).toBe(true);
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = JSON.parse(String(request.body));
+    expect(body).toEqual({
+      content: 'pong',
+      client_message_id: expect.any(String),
+    });
+    expect(body.recipient_email).toBeUndefined();
+  });
 });

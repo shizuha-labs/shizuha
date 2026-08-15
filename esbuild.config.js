@@ -3,6 +3,20 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 /** Stub out optional packages that aren't installed */
+const noFleetPlugin = process.argv.includes('--no-fleet-plugin');
+
+/** Public builds swap the Hive/k3s actuator for a no-op stub. */
+const fleetPluginAlias = {
+  name: 'fleet-plugin-alias',
+  setup(build) {
+    if (!noFleetPlugin) return;
+    build.onResolve({ filter: /plugins\/fleet\/k8s-backend(\.js)?$/ }, (args) => {
+      if (args.path.includes('k8s-backend.stub')) return undefined;
+      return { path: path.resolve('src/plugins/fleet/k8s-backend.stub.ts') };
+    });
+  },
+};
+
 const stubPlugin = {
   name: 'stub-optional',
   setup(build) {
@@ -91,7 +105,7 @@ await build({
       '})();',
     ].join('\n'),
   },
-  plugins: [stubPlugin, inkPatchPlugin],
+  plugins: [fleetPluginAlias, stubPlugin, inkPatchPlugin],
   external: [
     'better-sqlite3',
     'pino',

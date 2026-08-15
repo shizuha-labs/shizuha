@@ -12,7 +12,7 @@
     "postbuild": "chmod +x dist/shizuha.js",
     "build:node": "node esbuild.config.js",
     "build:web": "vite build --config vite.web.config.ts",
-    "build:public": "node esbuild.config.js --no-claude-code-provider && chmod +x dist/shizuha.js",
+    "build:public": "node esbuild.config.js --no-claude-code-provider --no-fleet-plugin && vite build --config vite.web.config.ts && chmod +x dist/shizuha.js",
     "build:check": "tsc --noEmit",
     "sync-skills": "node scripts/sync-skills.mjs",
     "dev": "tsx src/index.ts",

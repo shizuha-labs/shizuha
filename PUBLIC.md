@@ -1,6 +1,8 @@
 # Shizuha Code (public export)
 
-This tree is the **coding-agent harness**: TUI, `exec`/`resume`, `gateway`, and provider bridges.
+This tree is the **coding-agent harness**. You get both flavours:
 
-It is **not** the in-cluster fleet supervisor. That actuator is developed on `shizuha-beta` and dual-homed in `hive-runtime`.
-`src/daemon/k8s-backend.ts` here is a no-op stub so local `shizuha up` still typechecks without shipping Hive/k3s internals.
+- **Terminal** — `shizuha` TUI, plus `exec` / `resume` / `gateway` / provider bridges
+- **Browser** — `shizuha up` starts the local daemon and the same dashboard we use internally (`src/web` + `src/daemon/dashboard.ts` on :8015)
+
+Keep `src/daemon`. The dashboard server lives there. What is **not** included is the in-cluster Hive/k3s fleet actuator. That is an internal plugin on `shizuha-beta` (`src/plugins/fleet`) and is dual-homed in `hive-runtime`. Public / `--no-fleet-plugin` builds load a no-op stub.

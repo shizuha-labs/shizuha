@@ -24,6 +24,7 @@ export interface SendConnectDmResult {
   recipient?: { userId: number; email: string; name: string };
   error?: string;
   status?: number;
+  retryAfterMs?: number;
 }
 
 export interface SendConnectDmOptions {
@@ -37,6 +38,8 @@ export interface SendConnectDmOptions {
   clientMessageId?: string;
   /** Reply to a specific message (optional) */
   replyToMessageId?: string;
+  /** Existing conversation — POST in-thread instead of /messaging/dm/. */
+  conversationId?: string;
   /** Explicit sender overrides (otherwise read from env vars) */
   sender?: {
     username?: string;
@@ -147,7 +150,10 @@ export async function sendConnectDm(opts: SendConnectDmOptions): Promise<SendCon
   if (recipientEmail) body['recipient_email'] = recipientEmail;
   if (opts.replyToMessageId) body['reply_to_message_id'] = opts.replyToMessageId;
 
-  const url = `${platformBase}/connect/api/messaging/dm/`;
+  const conversationId = (opts.conversationId || '').trim();
+  const url = conversationId
+    ? `${platformBase}/connect/api/conversations/${encodeURIComponent(conversationId)}/messages/`
+    : `${platformBase}/connect/api/messaging/dm/`;
   const timeoutMs = opts.timeoutMs ?? 10_000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -159,7 +165,7 @@ export async function sendConnectDm(opts: SendConnectDmOptions): Promise<SendCon
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(conversationId ? { content, client_message_id: body['client_message_id'] } : body),
       signal: controller.signal,
     });
     const text = await resp.text();
@@ -167,10 +173,15 @@ export async function sendConnectDm(opts: SendConnectDmOptions): Promise<SendCon
     try { parsed = JSON.parse(text); } catch { /* non-JSON error body */ }
 
     if (!resp.ok) {
+      const retryAfter = resp.headers.get('retry-after');
+      const retryAfterMs = retryAfter && Number.isFinite(Number(retryAfter))
+        ? Math.round(Number(retryAfter) * 1000)
+        : undefined;
       return {
         ok: false,
         status: resp.status,
         error: (parsed['error'] as string) || (parsed['detail'] as string) || text.slice(0, 200),
+        ...(retryAfterMs ? { retryAfterMs } : {}),
       };
     }
 

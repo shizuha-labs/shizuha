@@ -4569,27 +4569,29 @@ export class AgentProcess {
       // SCLI-32: arm the STALL idle timer before the provider call.
       try { gatewayStruggle.onTurnStart(); } catch { /* best-effort */ }
 
-      // Forward emitter events to the channel in real-time + fan out
-      const unsub = this.emitter.on('*', async (event: AgentEvent) => {
-        if (turnGeneration !== this.sessionGeneration) {
-          logger.warn({ turnGeneration, activeGeneration: this.sessionGeneration }, 'Rejected late event from fenced session generation');
-          return;
-        }
-        applyAgentEventToPhase(this.activityPhase, event);
-        // 1. Send to originating channel (always)
-        try {
-          await channel.sendEvent(msg.threadId, event);
-        } catch { /* client disconnected */ }
-
-        // 2. Fan out to other channels that have it enabled
-        for (const [, otherChannel] of this.channels) {
-          if (otherChannel === channel) continue; // skip originator
-          if (!this.fanOut[otherChannel.type]) continue; // fan-out disabled for this type
-          if (!otherChannel.broadcastEvent) continue; // channel doesn't support fan-out
+      // Forward emitter events to the channel in real-time + fan out.
+      // Chain the async work: unsub() in finally used to drop a still-queued
+      // content event on a 1s cached T2, so Connect auto-reply persisted nothing.
+      let forwardChain = Promise.resolve();
+      const unsub = this.emitter.on('*', (event: AgentEvent) => {
+        forwardChain = forwardChain.then(async () => {
+          if (turnGeneration !== this.sessionGeneration) {
+            logger.warn({ turnGeneration, activeGeneration: this.sessionGeneration }, 'Rejected late event from fenced session generation');
+            return;
+          }
+          applyAgentEventToPhase(this.activityPhase, event);
           try {
-            await otherChannel.broadcastEvent(event, channel.id, msg.threadId);
-          } catch { /* fan-out target unavailable */ }
-        }
+            await channel.sendEvent(msg.threadId, event);
+          } catch { /* client disconnected */ }
+          for (const [, otherChannel] of this.channels) {
+            if (otherChannel === channel) continue;
+            if (!this.fanOut[otherChannel.type]) continue;
+            if (!otherChannel.broadcastEvent) continue;
+            try {
+              await otherChannel.broadcastEvent(event, channel.id, msg.threadId);
+            } catch { /* fan-out target unavailable */ }
+          }
+        }).catch(() => {});
       });
 
       // GAP F: Start telemetry span for this turn
@@ -4736,6 +4738,7 @@ export class AgentProcess {
         }
         throw err;
       } finally {
+        await forwardChain.catch(() => {});
         unsub();
       }
 
@@ -4921,12 +4924,16 @@ export class AgentProcess {
           .replace(/<think>[\s\S]*?<\/think>/g, '')
           .trim();
         const reasoning = reasoningTextFromContent(result.assistantMessage.content).trim();
-        if (!text && reasoning) {
-          await channel.sendEvent(msg.threadId, {
-            type: 'content',
-            text: reasoning,
-            timestamp: Date.now(),
-          });
+        const spoken = text || reasoning;
+        if (spoken) {
+          channel.ensureBufferedReply?.(msg.threadId, spoken);
+          if (!text && reasoning) {
+            await channel.sendEvent(msg.threadId, {
+              type: 'content',
+              text: reasoning,
+              timestamp: Date.now(),
+            });
+          }
         }
         break;
       }
