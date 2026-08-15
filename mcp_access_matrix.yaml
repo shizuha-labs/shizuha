@@ -1,0 +1,50 @@
+# MCP access matrix used by the local runtime.
+# Fail-closed: unknown roles get `base` only.
+base:
+  - pulse
+  - connect
+  - wiki
+  - admin
+  - id
+  - scs
+
+roles:
+  reviewer: []
+  architect: []
+  engineer: []
+  qa: []
+  security: []
+  docs:
+    - drive
+  analytics:
+    - finance
+    - books
+    - inventory
+  accounting:
+    - books
+    - drive
+  devops:
+    - cron
+    - hive
+  social:
+    - drive
+  product:
+    - drive
+
+overrides:
+  shizuha:
+    add:
+      - cron
+  shion:
+    add: []
+  hina:
+    remove:
+      - admin
+      - id
+      - scs
+  aya:
+    remove:
+      - admin
+      - id
+      - scs
+
