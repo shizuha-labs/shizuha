@@ -86,6 +86,17 @@ describe("agent runtime multi-architecture gates", () => {
     expect(workflow).toContain(`wait "$WAIT_PID" || PREPULL_WAIT_STATUS=$?`);
   });
 
+  it("does not auto-promote a writer-less tree onto the rt-fleet controller", () => {
+    expect(workflow).toContain("skipping DesiredRuntimeRelease promote: k8s actuator is not in this tree");
+    expect(workflow).toContain("if [ ! -f src/plugins/fleet/k8s-backend.ts ]; then");
+    const promote = workflow.indexOf("name: Auto-promote DesiredRuntimeRelease");
+    const skip = workflow.indexOf("skipping DesiredRuntimeRelease promote");
+    const append = workflow.indexOf("append-desired-runtime-release.py");
+    expect(promote).toBeGreaterThan(-1);
+    expect(skip).toBeGreaterThan(promote);
+    expect(append).toBeGreaterThan(skip);
+  });
+
   it("pre-pulls on labeled platform nodes without fleet Pod-read RBAC", () => {
     expect(workflow).toContain(
       `.metadata.labels["node-role.kubernetes.io/control-plane"] == null`,

@@ -877,6 +877,15 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # DesiredRuntimeRelease promote currently rewrites the rt-fleet
+          # *controller* image to the new harness digest. After the k8s
+          # actuator left this tree, that would roll the live supervisor
+          # onto a writer-less bundle. Agent images may still be built;
+          # they must not become the controller pin.
+          if [ ! -f src/plugins/fleet/k8s-backend.ts ]; then
+            echo "::notice::skipping DesiredRuntimeRelease promote: k8s actuator is not in this tree (hive-runtime owns the writer; rt-fleet stays on the pinned digest)"
+            exit 0
+          fi
           TAG="$PUBLISHED_TAG"
           printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$' || {
             echo "::error::refusing to promote an unsafe runtime tag"; exit 1;
