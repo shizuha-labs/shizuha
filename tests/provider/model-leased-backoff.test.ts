@@ -41,6 +41,19 @@ describe('modelLeasedRetryMs', () => {
     expect(late).toBeGreaterThanOrEqual(early);
     expect(late).toBeLessThanOrEqual(900_000);
   });
+
+  it('keeps talk seats well under the 60s T2 stall', () => {
+    const prev = process.env.SHIZUHA_LEAN_MCP;
+    process.env.SHIZUHA_LEAN_MCP = '1';
+    try {
+      const h = new Headers({ 'retry-after': '60' });
+      const ms = modelLeasedRetryMs(h, 0, () => 0.5);
+      expect(ms).toBeLessThan(5_000);
+    } finally {
+      if (prev === undefined) delete process.env.SHIZUHA_LEAN_MCP;
+      else process.env.SHIZUHA_LEAN_MCP = prev;
+    }
+  });
 });
 
 describe('isTransientProviderFailure for model_leased', () => {

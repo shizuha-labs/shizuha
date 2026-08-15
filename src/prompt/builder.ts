@@ -1,9 +1,9 @@
 import * as fs from 'node:fs';
 import type { ToolDefinition } from '../tools/types.js';
 import type { PermissionMode } from '../permissions/types.js';
-import { BASE_SYSTEM_PROMPT, LEAN_SYSTEM_PROMPT, AGENT_POLICY, ROLE_PROMPTS } from './templates.js';
+import { BASE_SYSTEM_PROMPT, LEAN_SYSTEM_PROMPT, TALK_MINIMAL_SYSTEM_PROMPT, AGENT_POLICY, ROLE_PROMPTS } from './templates.js';
 import { normalizeRole } from '../platform/mcp-access-matrix.js';
-import { isLeanConversationalEnv } from '../platform/lean-conversational.js';
+import { isLeanConversationalEnv, talkPromptMode } from '../platform/lean-conversational.js';
 import { loadMemory } from '../state/memory.js';
 import { getGitStatus, getGitBranch, isGitRepo } from '../utils/git.js';
 import { logger } from '../utils/logger.js';
@@ -180,6 +180,14 @@ async function composeSystemPrompt(ctx: PromptContext): Promise<string> {
     // noSystemPrompt = send absolutely nothing
     if (profile.noSystemPrompt) {
       return '';
+    }
+
+    const talkMode = talkPromptMode();
+    if (talkMode !== 'full') {
+      const parts: string[] = [];
+      if (talkMode === 'minimal') parts.push(TALK_MINIMAL_SYSTEM_PROMPT.trimEnd());
+      if (ctx.customPrompt) parts.push(ctx.customPrompt.trim());
+      return parts.filter(Boolean).join('\n\n');
     }
 
     // Model-specific system prompt from file (e.g., qwen-code's prompt for Qwen3-Coder)

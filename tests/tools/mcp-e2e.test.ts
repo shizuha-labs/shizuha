@@ -20,7 +20,7 @@ import { registerMCPTools, createMCPResourceReadTool, deriveReadOnly, deriveRisk
 
 // ── Helpers ──
 
-const MCP_SERVERS_DIR = '/home/phoenix/work/shizuha-stack/cli-agent/mcp-servers';
+const MCP_SERVERS_DIR = '/home/user/work/shizuha-stack/cli-agent/mcp-servers';
 
 /** Generate a fresh JWT token from shizuha-id (valid for 24h) */
 function generateJWT(): string {
@@ -35,7 +35,7 @@ if u:
 else:
     print('NO_USER')
 "`,
-      { cwd: '/home/phoenix/work/shizuha-stack/compose', encoding: 'utf-8', timeout: 15000 },
+      { cwd: '/home/user/work/shizuha-stack/compose', encoding: 'utf-8', timeout: 15000 },
     ).trim();
     if (output === 'NO_USER' || !output) throw new Error('No superuser found');
     return output;
@@ -49,7 +49,7 @@ function isServiceHealthy(name: string): boolean {
   try {
     const status = execSync(
       `docker compose ps --format '{{.Status}}' ${name}`,
-      { cwd: '/home/phoenix/work/shizuha-stack/compose', encoding: 'utf-8', timeout: 5000 },
+      { cwd: '/home/user/work/shizuha-stack/compose', encoding: 'utf-8', timeout: 5000 },
     ).trim();
     return status.includes('Up') && !status.includes('unhealthy');
   } catch {

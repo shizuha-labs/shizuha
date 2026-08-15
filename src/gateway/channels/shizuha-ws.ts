@@ -25,7 +25,7 @@ import WebSocket from 'ws';
 import type { AgentEvent } from '../../events/types.js';
 import type { Channel, Inbox, InboundMessage, ShizuhaWSChannelConfig } from '../types.js';
 import { logger } from '../../utils/logger.js';
-import { EventLog, isDurableEvent } from '../../daemon/event-log.js';
+import { EventLog, isDurableEvent } from '../../shared/event-log.js';
 import { AgentTokenManager } from '../../auth/agent-token-manager.js';
 
 const PING_INTERVAL_MS = 30_000;

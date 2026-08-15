@@ -42,6 +42,18 @@ describe('GLM thinking required for tool parser — static + behavioral', () => 
     expect(shouldEnableThinkingForRequest('GLM-5.2-QuantTrio-256K', 'off')).toBe(true);
   });
 
+  it('Connect auto-reply prefers email over inbound display-name username', () => {
+    const source = read('src/gateway/channels/connect.ts');
+    expect(source).toContain('recipientEmail ? undefined : target.username');
+  });
+
+  it('fleet gateway talk seats suppress tools and one-shot the inbox', () => {
+    const source = read('src/gateway/agent-process.ts');
+    expect(source).toContain('talkSeatSuppressesTools');
+    expect(source).toContain('Talk seat: empty tools[]');
+    expect(source).toContain("? 'none'");
+  });
+
   it('vLLM uses shouldEnableThinkingForRequest (not thinkingLevel!==off alone)', () => {
     const source = read('src/provider/vllm.ts');
     expect(source).toContain('shouldEnableThinkingForRequest');

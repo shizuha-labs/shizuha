@@ -21,7 +21,13 @@ import {
   formatCode, normalizeCode, CODE_TTL_MS,
 } from './devices/pairing.js';
 import { checkRateLimit, recordFailure, resetFailures } from './devices/rateLimit.js';
-import { incompleteTurnError } from './agent/incomplete-turn.js';
+import {
+  AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
+  incompleteTurnError,
+  MAX_THINKING_ONLY_RECOVERY,
+  shouldContinueAutonomousMaxTokens,
+} from './agent/incomplete-turn.js';
+import { reasoningTextFromContent } from './agent/content.js';
 
 interface QueryRequest {
   prompt: string;
@@ -245,6 +251,7 @@ export async function startServer(port = 8015, host = '0.0.0.0'): Promise<void> 
       reply.raw.write(toSSE(sessionStartEvent));
 
       let turnIndex = 0;
+      let thinkingOnlyRecoveryCount = 0;
       let totalInputTokens = 0;
       let lastReportedPromptTokens = 0; // SCLI-182: real last-turn prompt_tokens for the compaction gate
       let totalOutputTokens = 0;
@@ -414,6 +421,24 @@ export async function startServer(port = 8015, host = '0.0.0.0'): Promise<void> 
 
         // Continuation logic: error-aware nudges
         if (result.toolCalls.length === 0) {
+          if (shouldContinueAutonomousMaxTokens({
+            stopReason: result.stopReason,
+            permissionMode: config.permissionMode,
+            reasoningText: reasoningTextFromContent(result.assistantMessage.content),
+            recoveryCount: thinkingOnlyRecoveryCount,
+            maxRecovery: MAX_THINKING_ONLY_RECOVERY,
+            outputTokens: result.outputTokens,
+          })) {
+            thinkingOnlyRecoveryCount++;
+            const continueMsg = {
+              role: 'user' as const,
+              content: AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
+              timestamp: Date.now(),
+            };
+            messages.push(continueMsg);
+            store.appendMessage(activeSession.id, continueMsg);
+            continue;
+          }
           const incompleteError = incompleteTurnError(result.stopReason);
           if (incompleteError) {
             reply.raw.write(toSSE({

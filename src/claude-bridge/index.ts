@@ -30,11 +30,11 @@ import {
   formatHeartbeatQueueDrainOutcomeLogLine,
   heartbeatQueueDrainTelemetry,
   recordHeartbeatQueueDrainTurn,
-} from '../daemon/heartbeat-outcome.js';
+} from '../shared/heartbeat-outcome.js';
 import type {
   HeartbeatQueueDrainTurnToolCall,
   HeartbeatQueueDrainTurnToolResult,
-} from '../daemon/heartbeat-outcome.js';
+} from '../shared/heartbeat-outcome.js';
 import {
   isLoopbackRuntimeRollCaller,
   RuntimeRollDrainLease,
@@ -1223,7 +1223,7 @@ export class ClaudeBridge {
   /**
    * Resolve the base URL for shizuha-id auth calls (login / refresh / api-token
    * / admin set-password). MUST be the real platform (SHIZUHA_PLATFORM_URL,
-   * e.g. https://shizuha.com), NOT the daemon's BACKEND_URL (:8016) —
+   * e.g. http://shizuha.com), NOT the daemon's BACKEND_URL (:8016) —
    * the daemon shadows /id/api/auth/login/ with its own handler that 401s on
    * agent credentials. Falls back to daemon-host resolution only when
    * SHIZUHA_PLATFORM_URL is missing/loopback (broken inside containers).
@@ -2417,6 +2417,10 @@ export class ClaudeBridge {
 
     // Check if platform is connected
     // Resolve platform URL — reject localhost/loopback (broken inside containers).
+    // Containers can reach the host via Tailscale DNS (shizuha.com) which
+    // works across machines. HTTP is fine on Tailscale (encrypted tunnel).
+    // Resolve platform URL — reject localhost/loopback (broken inside containers).
+    // Containers reach the host via Tailscale DNS (shizuha.com).
     const platformBase = this.resolvePlatformBase();
     if (platformBase !== (process.env['SHIZUHA_PLATFORM_URL'] || '')) {
       console.log(`[${this.opts.agentName}] Platform URL corrected: ${process.env['SHIZUHA_PLATFORM_URL']} → ${platformBase}`);

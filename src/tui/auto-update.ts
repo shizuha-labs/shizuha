@@ -17,7 +17,7 @@ import {
   readInstalledSha,
   runInstaller,
 } from '../commands/update.js';
-import { isDaemonRunning } from '../daemon/state.js';
+import { isDaemonRunning } from '../shared/is-daemon-running.js';
 
 const NORMAL_CHECK_INTERVAL_MS = 15 * 60_000;
 const DAEMON_WAIT_RETRY_MS = 30_000;

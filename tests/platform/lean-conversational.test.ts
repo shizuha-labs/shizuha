@@ -3,8 +3,13 @@ import { SkillRegistry } from '../../src/skills/registry.js';
 import {
   LEAN_CONVERSATIONAL_MCP,
   LEAN_CONVERSATIONAL_MCP_TOOL_NAMES,
+  connectAutoReplyEnabled,
   isLeanConversationalEnv,
   leanConversationalSkillNames,
+  talkPromptMode,
+  talkSeatDisablesThinking,
+  talkSeatSuppressesTools,
+  talkSeatTurnTimeoutMs,
 } from '../../src/platform/lean-conversational.js';
 import { addExplicitlyMentionedMcpTools } from '../../src/gateway/agent-process.js';
 
@@ -34,6 +39,24 @@ describe('lean conversational seats', () => {
     expect(isLeanConversationalEnv({ AGENT_TEAM: 'ceo-office' } as NodeJS.ProcessEnv)).toBe(true);
     expect(isLeanConversationalEnv({ AGENT_USERNAME: 'hina' } as NodeJS.ProcessEnv)).toBe(true);
     expect(isLeanConversationalEnv({ AGENT_USERNAME: 'yuna' } as NodeJS.ProcessEnv)).toBe(true);
+    expect(isLeanConversationalEnv({ AGENT_USERNAME: 'ena' } as NodeJS.ProcessEnv)).toBe(true);
+  });
+
+  it('defaults talk-minimal prompt and Connect auto-reply on for lean seats', () => {
+    const lean = { AGENT_USERNAME: 'yuna' } as NodeJS.ProcessEnv;
+    expect(talkPromptMode(lean)).toBe('minimal');
+    expect(talkPromptMode({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: 'none' })).toBe('none');
+    expect(talkPromptMode({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: '0' })).toBe('full');
+    expect(connectAutoReplyEnabled(lean)).toBe(true);
+    expect(connectAutoReplyEnabled({ ...lean, SHIZUHA_CONNECT_AUTOREPLY: '0' })).toBe(false);
+    expect(connectAutoReplyEnabled({} as NodeJS.ProcessEnv)).toBe(false);
+    expect(talkSeatSuppressesTools(lean)).toBe(true);
+    expect(talkSeatSuppressesTools({ SHIZUHA_TALK_MINIMAL_PROMPT: '0' } as NodeJS.ProcessEnv)).toBe(false);
+    expect(talkSeatDisablesThinking('cortex/DeepSeek-V4-Flash', lean)).toBe(true);
+    expect(talkSeatDisablesThinking('cortex/grok-4.6', lean)).toBe(false);
+    expect(talkSeatTurnTimeoutMs(lean)).toBe(12_000);
+    expect(talkSeatTurnTimeoutMs({ ...lean, SHIZUHA_TALK_TURN_MS: '8000' })).toBe(8_000);
+    expect(talkSeatTurnTimeoutMs({ SHIZUHA_TALK_MINIMAL_PROMPT: '0' } as NodeJS.ProcessEnv)).toBeUndefined();
   });
 
   it('keeps the skill catalog to the lean set', () => {

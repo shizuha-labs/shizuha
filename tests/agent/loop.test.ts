@@ -345,6 +345,45 @@ describe('runAgent — incomplete model turns', () => {
     expect(complete?.totalTurns).toBe(1);
     expect(mockProvider.callCount).toBe(1);
   });
+
+  it('continues an autonomous thinking-only max_tokens turn so the model can tool-call', async () => {
+    mockProvider.queueResponse([
+      { type: 'reasoning' as const, id: 'r-think', rawContent: 'planning the chess engine in hidden reasoning' },
+      { type: 'usage' as const, inputTokens: 10_000, outputTokens: 16_384 },
+      { type: 'stop_reason' as const, reason: 'max_tokens' },
+      { type: 'done' as const },
+    ]);
+    mockProvider.queueResponse(ResponseBuilder.textOnly('Here is the implementation plan as visible text.'));
+
+    const events = await collectEvents({ model: 'Qwen3.8-27B-Q4', permissionMode: 'autonomous' });
+    const complete = findEvent<{ type: 'complete'; totalTurns: number }>(events, 'complete');
+    const error = findEvent<{ type: 'error'; error: string }>(events, 'error');
+    expect(error).toBeUndefined();
+    expect(complete?.totalTurns).toBe(2);
+    expect(mockProvider.callCount).toBe(2);
+    const secondCallMsgs = mockProvider.capturedMessages[1]!;
+    expect(secondCallMsgs.some(
+      (m) => typeof m.content === 'string' && m.content.includes('Continue. Use your tools'),
+    )).toBe(true);
+  });
+
+  it('continues autonomous max_tokens even when reasoning leaked into visible text', async () => {
+    mockProvider.queueResponse([
+      { type: 'reasoning' as const, id: 'r-leak', rawContent: 'hidden plan' },
+      { type: 'text' as const, text: 'I will now write chess_engine.py after more thought.' },
+      { type: 'usage' as const, inputTokens: 10_000, outputTokens: 16_384 },
+      { type: 'stop_reason' as const, reason: 'max_tokens' },
+      { type: 'done' as const },
+    ]);
+    mockProvider.queueResponse(ResponseBuilder.textOnly('Wrote the files.'));
+
+    const events = await collectEvents({ model: 'Qwen3.8-27B-Q4', permissionMode: 'autonomous' });
+    const complete = findEvent<{ type: 'complete'; totalTurns: number }>(events, 'complete');
+    const error = findEvent<{ type: 'error'; error: string }>(events, 'error');
+    expect(error).toBeUndefined();
+    expect(complete?.totalTurns).toBe(2);
+    expect(mockProvider.callCount).toBe(2);
+  });
 });
 
 describe('runAgent — error handling', () => {
@@ -707,6 +746,26 @@ describe('runAgent — SCLI-9 thinking-only re-prompt guard (c)', () => {
       typeof m.content === 'string' && m.content.includes('Continue'),
     );
     expect(hasContinueNudge).toBe(true);
+  });
+
+  it('talk one-shot seats do not re-prompt thinking-only or run a second model call', async () => {
+    const savedUser = process.env['AGENT_USERNAME'];
+    const savedTalk = process.env['SHIZUHA_TALK_MINIMAL_PROMPT'];
+    process.env['AGENT_USERNAME'] = 'yuna';
+    process.env['SHIZUHA_TALK_MINIMAL_PROMPT'] = '1';
+    try {
+      mockProvider.queueResponse(ResponseBuilder.textOnly('<think>I should analyze this carefully.</think>'));
+      mockProvider.queueResponse(ResponseBuilder.textOnly('should not reach'));
+      const events = await collectEvents();
+      const complete = findEvent<{ type: 'complete'; totalTurns: number }>(events, 'complete');
+      expect(complete?.totalTurns).toBe(1);
+      expect(mockProvider.callCount).toBe(1);
+    } finally {
+      if (savedUser === undefined) delete process.env['AGENT_USERNAME'];
+      else process.env['AGENT_USERNAME'] = savedUser;
+      if (savedTalk === undefined) delete process.env['SHIZUHA_TALK_MINIMAL_PROMPT'];
+      else process.env['SHIZUHA_TALK_MINIMAL_PROMPT'] = savedTalk;
+    }
   });
 
   it('stops after MAX_THINKING_ONLY_RECOVERY re-prompts (default 3)', async () => {

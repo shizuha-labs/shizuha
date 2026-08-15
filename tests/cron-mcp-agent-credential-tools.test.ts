@@ -284,7 +284,7 @@ describe('AgentCredential broker tools', () => {
 
     const grant = buildUpdateAgentSshKeysShimGrant(' kai ', {
       enabled: true,
-      sshDir: '/home/phoenix/.ssh',
+      sshDir: '/home/user/.ssh',
       keyFiles: ['id_ed25519'],
       remoteUser: 'phoenix',
     });
@@ -294,7 +294,7 @@ describe('AgentCredential broker tools', () => {
       scope: 'fleet-ssh',
       payload: {
         enabled: true,
-        sshDir: '/home/phoenix/.ssh',
+        sshDir: '/home/user/.ssh',
         keyFiles: ['id_ed25519'],
         remoteUser: 'phoenix',
       },

@@ -389,7 +389,7 @@ install_from_binary() {
     err "Available platforms: linux-x64, linux-arm64, darwin-x64, darwin-arm64"
     err ""
     err "Alternative: install from source:"
-    err "  git clone https://github.com/shizuha-labs/shizuha && cd shizuha && ./install.sh"
+    err "  git clone https://github.com/shizuha-labs/shizuha-beta && cd shizuha-beta && ./install.sh"
     exit 1
   fi
 

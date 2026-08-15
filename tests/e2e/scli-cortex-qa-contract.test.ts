@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -108,7 +108,7 @@ process.stdout.write(String(status));
   return { ...run, output: `${run.stdout}${run.stderr}`, records };
 }
 
-describe('SCLI-354 dynamic Cortex fresh-install QA contract', () => {
+describe.skipIf(!existsSync(harness))('SCLI-354 dynamic Cortex fresh-install QA contract', () => {
   it('discovers, deterministically selects, records, and exercises live inventory for all auth modes', () => {
     const run = runFixture('green');
     expect(run.status, run.output).toBe(0);

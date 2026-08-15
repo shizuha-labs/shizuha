@@ -15,7 +15,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { detectInitSystem } from '../daemon/service.js';
+import { detectInitSystem } from '../shared/init-system.js';
 
 const BUILDS_URL = process.env['SHIZUHA_BUILDS_URL'] ?? 'https://shizuha.com/builds/releases';
 const INSTALLER_URL = process.env['SHIZUHA_INSTALLER_URL'] ?? 'https://shizuha.com/install.sh';

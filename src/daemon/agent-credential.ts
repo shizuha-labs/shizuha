@@ -51,7 +51,7 @@ const ALLOWED_AUDIT_ROLE_SET = new Set<string>(AGENT_CREDENTIAL_AUDIT_ROLES);
 export const AGENT_CREDENTIAL_SCOPE_CHECK_SQL =
   `scope IN (${AGENT_CREDENTIAL_SCOPES.map((s) => `'${s}'`).join(', ')}) AND scope <> '${AGENT_CREDENTIAL_RESERVED_SCOPE}'`;
 
-export const DOGFOOD_PHOENIX_FLEET_SSH_USERNAMES = ['kai', 'ichi', 'ni'] as const;
+export const DOGFOOD_PHOENIX_FLEET_SSH_USERNAMES = [] as const;
 
 const DOGFOOD_PHOENIX_FLEET_SSH_USERNAME_SET = new Set<string>(DOGFOOD_PHOENIX_FLEET_SSH_USERNAMES);
 const DOGFOOD_PHOENIX_MIGRATION_TASK = 'PLAT-111';
@@ -103,7 +103,7 @@ function isDogfoodPhoenixFleetSshAgent(agent: AgentInfo): boolean {
 }
 
 function isPhoenixFleetSshMountData(data: { sshDir?: string; remoteUser?: string } | undefined): boolean {
-  return data?.sshDir === '/home/phoenix/.ssh' && data?.remoteUser === 'phoenix';
+  return false;
 }
 
 function dogfoodPhoenixCredentialData(agent: AgentInfo, migratedAt: string): Record<string, string> {

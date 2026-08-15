@@ -37,7 +37,7 @@ interface TokenData {
 export interface AgentTokenManagerOptions {
   agentUsername: string;
   agentEmail?: string;
-  /** Backend base (e.g. https://shizuha.com or http://host.docker.internal:8016). */
+  /** Backend base (e.g. http://shizuha.com or http://host.docker.internal:8016). */
   platformUrl: string;
   /** Override the directory where token files live. Defaults to $HOME/.shizuha/auth. */
   tokenDir?: string;

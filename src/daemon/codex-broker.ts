@@ -33,7 +33,7 @@ function coordinatorBearerToken(): string {
   if (configured) return configured;
 
   const tokenFile = process.env['MCP_AUTH_PROXY_COORDINATOR_TOKEN_FILE']
-    || path.join(process.env['HOME'] || process.env['USERPROFILE'] || '', '.shizuha', 'mcp-auth-proxy', 'coordinator-token.txt');
+    || path.join(process.env['HOME'] ?? process.env['USERPROFILE'] ?? '', '.shizuha', 'mcp-auth-proxy', 'coordinator-token.txt');
   try {
     return fs.readFileSync(tokenFile, 'utf8').trim();
   } catch {

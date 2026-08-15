@@ -22,7 +22,7 @@ import {
 } from './heartbeat-hygiene.js';
 import { resolveDynamicCompactionWindow, resolveEffectiveContextWindow, type CompactionWindowMode } from '../provider/context-window.js';
 import { MCPManager } from '../tools/mcp/manager.js';
-import { isLeanConversationalEnv, leanConversationalSkillNames } from '../platform/lean-conversational.js';
+import { isLeanConversationalEnv, leanConversationalSkillNames, talkSeatSuppressesTools, talkSeatTurnTimeoutMs } from '../platform/lean-conversational.js';
 import { registerMCPTools, createMCPResourceReadTool } from '../tools/mcp/bridge.js';
 import {
   ToolSearchState,
@@ -44,7 +44,12 @@ import {
   visibleTextFromContent,
 } from './content.js';
 import { DEGENERACY_RECOVERY_PROMPT } from './output-degeneracy-guard.js';
-import { incompleteTurnError } from './incomplete-turn.js';
+import {
+  AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
+  incompleteTurnError,
+  MAX_THINKING_ONLY_RECOVERY,
+  shouldContinueAutonomousMaxTokens,
+} from './incomplete-turn.js';
 import {
   BackgroundTaskWaitController,
   decideBackgroundTaskContinuation,
@@ -166,7 +171,8 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
   // looping on tool calls) otherwise iterates forever, wedging the agent —
   // inbox stuck busy, no heartbeat can rescue it (observed: zen, 226+ model-calls).
   // Hitting this ends the turn cleanly so the inbox frees and the heartbeat re-drives.
-  const hardMaxTurns = Number(process.env['SHIZUHA_HARD_MAX_TURNS'] ?? 100);
+  const talkOneShot = talkSeatSuppressesTools();
+  const hardMaxTurns = talkOneShot ? 1 : Number(process.env['SHIZUHA_HARD_MAX_TURNS'] ?? 100);
   const temperature = agentConfig.temperature ?? config.agent.temperature;
   const maxOutputTokens = agentConfig.maxOutputTokens ?? config.agent.maxOutputTokens;
   const permissionMode = agentConfig.permissionMode ?? config.permissions.mode;
@@ -344,7 +350,7 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
     );
   }
 
-  let toolDefs = getToolDefs();
+  let toolDefs = talkSeatSuppressesTools() ? [] : getToolDefs();
   const skillCatalog = skillRegistry.size > 0
     ? skillRegistry.buildCatalog(
       process.env['AGENT_ROLE'],
@@ -469,7 +475,8 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
 
   // Continuation logic:
   // - Text-only response → STOP immediately
-  // - max_tokens / transport salvage → explicit incomplete terminal, no replay
+  // - max_tokens with visible text / transport salvage → incomplete terminal, no replay
+  // - max_tokens with thinking/reasoning only (autonomous) → same re-prompt as thinking-only
   // - Thinking-only (no output text) → re-prompt up to 3 times, counted separately
   // - Non-thinking reasoning-only → one visible-answer recovery; never surface hidden text
   // - Silent generation (0 output tokens) → targeted recovery up to 2 times
@@ -477,7 +484,6 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
   // - Has tool_use → execute tools, continue
   const REPEATED_TOOL_CALL_NUDGE_AT = 2;
   const REPEATED_TOOL_CALL_STOP_AT = 6;
-  const MAX_THINKING_ONLY_RECOVERY = 3; // SCLI-9: separate from truncation — thinking-only is a different failure mode
   const MAX_SILENT_GENERATION_RECOVERY = 2; // SCLI-9: model returned 0 output tokens (completely silent)
   const MAX_NON_THINKING_REASONING_RECOVERY = 1; // SCLI-117: backend leaked reasoning_content for a non-thinking model
   const MAX_PROGRESS_ONLY_RECOVERY = 2;
@@ -548,7 +554,7 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
 
   try {
     while ((!maxTurns || turnIndex < maxTurns) && turnIndex < hardMaxTurns) {
-      if (turnIndex === hardMaxTurns - 1) {
+      if (!talkOneShot && turnIndex === hardMaxTurns - 1) {
         logger.warn({ turnIndex, hardMaxTurns }, '[turn-watchdog] SCLI-53: hard turn cap reached — ending turn to break a runaway loop (inbox will free; heartbeat re-drives)');
       }
       yield { type: 'turn_start', turnIndex, timestamp: Date.now() };
@@ -664,7 +670,14 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
             undefined, // onPermissionAsk
             undefined, // hookEngine
             thinkingLevel,
-            undefined, // abortSignal
+            (() => {
+              const ms = talkSeatTurnTimeoutMs();
+              const talkAbort = ms ? AbortSignal.timeout(ms) : undefined;
+              if (talkAbort && agentConfig.abortSignal) {
+                return AbortSignal.any([talkAbort, agentConfig.abortSignal]);
+              }
+              return talkAbort ?? agentConfig.abortSignal;
+            })(),
             reasoningEffort,
             undefined, // fastMode
             coerceToolParamsFn,
@@ -688,6 +701,7 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
                 return continuity;
               },
             },
+            talkOneShot ? 'none' : undefined,
           );
           break; // Success
         } catch (turnErr) {
@@ -968,11 +982,13 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
         const _txt = visibleTextFromContent(_c);
         const _reasoning = Array.isArray(_c) ? _c.some((b) => b.type === 'reasoning') : false;
         const _isThinkingOnly = !_txt.replace(/<think>[\s\S]*?<\/think>/g, '').trim() && _txt.length > 0;
-        const continuing = result.toolCalls.length > 0
+        const continuing = !talkOneShot && (
+          result.toolCalls.length > 0
           || (result.outputTokens === 0 && silentGenerationCount < MAX_SILENT_GENERATION_RECOVERY)
           || (_reasoning && !_txt.trim() && !modelProfile.supportsThinking
             && nonThinkingReasoningRecoveryCount < MAX_NON_THINKING_REASONING_RECOVERY)
-          || (_isThinkingOnly && thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY);
+          || (_isThinkingOnly && thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY)
+        );
         if (!continuing && taskRegistry.runningCount > 0 && isBackgroundTaskWaitContentIntent(_c)) {
           struggleAnalyzer.onTurnRecorded(true);
         } else {
@@ -1029,7 +1045,37 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
       }
 
       // Continuation — stop if no tool calls
+      if (talkOneShot) {
+        if (!visibleTextFromContent(result.assistantMessage.content).replace(/<think>[\s\S]*?<\/think>/g, '').trim()) {
+          const reasoningStr = reasoningTextFromContent(result.assistantMessage.content);
+          if (reasoningStr.length > 0) {
+            yield { type: 'content', text: reasoningStr, timestamp: Date.now() };
+          }
+        }
+        break;
+      }
       if (result.toolCalls.length === 0) {
+        if (shouldContinueAutonomousMaxTokens({
+          stopReason: result.stopReason,
+          permissionMode,
+          reasoningText: reasoningTextFromContent(result.assistantMessage.content),
+          recoveryCount: thinkingOnlyRecoveryCount,
+          outputTokens: result.outputTokens,
+        })) {
+          thinkingOnlyRecoveryCount++;
+          logger.warn(
+            { turnIndex, attempt: thinkingOnlyRecoveryCount, outputTokens: result.outputTokens, stopReason: result.stopReason },
+            'SCLI: max_tokens hit on a thinking-only autonomous turn — continuing so the model can tool-call',
+          );
+          const continueMsg: Message = {
+            role: 'user',
+            content: AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
+            timestamp: Date.now(),
+          };
+          messages.push(continueMsg);
+          store.appendMessage(session.id, continueMsg);
+          continue;
+        }
         const incompleteError = incompleteTurnError(result.stopReason);
         if (incompleteError) {
           logger.warn({ turnIndex, stopReason: result.stopReason }, 'SCLI: model turn ended incomplete; refusing automatic replay');
@@ -1116,7 +1162,7 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
 
         // SCLI-9(c): Thinking-only re-prompt — model generated <think>...</think>
         // but no actionable output. Re-prompt separately from truncation recovery.
-        if (!hasActionableText && textContent.length > 0 && thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY) {
+        if (!talkOneShot && !hasActionableText && textContent.length > 0 && thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY) {
           thinkingOnlyRecoveryCount++;
           logger.info(
             { turnIndex, attempt: thinkingOnlyRecoveryCount, outputTokens: result.outputTokens },

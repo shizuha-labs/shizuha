@@ -1095,7 +1095,7 @@ function normalizeRuntimeEnvironment(
   return fallback;
 }
 
-// CTX-16: detect raw vLLM NodePort URLs (e.g. http://127.0.0.1:8000/v1).
+// CTX-16: detect raw vLLM NodePort URLs (e.g. http://gx10-1:31428/v1).
 // Agents configured before the gateway was available may have CORTEX_BASE_URL
 // pointing at a GB10 node's NodePort, bypassing usage metering and load balancing.
 // The CORTEX_GATEWAY_BASE_URL daemon env override rewrites these to the cortex
@@ -1290,7 +1290,8 @@ export function resolveDindMode(): [boolean, 'sysbox' | 'privileged' | 'none'] {
   if (!isDockerAvailable()) return [false, 'none'];
   // Always use privileged DinD — sysbox containers get DNS from host's legacy
   // resolv.conf instead of Docker's internal resolver (127.0.0.11), which breaks
-  // overlay-network hostname resolution and causes isolation issues.
+  // Tailscale hostname resolution (shizuha.com) and causes network
+  // isolation issues with internal services.
   return [true, 'privileged'];
 }
 
@@ -4505,8 +4506,8 @@ function maybeProbeK8sGithubAuth(agents: AgentInfo[], k8sDeploymentStates: Retur
 const HARNESS_ROLL_ENABLED =
   (process.env['SHIZUHA_HARNESS_AUTO_ROLL'] ?? 'true').toLowerCase() !== 'false';
 const HARNESS_ROLL_IDLE_MS = Math.max(
-  30_000,
-  Number(process.env['SHIZUHA_HARNESS_ROLL_IDLE_SECONDS'] ?? '90') * 1000,
+  15_000,
+  Number(process.env['SHIZUHA_HARNESS_ROLL_IDLE_SECONDS'] ?? '30') * 1000,
 );
 // PLAT-4211: minimum wall-clock spacing between harness rolls. The anyConverging
 // gate alone under-serializes (a Recreate briefly shows replicas=0, so the next

@@ -28,6 +28,9 @@ benchmark/results/
 benchmark/reports/
 benchmark/__pycache__/
 benchmark/*.pyc
+# Source moved to cortex/benchboard (6a963cb). The leftover directory is
+# local DBs/archives/logs/.env only — never re-add it to this repo.
+/benchmark/
 
 # Test artifacts
 test-results/
@@ -102,8 +105,3 @@ htmlcov/
 
 # Local bench credentials — never ship
 benchmark/.local/
-
-# Scratch leftovers
-hello.py
-checkpoint.txt
-push.sh

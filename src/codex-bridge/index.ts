@@ -35,12 +35,12 @@ import {
   heartbeatQueueDrainTelemetry,
   recordHeartbeatQueueDrainOutcome,
   recordHeartbeatQueueDrainTurn,
-} from '../daemon/heartbeat-outcome.js';
+} from '../shared/heartbeat-outcome.js';
 import type {
   HeartbeatQueueDrainRecord,
   HeartbeatQueueDrainTurnToolCall,
   HeartbeatQueueDrainTurnToolResult,
-} from '../daemon/heartbeat-outcome.js';
+} from '../shared/heartbeat-outcome.js';
 import {
   getTurnStallReason,
   isCurrentBridgeChild,

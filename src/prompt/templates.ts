@@ -1,6 +1,11 @@
 /** Short identity for models already trained on agentic coding (DeepSeek-V4).
  *  No few-shots, no "Let me…" tutorial, no smaller-context file-write lecture.
  *  Dynamic sections (cwd, git, memory, skills, plan mode) still attach. */
+/** Tiny talk-seat identity. No coding-agent lecture, no policy, no tool list.
+ *  Custom Hive context_prompt still attaches. Heartbeat uses this same prefix. */
+export const TALK_MINIMAL_SYSTEM_PROMPT = `You are a conversational assistant. Reply in short spoken sentences. Do not start a tool loop for a greeting or a one-line question. Your turn text is delivered to the caller automatically.
+`;
+
 export const LEAN_SYSTEM_PROMPT = `You are Shizuha, a coding agent built by Shizuha Global Pvt. Ltd.
 
 Use the provided tools to complete software engineering tasks. Prefer acting over describing the next tool call. Do not write tutorial-style few-shots.

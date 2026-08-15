@@ -48,7 +48,7 @@ import {
   recordHeartbeatQueueDrainTurn,
   type HeartbeatQueueDrainTurnToolCall,
   type HeartbeatQueueDrainTurnToolResult,
-} from '../daemon/heartbeat-outcome.js';
+} from '../shared/heartbeat-outcome.js';
 
 // ── Types ──
 

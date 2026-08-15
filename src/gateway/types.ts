@@ -267,7 +267,7 @@ export interface ShizuhaWSChannelConfig {
   /** Auto-reconnect on disconnect */
   reconnect?: boolean;
   /** Event log for cursor-based replay (replaces RAM outbox) */
-  eventLog?: import('../daemon/event-log.js').EventLog;
+  eventLog?: import('../shared/event-log.js').EventLog;
 
   /**
    * Called when another runner is already connected for this agent.

@@ -22,6 +22,17 @@ export const CORTEX_GROUP = 'Shizuha / Cortex';
  * An empty list (`[]`, reachable but serving nothing) shows no Cortex entries
  * rather than a stale default.
  */
+/** Drop Cortex rows that cannot serve. /v1/models used to keep
+ *  available=false ids (dead adopted backends); SCLI /model listed them. */
+export function servableCortexModelIds(
+  rows: Array<{ id: string; available?: boolean; status?: string }> | null,
+): string[] | null {
+  if (rows === null) return null;
+  return rows
+    .filter((m) => m.available !== false && m.status !== 'unavailable')
+    .map((m) => m.id);
+}
+
 export function assembleCortexModels(liveModelIds: string[] | null): ModelInfo[] {
   if (liveModelIds === null) {
     return [{

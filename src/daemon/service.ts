@@ -15,40 +15,11 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
+import { detectInitSystem, type InitSystem } from '../shared/init-system.js';
+
+export { detectInitSystem, type InitSystem };
 
 const SERVICE_NAME = 'shizuha';
-
-// ── Init system detection ────────────────────────────────────────────
-
-export type InitSystem = 'systemd' | 'launchd' | 'nohup';
-
-let _detected: InitSystem | null = null;
-
-export function detectInitSystem(): InitSystem {
-  if (_detected) return _detected;
-
-  // macOS — launchd
-  if (process.platform === 'darwin') {
-    try {
-      execSync('launchctl version', { stdio: 'ignore' });
-      _detected = 'launchd';
-      return _detected;
-    } catch { /* fall through */ }
-  }
-
-  // Linux — systemd (user session)
-  if (process.platform === 'linux') {
-    try {
-      execSync('systemctl --user --version', { stdio: 'ignore' });
-      _detected = 'systemd';
-      return _detected;
-    } catch { /* fall through */ }
-  }
-
-  // Everything else: Docker, Termux, old sysvinit, WSL1, etc.
-  _detected = 'nohup';
-  return _detected;
-}
 
 /** Human-readable name for the detected init system. */
 export function initSystemName(): string {

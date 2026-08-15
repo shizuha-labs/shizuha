@@ -51,11 +51,19 @@ function mdToHtml(md: string): string {
   return html;
 }
 
+// Human email mapping (same as teams config)
+const HUMAN_EMAILS: Record<string, string> = {
+  hritik: 'hothritik1@gmail.com',
+};
+
 function toEmail(username: string): string {
-  return `${username}@agents.shizuha.io`;
+  return HUMAN_EMAILS[username] ?? `${username}@agents.shizuha.io`;
 }
 
 function fromEmail(email: string): string {
+  for (const [user, e] of Object.entries(HUMAN_EMAILS)) {
+    if (e === email) return user;
+  }
   return email.split('@')[0] ?? email;
 }
 

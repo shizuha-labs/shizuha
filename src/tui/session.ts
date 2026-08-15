@@ -28,7 +28,7 @@ import {
   resolveCortexAuthToken,
   resolveCortexBaseUrl,
 } from '../provider/registry.js';
-import { assembleCortexModels } from './cortex-models.js';
+import { assembleCortexModels, servableCortexModelIds } from './cortex-models.js';
 import { BackgroundTaskRegistry } from '../tasks/registry.js';
 import type { SessionSummary, ModelInfo } from './state/types.js';
 import { logger } from '../utils/logger.js';
@@ -3373,8 +3373,8 @@ export class AgentSession extends EventEmitter {
         const token = resolveCortexAuthToken(this.config);
         const authHeader = token ? ` -H ${JSON.stringify(`Authorization: Bearer ${token}`)}` : '';
         const raw = execSync(`curl -sf${authHeader} ${JSON.stringify(`${cortexUrl}/models`)} 2>/dev/null`, { encoding: 'utf-8', timeout: 3000 });
-        const data = JSON.parse(raw) as { data?: Array<{ id: string }> };
-        liveModelIds = (data.data ?? []).map((m) => m.id);
+        const data = JSON.parse(raw) as { data?: Array<{ id: string; available?: boolean; status?: string }> };
+        liveModelIds = servableCortexModelIds(data.data ?? []);
       } catch { /* offline or unreachable -> liveModelIds stays null */ }
       for (const info of assembleCortexModels(liveModelIds)) {
         models.push(info);

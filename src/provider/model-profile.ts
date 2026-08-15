@@ -9,6 +9,8 @@
  * Unknown models get the DEFAULT profile.
  */
 
+import { talkSeatDisablesThinking } from '../platform/lean-conversational.js';
+
 export interface ModelProfile {
   /** Human-readable name for logs/dashboard */
   displayName: string;
@@ -236,7 +238,7 @@ const PROFILES: Array<[string, ModelProfile]> = [
     supportsVision: true,
   }],
 
-  // Qwen3.8-27B-Q4 — i9-ws llama.cpp UD-Q4_K_XL, 3×40960 slots. Must precede
+  // Qwen3.8-27B-Q4 — i9-ws llama.cpp UD-Q4_K_XL, 1×122880 slot. Must precede
   // the generic Qwen3.8 profile (first-match-wins). Same thinking+coding
   // recipe as BF16; native window is the live slot, not the 256K card.
   ['Qwen3.8-27B-Q4', {
@@ -248,11 +250,11 @@ const PROFILES: Array<[string, ModelProfile]> = [
     disableThinkingExplicitly: true,
     toolCallFormat: 'auto',
     supportsParallelToolCalls: true,
-    nativeContextWindow: 40960,
+    nativeContextWindow: 122880,
     recommendedMaxOutputTokens: 16384,
     defaultTemperature: 0.6,
     defaultTopP: 0.95,
-    defaultReasoningEffort: 'high',
+    defaultReasoningEffort: 'xhigh',
     benefitsFromPrefixCaching: true,
     supportsVision: false,
   }],
@@ -276,7 +278,7 @@ const PROFILES: Array<[string, ModelProfile]> = [
     recommendedMaxOutputTokens: 16384,
     defaultTemperature: 0.6,
     defaultTopP: 0.95,
-    defaultReasoningEffort: 'high',
+    defaultReasoningEffort: 'xhigh',
     benefitsFromPrefixCaching: true,
     supportsVision: false,
   }],
@@ -856,6 +858,7 @@ export function resolveThinkingLevelForModel(
   modelName?: string | null,
   savedOrUserLevel?: string | null,
 ): string {
+  if (talkSeatDisablesThinking(modelName ?? '')) return 'off';
   if (modelRequiresThinkingForTools(modelName)) return 'on';
   const lower = (modelName ?? '').toLowerCase();
   if (lower.includes('deepseek-v4-flash')) return 'on';
@@ -885,6 +888,7 @@ export function shouldEnableThinkingForRequest(
   modelName: string,
   thinkingLevel?: string | null,
 ): boolean {
+  if (talkSeatDisablesThinking(modelName)) return false;
   const profile = getModelProfile(modelName);
   if (!profile.supportsThinking && !profile.disableThinkingExplicitly) return false;
   if (profile.defaultThinkingOn === true) return true;
@@ -901,6 +905,7 @@ export function resolveReasoningEffortForRequest(
   modelName: string,
   options?: { reasoningEffort?: string | null; thinkingLevel?: string | null },
 ): string | undefined {
+  if (talkSeatDisablesThinking(modelName)) return undefined;
   const env = process.env['VLLM_REASONING_EFFORT']?.trim()
     || process.env['REASONING_EFFORT']?.trim();
   const explicit = options?.reasoningEffort?.trim();
@@ -916,6 +921,12 @@ export function resolveReasoningEffortForRequest(
   const allowHigh = process.env['SHIZUHA_ALLOW_GROK_HIGH_REASONING'] === '1';
   if (isSuperGrok && !allowHigh && (resolved === 'high' || resolved === 'xhigh')) {
     return 'low';
+  }
+  // Qwen3.8 chat template only accepts xhigh|medium|low. Sending `high`
+  // raises TemplateError and Cortex returns 400 (shizuha1, 2026-08-15).
+  const isQwen38 = modelId.includes('qwen3.8');
+  if (isQwen38 && (resolved === 'high' || resolved === 'max')) {
+    return 'xhigh';
   }
   return resolved;
 }

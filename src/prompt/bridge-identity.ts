@@ -1,7 +1,27 @@
-import type { AgentInfo } from '../daemon/types.js';
 import { listSkillNames, readSkillByName } from '../skills/frontmatter.js';
 import { skillMatchesAudience } from '../skills/registry.js';
 import { AGENT_POLICY } from './templates.js';
+
+/** Fields the identity prompt needs — not the full fleet AgentInfo. */
+export type BridgeIdentityAgent = {
+  name: string;
+  username: string;
+  role?: string | null;
+  team?: string | null;
+  skills?: string[];
+  eagerSkills?: string[];
+  personalityTraits?: Record<string, unknown>;
+  effectiveCapabilities?: {
+    source?: string;
+    skills?: string[];
+    eagerSkills?: string[];
+    capabilities?: string[];
+    sourceTeams?: string[];
+    mcpServers?: string[];
+    diagnostics?: Array<{ severity?: string; code?: string; message?: string }>;
+    catalogVersion?: string | number;
+  } | null;
+};
 
 /**
  * Keep in sync with PLATFORM_UNIVERSAL_SKILLS in daemon/manager.ts — these are
@@ -28,7 +48,7 @@ function trimOrNull(value: string | null | undefined): string | null {
 }
 
 export function buildBridgeIdentityPrompt(
-  agent: Pick<AgentInfo, 'name' | 'username' | 'role' | 'team' | 'skills' | 'eagerSkills' | 'personalityTraits' | 'effectiveCapabilities'>,
+  agent: BridgeIdentityAgent,
   customPrompt?: string | null,
 ): string {
   const sections: string[] = [];
@@ -167,10 +187,14 @@ export function buildBridgeIdentityPrompt(
 
   if (agent.effectiveCapabilities?.source === 'hive') {
     const effective = agent.effectiveCapabilities;
-    const capLine = effective.capabilities.length ? effective.capabilities.join(', ') : 'none';
-    const teamLine = effective.sourceTeams.length ? effective.sourceTeams.join(', ') : 'none';
-    const mcpLine = effective.mcpServers.length ? effective.mcpServers.join(', ') : 'none';
-    const diagLine = effective.diagnostics
+    const capabilities = effective.capabilities ?? [];
+    const sourceTeams = effective.sourceTeams ?? [];
+    const mcpServers = effective.mcpServers ?? [];
+    const diagnostics = effective.diagnostics ?? [];
+    const capLine = capabilities.length ? capabilities.join(', ') : 'none';
+    const teamLine = sourceTeams.length ? sourceTeams.join(', ') : 'none';
+    const mcpLine = mcpServers.length ? mcpServers.join(', ') : 'none';
+    const diagLine = diagnostics
       .filter((d) => d.severity !== 'info')
       .map((d) => `${d.severity}:${d.code}`)
       .join(', ') || 'none';

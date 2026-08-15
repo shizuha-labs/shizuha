@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { computePrefixFingerprint, comparePrefixFingerprints, stableJson, PrefixFingerprintTracker } from '../src/telemetry/prefix-fingerprint.js';
 import { ToolRegistry } from '../src/tools/registry.js';
-import { BenchPrefixDebugTracker, shouldEmitBenchPrefixDebug } from '../benchmark/prefix-debug.js';
+import { BenchPrefixDebugTracker, shouldEmitBenchPrefixDebug } from '../src/telemetry/bench-prefix-debug.js';
 
 function tool(name: string) {
   return { name, description: `${name} desc`, parameters: z.object({ q: z.string().optional() }), execute: async () => ({ content: 'ok' }) };

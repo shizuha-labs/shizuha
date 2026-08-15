@@ -100,8 +100,9 @@ printf 'gemini 0.50.0\n'
     expect(smokeRenderer).toContain('/opt/shizuha/harness-versions.json');
     expect(workflow).not.toContain('/app/manage.py promote_runtime_image');
     expect(workflow.indexOf('runtime image smoke failed')).toBeLessThan(
-      workflow.indexOf('Promotion requires a reviewed deploy PR'),
+      workflow.indexOf('Auto-promote appends this digest'),
     );
+    expect(workflow).toContain('append-desired-runtime-release.py');
     expect(workflow).toContain('PREPULL_NODES="$(');
     expect(workflow).toContain('or .metadata.labels["shizuha.io/platform"] == "true"');
     expect(workflow).not.toContain('kubectl get pods -n shizuha-fleet');
@@ -133,7 +134,7 @@ printf 'gemini 0.50.0\n'
     expect(workflow).toContain('node became ${NODE_READY:-unavailable}');
     expect(workflow).toContain('kubectl delete job -n build "$PREPULL_JOB" --wait=false');
     expect(workflow.indexOf('runtime image fleet pre-pull failed')).toBeLessThan(
-      workflow.indexOf('Promotion requires a reviewed deploy PR'),
+      workflow.indexOf('Auto-promote appends this digest'),
     );
     expect(workflow).not.toContain('/app/manage.py promote_runtime_image');
     expect(workflow).not.toContain('FLEET_IMAGE="localhost:30500/${IMG}:${TAG}"');
@@ -220,7 +221,7 @@ printf 'gemini 0.50.0\n'
     expect(workflow).toContain('hostPath dist stage + s1 pin RETIRED');
     expect(workflow).toContain('Do not re-add s1 hostPath staging');
     expect(workflow).toContain('fleet-daemon-k8s + agent-runtime image');
-    expect(workflow).not.toContain('path: /home/phoenix/work/shizuha-stack/cli');
+    expect(workflow).not.toContain('path: /home/user/work/shizuha-stack/cli');
     expect(workflow).not.toContain('dist.previous-\\${DEPLOY_ID}');
     expect(workflow).not.toContain('wait_runtime_fleet_rollout()');
     expect(workflow).not.toContain('ci-rollback-runtime-fleet-${SHORT}');

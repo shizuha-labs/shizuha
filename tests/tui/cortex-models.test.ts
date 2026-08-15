@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { assembleCortexModels, CORTEX_GROUP } from '../../src/tui/cortex-models.js';
+import { assembleCortexModels, CORTEX_GROUP, servableCortexModelIds } from '../../src/tui/cortex-models.js';
 import { DEFAULT_CORTEX_MODEL } from '../../src/provider/registry.js';
 
 // SCLI-162: the Cortex picker must reflect live /v1/models, never a static
@@ -35,6 +35,16 @@ describe('assembleCortexModels (SCLI-162)', () => {
 
   it('reachable but serving nothing: shows no Cortex entries (no stale default)', () => {
     expect(assembleCortexModels([])).toEqual([]);
+  });
+
+  it('servableCortexModelIds drops available=false / status=unavailable rows', () => {
+    expect(servableCortexModelIds(null)).toBeNull();
+    expect(servableCortexModelIds([
+      { id: 'Qwen3.8-27B-Q4', available: true, status: 'available' },
+      { id: 'Qwen3.8-27B', available: false, status: 'unavailable' },
+      { id: 'Qwen3.8-27B-MLX', status: 'unavailable' },
+      { id: 'DeepSeek-V4-Flash' },
+    ])).toEqual(['Qwen3.8-27B-Q4', 'DeepSeek-V4-Flash']);
   });
 
   it('unreachable (null): offline fallback = default ONLY, clearly marked offline', () => {

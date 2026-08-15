@@ -27,7 +27,7 @@ export interface SendConnectDmResult {
 }
 
 export interface SendConnectDmOptions {
-  /** Recipient email (e.g., "kai@agents.shizuha.io") */
+  /** Recipient email (e.g., "kai@agents.shizuha.io" or "hothritik1@gmail.com") */
   recipientEmail?: string;
   /** Recipient username — preferred ergonomic form (e.g. "hritik", "kai"). */
   recipientUsername?: string;

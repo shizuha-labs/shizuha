@@ -30,7 +30,13 @@ import {
   preflightOrExit,
   requireOptionalNonEmpty,
 } from './cli/option-preflight.js';
-import { incompleteTurnError } from './agent/incomplete-turn.js';
+import {
+  AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
+  incompleteTurnError,
+  MAX_THINKING_ONLY_RECOVERY,
+  shouldContinueAutonomousMaxTokens,
+} from './agent/incomplete-turn.js';
+import { reasoningTextFromContent } from './agent/content.js';
 
 // Keep CLI output clean from Node runtime deprecation warnings.
 process.noDeprecation = true;
@@ -618,7 +624,7 @@ program
         process.exit(1);
       }
       const { ShizuhaWSChannel } = await import('./gateway/channels/shizuha-ws.js');
-      const { EventLog } = await import('./daemon/event-log.js');
+      const { EventLog } = await import('./shared/event-log.js');
       const eventLog = new EventLog();
       const wsChannel = new ShizuhaWSChannel({
         type: 'shizuha-ws',
@@ -2384,10 +2390,12 @@ async function* runAgentWithPrompt(
 
   // Continuation logic:
   // - Text-only response (no tool_use) → STOP immediately (no nudges)
-  // - Incomplete response (max_tokens / transport salvage) → fail closed
+  // - max_tokens with a reasoning block (autonomous) → continue to tool-call
+  // - Other incomplete (visible-only max_tokens / transport salvage) → fail closed
   // - Has tool_use → execute tools, continue loop
   const MAX_TRUNCATION_RECOVERY = 3;
   let truncationRecoveryCount = 0;
+  let thinkingOnlyRecoveryCount = 0;
   const backgroundTaskWait = new BackgroundTaskWaitController();
 
   try {
@@ -2722,6 +2730,31 @@ async function* runAgentWithPrompt(
 
       // Continuation logic:
       if (result.toolCalls.length === 0) {
+        // Bench/`shizuha exec` is this loop, not runAgent(). Continue must
+        // run before the incomplete-terminal, including finish_reason=stop
+        // after a 16k think (llama.cpp often emits stop, not length).
+        if (shouldContinueAutonomousMaxTokens({
+          stopReason: result.stopReason,
+          permissionMode,
+          reasoningText: reasoningTextFromContent(result.assistantMessage.content),
+          recoveryCount: thinkingOnlyRecoveryCount,
+          maxRecovery: MAX_THINKING_ONLY_RECOVERY,
+          outputTokens: result.outputTokens,
+        })) {
+          thinkingOnlyRecoveryCount++;
+          logger.warn(
+            { turnIndex, attempt: thinkingOnlyRecoveryCount, outputTokens: result.outputTokens, stopReason: result.stopReason },
+            'SCLI: max_tokens hit on a thinking-only autonomous turn — continuing so the model can tool-call',
+          );
+          const continueMsg: Message = {
+            role: 'user',
+            content: AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
+            timestamp: Date.now(),
+          };
+          messages.push(continueMsg);
+          store.appendMessage(session.id, continueMsg);
+          continue;
+        }
         const incompleteError = incompleteTurnError(result.stopReason);
         if (incompleteError) {
           logger.warn({ turnIndex, stopReason: result.stopReason }, 'SCLI exec: model turn ended incomplete; refusing automatic replay');

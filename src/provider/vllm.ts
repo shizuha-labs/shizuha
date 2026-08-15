@@ -123,13 +123,24 @@ export function isModelLeasedBody(body: unknown, bodyText = ''): boolean {
   return /model_leased_to_other|model_leased|not_hive_eligible|"type"\s*:\s*"model_leased"|leased to another agent|not marked them eligible/i.test(bodyText);
 }
 
-/** Delay for a leased-out model: honor Retry-After, floor 60s, cap 15min. */
+/** Delay for a leased-out model: honor Retry-After, floor 60s, cap 15min.
+ *  Lean talk seats must not sit 60s silent on a 503 — Cortex fail-opens
+ *  non-holders onto shared capacity; a long wait is a missed T2. */
 export function modelLeasedRetryMs(
   headers: Headers,
   attempt: number,
   rand: () => number = Math.random,
 ): number {
+  const talkSeat = process.env['SHIZUHA_LEAN_MCP'] === '1'
+    || process.env['SHIZUHA_TALK_MINIMAL_PROMPT'] === '1';
   const headerMs = retryAfterHeaderMs(headers);
+  if (talkSeat) {
+    const BASE = 1_500;
+    const MAX = 4_000;
+    const delay = Math.min(Math.max(headerMs ?? BASE, BASE), MAX);
+    const r = Math.min(1, Math.max(0, rand()));
+    return Math.round(delay * (0.9 + r * 0.2));
+  }
   // Floor 60s: Cortex default Retry-After is 60; never thrash faster than that.
   const BASE = 60_000;
   const MAX = 900_000; // 15 min ≈ min-hold; next sprint is often free by then
@@ -1427,9 +1438,15 @@ export class VLlmProvider implements LLMProvider {
     // never yields an answer (operator 2026-07-25: "even if it takes this long
     // we should at least have some answer").
     const isSlowThinkingModel = isGlmModel || profile.defaultThinkingOn === true;
-    const defaultStreamStallMs = interactiveTui
-      ? (isRemoteCodex ? 180_000 : isSlowThinkingModel ? 300_000 : 90_000)
-      : 930_000;
+    const talkSeat = process.env['SHIZUHA_LEAN_MCP'] === '1'
+      || process.env['SHIZUHA_TALK_MINIMAL_PROMPT'] === '1';
+    // Talk seats cannot sit silent for the 930s fleet stall — that is the
+    // Yuna T2 miss: 98% cache hit then minutes of thinking-only SSE.
+    const defaultStreamStallMs = talkSeat
+      ? 20_000
+      : interactiveTui
+        ? (isRemoteCodex ? 180_000 : isSlowThinkingModel ? 300_000 : 90_000)
+        : 930_000;
     const configuredStreamStallMs = parseTimeoutMs(
       'VLLM_STREAM_STALL_MS',
       // After first token: allow long think gaps, but not infinite silence.
@@ -1583,7 +1600,10 @@ export class VLlmProvider implements LLMProvider {
     // backend — hammering 5xx backoff (2–30s × 40) just storms Cortex. Long
     // waits (60s floor / Retry-After / up to 15min) until the lease free or we
     // give up and let the heartbeat re-enter (Rui 2026-07-28).
-    const MAX_LEASE_RETRIES = parseTimeoutMs('VLLM_LEASE_RETRIES', interactiveTui ? 1 : 20);
+    const MAX_LEASE_RETRIES = parseTimeoutMs(
+      'VLLM_LEASE_RETRIES',
+      interactiveTui || process.env['SHIZUHA_LEAN_MCP'] === '1' ? 1 : 20,
+    );
     let leaseAttempt = 0;
     let errBodyText: string | undefined;
     // Client-side endpoint failover (free, no Cloudflare): on a connection-class

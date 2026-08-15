@@ -76,7 +76,7 @@ import {
   recordHeartbeatQueueDrainTurn,
   recordObservedEmptyPulseQueue,
   type HeartbeatQueueDrainOutcome,
-} from '../daemon/heartbeat-outcome.js';
+} from '../shared/heartbeat-outcome.js';
 import { setActiveTelemetryWindow, createTurnTelemetrySink } from '../agent/loop.js';
 import { incompleteTurnError } from '../agent/incomplete-turn.js';
 import {
@@ -89,11 +89,14 @@ import { countTokens } from '../utils/tokens.js';
 import { modelSupportsAppendOnlyToolActivation } from '../tools/tool-search.js';
 import {
   DEFAULT_FIRST_HEARTBEAT_MS,
+  LEAN_FIRST_HEARTBEAT_MS,
   DEFAULT_HEARTBEAT_DEBOUNCE_MS,
   DEFAULT_IDLE_HEARTBEAT_MS,
   LEAN_CONVERSATIONAL_MCP_TOOL_NAMES,
   isLeanConversationalEnv,
   leanConversationalSkillNames,
+  talkSeatSuppressesTools,
+  talkSeatTurnTimeoutMs,
 } from '../platform/lean-conversational.js';
 import { estimatePromptTokenBudget, heartbeatBudgetConfig } from '../agent/heartbeat-hygiene.js';
 import {
@@ -615,18 +618,22 @@ export class AgentProcess {
   // they only acted on a pushed message and went idle forever on ready work.
   // This self-wakes the agent after a period of inactivity to finish assigned tasks.
   private lastActivityAt = Date.now();
+  private readonly bootAt = this.lastActivityAt;
   private lastHeartbeatAt = 0;
   private idleHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private readonly idleHeartbeatMs = Number(process.env['SHIZUHA_IDLE_HEARTBEAT_MS'] ?? DEFAULT_IDLE_HEARTBEAT_MS);
   private readonly heartbeatDebounceMs = Number(process.env['SHIZUHA_HEARTBEAT_DEBOUNCE_MS'] ?? DEFAULT_HEARTBEAT_DEBOUNCE_MS);
-  // First beat matches the idle cadence. Operator 2026-08-15: heartbeats are
-  // for long-idle seats only — a 2.5m post-spawn tick injected work into a
-  // just-talked conversational agent and broke SuperGrok prefix cache.
+  // Lean talk seats fire one silent prefix-warm ~8s after boot (empty Pulse
+  // still hits the model so the system prefix is resident). After that the
+  // idle cadence is 30m and a just-talked seat is never injected.
   private readonly firstHeartbeatMs = Math.min(
-    Number(process.env['SHIZUHA_FIRST_HEARTBEAT_MS'] ?? DEFAULT_FIRST_HEARTBEAT_MS),
+    Number(process.env['SHIZUHA_FIRST_HEARTBEAT_MS'] ?? (
+      isLeanConversationalEnv() ? LEAN_FIRST_HEARTBEAT_MS : DEFAULT_FIRST_HEARTBEAT_MS
+    )),
     this.idleHeartbeatMs,
   );
   private firstHeartbeatPending = true;
+  private firstWarmTimer: ReturnType<typeof setTimeout> | null = null;
   private nextHeartbeatDueAt = Date.now() + this.firstHeartbeatMs;
   private readonly expensiveTurnGuard = new ExpensiveTurnGuard(expensiveTurnGuardConfigFromEnv());
   // SCLI-415: single-row deferred-replay pump. At most one row is `releasing`
@@ -1521,7 +1528,7 @@ export class AgentProcess {
     const keepMinimalDeferredHead = deferMcpTools
       && process.env['SHIZUHA_APPEND_ONLY_TOOL_ACTIVATION'] !== '0'
       && modelSupportsAppendOnlyToolActivation(this.model);
-    if (!keepMinimalDeferredHead) {
+    if (!keepMinimalDeferredHead && !talkSeatSuppressesTools()) {
       try {
         const mentioned = new Set<string>();
         if (isLeanConversationalEnv()) {
@@ -1552,6 +1559,14 @@ export class AgentProcess {
             'Pre-activated prompt-referenced MCP tools at setup (prefix-stable head)');
         }
       } catch { /* diagnostics-only compatibility optimization — never block setup */ }
+    }
+
+    // Talk seats reply via Connect auto-reply. Advertising Pulse/wiki tools
+    // starts a multi-round tool loop that holds the single-task inbox and
+    // looks like a dead turn to the next human DM.
+    if (talkSeatSuppressesTools()) {
+      this.toolDefs = [];
+      logger.info('Talk seat: empty tools[] (one-shot auto-reply; no Pulse/wiki loops)');
     }
 
     // Initialize persistent agent memory
@@ -2102,10 +2117,16 @@ export class AgentProcess {
     if (process.env['SHIZUHA_IDLE_HEARTBEAT_DISABLED'] === '1') return;
     const NUDGE = IDLE_HEARTBEAT_NUDGE;
     logger.info({ idleHeartbeatMs: this.idleHeartbeatMs, firstHeartbeatMs: this.firstHeartbeatMs, heartbeatDebounceMs: this.heartbeatDebounceMs }, 'Idle-heartbeat armed (SCLI-49 + SCLI-71 early first beat)');
-    this.idleHeartbeatTimer = setInterval(async () => {
+    const tickIdleHeartbeat = async () => {
       try {
         const now = Date.now();
-        if (!idleHeartbeatAdmissionAllowed({
+        const talkedSinceBoot = this.lastActivityAt > this.bootAt;
+        const prefixWarm = this.firstHeartbeatPending
+          && isLeanConversationalEnv()
+          && now >= this.nextHeartbeatDueAt
+          && !talkedSinceBoot
+          && !this.inbox.busy;
+        if (!prefixWarm && !idleHeartbeatAdmissionAllowed({
           running: this.running,
           busy: this.inbox.busy,
           pendingHeartbeat: this.inbox.hasClass('heartbeat'),
@@ -2132,8 +2153,8 @@ export class AgentProcess {
         this.lastHeartbeatAt = now;
         this.firstHeartbeatPending = false;
         this.nextHeartbeatDueAt = now + Math.max(this.idleHeartbeatMs, this.heartbeatDebounceMs);
-        const readyWork = await this.hasReadyPulseWorkForIdleHeartbeat();
-        if (readyWork === false) {
+        const readyWork = prefixWarm ? null : await this.hasReadyPulseWorkForIdleHeartbeat();
+        if (readyWork === false && !prefixWarm) {
           const agentId = this.config.agentId ?? this.config.agentName ?? 'unknown-agent';
           try {
             const empty = recordObservedEmptyPulseQueue(agentId);
@@ -2148,6 +2169,9 @@ export class AgentProcess {
             pulseReadyWork: false,
           }, 'idle_tick skipped model: inbox empty and direct Pulse queue empty');
           return;
+        }
+        if (prefixWarm) {
+          logger.info({ firstHeartbeatMs: this.firstHeartbeatMs }, 'lean prefix-warm heartbeat queued');
         }
         this.inbox.push({
           id: crypto.randomUUID(),
@@ -2177,7 +2201,11 @@ export class AgentProcess {
         logger.error({ err }, 'Idle heartbeat error');
         this.emitTelemetry();
       }
-    }, 60 * 1000);
+    };
+    this.idleHeartbeatTimer = setInterval(() => { void tickIdleHeartbeat(); }, 60 * 1000);
+    if (isLeanConversationalEnv() && this.firstHeartbeatMs < 60_000) {
+      this.firstWarmTimer = setTimeout(() => { void tickIdleHeartbeat(); }, this.firstHeartbeatMs);
+    }
   }
 
   /** Stop the agent process gracefully. */
@@ -2185,6 +2213,7 @@ export class AgentProcess {
     this.running = false;
     this.runtimeRollDrain.dispose();
     if (this.idleHeartbeatTimer) { clearInterval(this.idleHeartbeatTimer); this.idleHeartbeatTimer = null; }
+    if (this.firstWarmTimer) { clearTimeout(this.firstWarmTimer); this.firstWarmTimer = null; }
     if (this.telemetryTimer) { clearInterval(this.telemetryTimer); this.telemetryTimer = null; }
     this.telemetryFlusher.stop();
     // SCLI-415: a pending single-row replay timer must not outlive the process.
@@ -2382,7 +2411,9 @@ export class AgentProcess {
 
     const maxOutputTokens = this.maxOutputTokensForMessage(msg, turnIndex);
     const doTurn = async (provider: any, model: string, thinking?: string, effort?: string) => {
-      const heartbeatQueueTool = forceHeartbeatQueueTool && provider?.name === 'cortex'
+      const heartbeatQueueTool = !talkSeatSuppressesTools()
+        && forceHeartbeatQueueTool
+        && provider?.name === 'cortex'
         ? this.toolDefs.find((tool) => tool.name.endsWith('__pulse_get_my_alerts'))
         : undefined;
       let rehomeRequiredForAttempt = false;
@@ -2399,7 +2430,10 @@ export class AgentProcess {
         undefined, // onPermissionAsk
         this.hookEngine ?? undefined,
         thinking ?? this.thinkingLevel,
-        undefined, // abortSignal
+        (() => {
+          const ms = talkSeatTurnTimeoutMs();
+          return ms ? AbortSignal.timeout(ms) : undefined;
+        })(),
         effort ?? this.reasoningEffort,
         undefined, // fastMode
         undefined, // paramCoercion
@@ -2420,10 +2454,12 @@ export class AgentProcess {
             ? { onCortexRehomeRequired: () => { rehomeRequiredForAttempt = true; } }
             : {}),
         },
-        heartbeatQueueTool ? {
-          type: 'function',
-          function: { name: heartbeatQueueTool.name },
-        } : undefined,
+        talkSeatSuppressesTools()
+          ? 'none'
+          : heartbeatQueueTool ? {
+              type: 'function',
+              function: { name: heartbeatQueueTool.name },
+            } : undefined,
       );
       // A `required` header belongs to this exact provider attempt. Surface it
       // only if that same attempt completed successfully; an errored stream
@@ -4327,7 +4363,10 @@ export class AgentProcess {
     ]);
     // Lean seats already declare the Pulse work head. Do not grow tools[]
     // from heartbeat/user text — that rewrite is the SuperGrok cache break.
-    if (isLeanConversationalEnv()) {
+    // Talk one-shot seats keep tools[] empty for the whole session.
+    if (talkSeatSuppressesTools()) {
+      mentionedMcpTools.clear();
+    } else if (isLeanConversationalEnv()) {
       const allowed = new Set<string>(LEAN_CONVERSATIONAL_MCP_TOOL_NAMES);
       for (const name of [...mentionedMcpTools]) {
         if (!allowed.has(name)) mentionedMcpTools.delete(name);
@@ -4876,6 +4915,21 @@ export class AgentProcess {
 
       // Continuation logic — incomplete streams are terminal and never replay
       // after partial output because the upstream cancellation may still be in flight.
+      if (talkSeatSuppressesTools()) {
+        const { visibleTextFromContent, reasoningTextFromContent } = await import('../agent/content.js');
+        const text = visibleTextFromContent(result.assistantMessage.content)
+          .replace(/<think>[\s\S]*?<\/think>/g, '')
+          .trim();
+        const reasoning = reasoningTextFromContent(result.assistantMessage.content).trim();
+        if (!text && reasoning) {
+          await channel.sendEvent(msg.threadId, {
+            type: 'content',
+            text: reasoning,
+            timestamp: Date.now(),
+          });
+        }
+        break;
+      }
       if (result.toolCalls.length === 0) {
         const incompleteError = incompleteTurnError(result.stopReason);
         if (incompleteError) {

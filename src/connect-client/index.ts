@@ -419,18 +419,20 @@ export class ConnectClient {
    * The AgentChatConsumer broadcasts these to all conversation participants.
    */
   /**
-   * DEPRECATED — auto-streaming of turn output to Connect was removed.
-   *
-   * Agents no longer stream their LLM turn output to Connect. Inter-user
-   * messaging happens exclusively through explicit `message_user` /
-   * `message_user` tool calls which POST to `/api/messaging/dm/` directly.
-   *
-   * This method is kept as a no-op so legacy callers (old bridges, tests)
-   * don't crash, but it deliberately does nothing. Delete it once all
-   * bridges stop calling it.
+   * Live token/sentence stream for talk seats. Humans in the conversation
+   * receive `agent_stream` frames; other agents do not (loop-safe).
+   * Persistence still happens via sendComplete → sendConnectDm.
    */
-  sendStreamEvent(_conversationId: string, _eventType: string, _data: Record<string, unknown> = {}): void {
-    return;
+  sendStreamEvent(conversationId: string, eventType: string, data: Record<string, unknown> = {}): void {
+    if (!conversationId || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({
+        type: 'stream_event',
+        conversation_id: conversationId,
+        event_type: eventType,
+        data,
+      }));
+    } catch { /* next token retries */ }
   }
 
   /**

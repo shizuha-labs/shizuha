@@ -1,7 +1,7 @@
 {
   "name": "shizuha",
   "version": "0.1.0",
-  "description": "Shizuha Code \u2014 local AI agent runtime",
+  "description": "Shizuha universal coding agent",
   "type": "module",
   "main": "dist/shizuha.js",
   "bin": {
@@ -27,6 +27,7 @@
     "perf:update-baseline": "vitest run tests/perf/ --reporter=verbose && node scripts/update-perf-baseline.mjs",
     "ci": "node scripts/ci/full-ci.mjs",
     "ci:fast": "node scripts/ci/full-ci.mjs",
+    "test:e2e:long": "node scripts/ci/cortex-long-e2e.mjs",
     "test:watch": "vitest",
     "serve": "tsx src/server.ts"
   },
@@ -98,13 +99,5 @@
     "@babel/core": "7.29.7",
     "picomatch": "4.0.5",
     "postcss": "8.5.25"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/shizuha-labs/shizuha.git"
-  },
-  "bugs": {
-    "url": "https://github.com/shizuha-labs/shizuha/issues"
-  },
-  "homepage": "https://github.com/shizuha-labs/shizuha"
+  }
 }

@@ -15,6 +15,8 @@ import type { Channel, Inbox, InboundMessage, ConnectChannelConfig } from '../ty
 import { ConnectClient } from '../../connect-client/index.js';
 import { sendConnectDm } from '../../platform/connect-dm.js';
 import { isRoutineTaskNotificationContent, isWorkingDeferredTaskNotification } from '../inbox.js';
+import { connectAutoReplyEnabled } from '../../platform/lean-conversational.js';
+import { logger } from '../../utils/logger.js';
 
 export class ConnectChannel implements Channel {
   readonly id: string;
@@ -24,16 +26,15 @@ export class ConnectChannel implements Channel {
   private client: ConnectClient;
   private agentId?: string;
 
-  // SCLI chat-assistant auto-reply (opt-in via env): deliver the agent's
-  // natural turn output back to the originating Connect conversation, so a
-  // user-facing assistant replies conversationally without having to emit an
-  // explicit `message_user` tool call (which reasoning models do unreliably).
-  // Scoped to real conversation threads (populated from onMessage) so heartbeat
-  // / non-connect turns are never auto-sent to the owner.
-  private readonly autoReply = process.env['SHIZUHA_CONNECT_AUTOREPLY'] === '1';
+  // Lean talk seats auto-reply by default (Grok Build already did). DeepSeek
+  // does not reliably call message_user. Opt out with SHIZUHA_CONNECT_AUTOREPLY=0.
+  // Reply goes to the inbound sender (conversation-scoped), not a fixed inbox.
+  private readonly autoReply = connectAutoReplyEnabled();
   private readonly replyEmail = (process.env['SHIZUHA_CONNECT_REPLY_EMAIL'] || '').trim();
   private readonly replyBuf = new Map<string, string>();
+  private readonly flushedLen = new Map<string, number>();
   private readonly convThreads = new Set<string>();
+  private readonly replyTargets = new Map<string, { username?: string; email?: string }>();
 
   constructor(config: ConnectChannelConfig) {
     this.id = `connect-${config.agentId ?? 'default'}`;
@@ -44,7 +45,14 @@ export class ConnectChannel implements Channel {
       token: config.token || undefined,
       onMessage: (convId, content, senderId, senderName, messageId, conversationType, replyObligation) => {
         if (!this.inbox) return;
-        if (this.autoReply && this.replyEmail) this.convThreads.add(convId);
+        if (this.autoReply) {
+          this.convThreads.add(convId);
+          const username = (senderName || '').trim();
+          this.replyTargets.set(convId, {
+            username: username || undefined,
+            email: this.replyEmail || undefined,
+          });
+        }
         const routineTaskNotification = isRoutineTaskNotificationContent(content);
         const taskKey = routineTaskNotification
           ? content.match(/\b[A-Z][A-Z0-9]*-\d+\b/i)?.[0]?.toUpperCase()
@@ -101,25 +109,71 @@ export class ConnectChannel implements Channel {
   // the assistant's content for a Connect conversation turn and deliver it to the
   // owner on completion. Otherwise they remain no-ops (agents reply via message_user).
   async sendEvent(threadId: string, event: AgentEvent): Promise<void> {
-    if (!this.autoReply || !this.replyEmail) return;
+    if (!this.autoReply) return;
     if (!this.convThreads.has(threadId)) return;
     if (event.type === 'content') {
       const text = (event as unknown as { text?: string }).text;
-      if (text) this.replyBuf.set(threadId, (this.replyBuf.get(threadId) || '') + text);
+      if (text) {
+        const next = (this.replyBuf.get(threadId) || '') + text;
+        this.replyBuf.set(threadId, next);
+        this.client.sendStreamEvent(threadId, 'content', { text });
+        this.flushSpokenSentences(threadId);
+      }
     }
   }
 
   sendComplete(threadId: string): void {
-    if (!this.autoReply || !this.replyEmail) return;
+    if (!this.autoReply) return;
     if (!this.convThreads.has(threadId)) return;
     const text = (this.replyBuf.get(threadId) || '').trim();
     this.replyBuf.delete(threadId);
-    if (!text) return;
-    void sendConnectDm({
-      recipientEmail: this.replyEmail,
-      content: text,
-      sender: { username: process.env['AGENT_USERNAME'] || '', agentId: process.env['AGENT_ID'] || undefined },
-    }).catch(() => { /* best-effort delivery */ });
+    this.flushedLen.delete(threadId);
+    this.client.sendStreamEvent(threadId, 'complete', {});
+    if (!text) {
+      logger.warn({ threadId }, 'connect auto-reply: empty turn text (thinking-only or tool-only)');
+      return;
+    }
+    void this.deliverReply(threadId, text);
+  }
+
+  private flushSpokenSentences(threadId: string): void {
+    const buf = this.replyBuf.get(threadId) || '';
+    const already = this.flushedLen.get(threadId) || 0;
+    const unsent = buf.slice(already);
+    const match = unsent.match(/^[\s\S]*?[.!?…](?:["')\]]+)?(?=\s|$)/);
+    if (!match) return;
+    const sentence = match[0].trim();
+    if (sentence.length < 8) return;
+    this.flushedLen.set(threadId, already + match[0].length);
+    this.client.sendStreamEvent(threadId, 'sentence', { text: sentence });
+  }
+
+  private async deliverReply(threadId: string, text: string): Promise<void> {
+    const target = this.replyTargets.get(threadId) || {};
+    const recipientEmail = target.email || this.replyEmail || undefined;
+    // Prefer email when present. Inbound senderName is often a display/Google
+    // local-part (hothritik1) that is not the Shizuha username (hritik).
+    // Sending both makes Connect 404 on username and drop the reply.
+    const recipientUsername = recipientEmail ? undefined : target.username;
+    if (!recipientEmail && !recipientUsername) {
+      logger.error({ threadId }, 'connect auto-reply: no recipient');
+      return;
+    }
+    let lastError = '';
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const result = await sendConnectDm({
+        recipientEmail,
+        recipientUsername,
+        content: text,
+        sender: { username: process.env['AGENT_USERNAME'] || '', agentId: process.env['AGENT_ID'] || undefined },
+      });
+      if (result.ok) return;
+      lastError = result.error || `status ${result.status}`;
+      logger.warn({ threadId, attempt, error: lastError, status: result.status }, 'connect auto-reply send failed');
+      if (result.status === 400 || result.status === 403 || result.status === 404) break;
+      await new Promise((r) => setTimeout(r, 400 * attempt));
+    }
+    logger.error({ threadId, error: lastError }, 'connect auto-reply exhausted retries');
   }
 
   ackProcessed(messageId: string): boolean {

@@ -4,11 +4,11 @@ import { formatToolActivityLabel } from '../../src/tui/hooks/useAgentSession.js'
 describe('compact live tool activity label', () => {
   it('uses the first meaningful bash segment and stays on one short line', () => {
     const label = formatToolActivityLabel('bash', {
-      command: 'cd /home/phoenix/work && echo heading && grep -rn "warmup|probe" vendor/hermes-agent',
+      command: 'cd /home/user/work && echo heading && grep -rn "warmup|probe" vendor/hermes-agent',
     });
 
     expect(label).toContain('Running bash \u00b7 grep -rn');
-    expect(label).not.toContain('/home/phoenix/work');
+    expect(label).not.toContain('/home/user/work');
     expect(label.length).toBeLessThanOrEqual(55);
     expect(label).not.toContain('\n');
   });

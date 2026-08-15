@@ -1,50 +1,71 @@
-# MCP access matrix used by the local runtime.
-# Fail-closed: unknown roles get `base` only.
-base:
-  - pulse
-  - connect
-  - wiki
-  - admin
-  - id
-  - scs
+# MCP Server Access-Matrix (SCLI-46 / SCLI-67)
+# Single source of truth — survives fleet rolls (persistent volume mount).
+# Implements wiki "Canonical Role → MCP-Server Access-Matrix" (288f65e8, SCLI-45/SCLI-43.1).
+#
+# Algorithm (§4): allowed = base ∪ roles[role] ∪ overrides[agent].add − overrides[agent].remove
+# FAIL CLOSED: unknown/unset role → base only, NEVER all servers.
+# Server names are logical MCP service names (runtime maps to shizuha-{name} keys).
+#
+# EDITING: restart is NOT required. The runtime re-reads this file every
+# MCP_MATRIX_RELOAD_TTL_MS (default 60 000 ms). Set to 0 to disable file watching.
+# Validation runs on load — a malformed entry falls back to the built-in TS const.
+#
+# Governance (PLAT-187): adding admin/cron/id to an agent that does not already
+# exercise it routes through the PLAT-187 risk-tier check before deploying.
 
+# ─── Universal base — every task-driven agent ─────────────────────────────────
+base:
+  - pulse    # task system
+  - connect  # messaging
+  - wiki     # consult-before / document-after (PLAT-182)
+  - admin    # org chart / service state (core construct, operator 2026-06-24)
+  - id       # identity lookups (core construct, operator 2026-06-24)
+  - scs      # app hosting: agents deploy built sites to <slug>.apps.shizuha.com (operator 2026-07-11)
+
+# ─── Role additions (non-base servers) ────────────────────────────────────────
 roles:
+  # revi + board (aoi/akira): review = GitHub CLI + base. Base-only (PLAT-213).
   reviewer: []
+
+  # org-chart/team routing and identity lookups are provided by base.
   architect: []
+
+  # code work = GitHub CLI / repos / host, not MCP. `drive` via override if needed.
   engineer: []
+
+  # base + the product MCP under test, granted PER-TASK via override (not standing).
   qa: []
+
+  # audits, user/service enumeration, access reviews use base admin/id.
   security: []
+
+  # attachments / exports / asset links.
   docs:
     - drive
+
+  # metrics/dashboards over the data services.
   analytics:
     - finance
     - books
     - inventory
+
+  # Tenant-selected ledgers, computed reports, and supporting evidence.
   accounting:
     - books
     - drive
+
+  # cron = host exec / agent mgmt; admin = base org/service state;
+  # hive = claw/agent lifecycle mgmt via MCP (HIVE-435).
   devops:
     - cron
     - hive
+
+  # media assets (feed posting is `connect`, already base).
   social:
     - drive
+
+  # PRDs/specs/roadmap attachments + exports.
   product:
     - drive
 
-overrides:
-  shizuha:
-    add:
-      - cron
-  shion:
-    add: []
-  hina:
-    remove:
-      - admin
-      - id
-      - scs
-  aya:
-    remove:
-      - admin
-      - id
-      - scs
-
+overrides: {}

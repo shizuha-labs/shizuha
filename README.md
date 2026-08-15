@@ -1,7 +1,7 @@
-# Shizuha Code
+# Shizuha — AI Agent Runtime
 
 <p align="center">
-  <strong>The Shizuha agent runtime — run autonomous AI coding agents on your own machine.</strong>
+  <strong>Run autonomous AI coding agents on your own machine.</strong>
 </p>
 
 <p align="center">
@@ -9,7 +9,7 @@
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node.js-22+-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node 22+"></a>
 </p>
 
-**Shizuha Code** is the public name of the Shizuha agent runtime. It runs multiple autonomous agents with built-in tools, multi-channel messaging, and a web dashboard — all on your own hardware.
+**Shizuha** is an AI agent runtime and orchestration platform. It runs multiple autonomous agents with built-in tools, multi-channel messaging, and a web dashboard — all on your own hardware.
 
 Each agent has its own identity, model, and execution method. Chat with them from the dashboard, Telegram, Discord, WhatsApp, or any connected channel.
 
@@ -32,7 +32,7 @@ Runtime: **Node.js 22+**.
 
 ```bash
 git clone https://github.com/shizuha-labs/shizuha.git
-cd shizuha
+cd cli
 ./install.sh
 ```
 

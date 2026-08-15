@@ -257,6 +257,9 @@ describe('mcp-access-matrix: PLAT-309 overrides (shizuha / shion) × SHIZUHA_MCP
     expect(sorted(resolveAllowedServers('General Assistant', 'yuna'))).toEqual(
       sorted(new Set(['pulse', 'connect', 'wiki'])),
     );
+    expect(sorted(resolveAllowedServers('General Assistant', 'ena'))).toEqual(
+      sorted(new Set(['pulse', 'connect', 'wiki'])),
+    );
   });
 
   it('General Assistant role without override → base only (fail-closed)', () => {

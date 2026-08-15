@@ -14,6 +14,9 @@ import {
   getAgentStateStore,
   mirrorAgentPatch,
 } from './agent-state-mirror.js';
+import { cmdlineLooksLikeShizuhaDaemon } from '../shared/is-daemon-running.js';
+
+export { cmdlineLooksLikeShizuhaDaemon };
 
 function daemonStatePath(): string {
   return path.join(process.env['HOME'] ?? '~', '.shizuha', 'daemon.json');
@@ -731,22 +734,6 @@ export function isDaemonRunning(): boolean {
     return false;
   }
   return true;
-}
-
-/**
- * Null-separated /proc cmdline that belongs to a shizuha daemon *node* process.
- *
- * Do not substring-match `shizuha` + `up`. The rt-fleet controller's tini PID 1
- * forwards `up --platform http://shizuha-nginx...`, so that naive match kills
- * init on every tini-wrapped controller boot when daemon.json still holds the
- * previous image's pid=1 (2026-08-15: DesiredRuntimeRelease gen 4 crashloop).
- */
-export function cmdlineLooksLikeShizuhaDaemon(cmdline: string): boolean {
-  const parts = cmdline.split('\0').filter(Boolean);
-  const hasNode = parts.some((part) => /(^|\/)node(\.exe)?$/.test(part));
-  const hasShizuhaJs = parts.some((part) => part.endsWith('shizuha.js') || part.endsWith('/shizuha.js'));
-  const hasDaemonVerb = parts.includes('up') || parts.some((part) => part.includes('SHIZUHA_DAEMON'));
-  return hasNode && hasShizuhaJs && hasDaemonVerb;
 }
 
 function isAncestorPid(pid: number): boolean {

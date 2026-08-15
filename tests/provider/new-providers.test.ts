@@ -3,7 +3,7 @@ import { ProviderRegistry } from '../../src/provider/registry.js';
 import { XaiProvider } from '../../src/provider/xai.js';
 import { GroqProvider } from '../../src/provider/groq.js';
 import { TogetherProvider } from '../../src/provider/together.js';
-import { getModelProfile, resolveReasoningEffortForRequest } from '../../src/provider/model-profile.js';
+import { getModelProfile, resolveReasoningEffortForRequest, shouldEnableThinkingForRequest } from '../../src/provider/model-profile.js';
 import { configSchema } from '../../src/config/schema.js';
 import type { ShizuhaConfig } from '../../src/config/types.js';
 
@@ -81,6 +81,35 @@ describe('grok- model profile (no longer DEFAULT_PROFILE)', () => {
       else process.env['REASONING_EFFORT'] = savedReasoning;
       if (savedAllow === undefined) delete process.env['SHIZUHA_ALLOW_GROK_HIGH_REASONING'];
       else process.env['SHIZUHA_ALLOW_GROK_HIGH_REASONING'] = savedAllow;
+    }
+  });
+
+  it('disables DeepSeek thinking on lean talk seats; Grok 4.6 stays API-forced', () => {
+    const savedUser = process.env['AGENT_USERNAME'];
+    const savedTalk = process.env['SHIZUHA_TALK_MINIMAL_PROMPT'];
+    const savedTeam = process.env['AGENT_TEAM'];
+    const savedLean = process.env['SHIZUHA_LEAN_MCP'];
+    delete process.env['AGENT_USERNAME'];
+    delete process.env['AGENT_TEAM'];
+    delete process.env['SHIZUHA_LEAN_MCP'];
+    delete process.env['SHIZUHA_TALK_MINIMAL_PROMPT'];
+    try {
+      expect(shouldEnableThinkingForRequest('cortex/DeepSeek-V4-Flash', 'on')).toBe(true);
+      process.env['AGENT_USERNAME'] = 'yuna';
+      process.env['SHIZUHA_TALK_MINIMAL_PROMPT'] = '1';
+      expect(shouldEnableThinkingForRequest('cortex/DeepSeek-V4-Flash', 'on')).toBe(false);
+      expect(shouldEnableThinkingForRequest('cortex/grok-4.6', 'on')).toBe(true);
+      expect(resolveReasoningEffortForRequest('cortex/DeepSeek-V4-Flash', { reasoningEffort: 'low' })).toBeUndefined();
+      expect(resolveReasoningEffortForRequest('cortex/grok-4.6', { reasoningEffort: 'low' })).toBe('low');
+    } finally {
+      if (savedUser === undefined) delete process.env['AGENT_USERNAME'];
+      else process.env['AGENT_USERNAME'] = savedUser;
+      if (savedTalk === undefined) delete process.env['SHIZUHA_TALK_MINIMAL_PROMPT'];
+      else process.env['SHIZUHA_TALK_MINIMAL_PROMPT'] = savedTalk;
+      if (savedTeam === undefined) delete process.env['AGENT_TEAM'];
+      else process.env['AGENT_TEAM'] = savedTeam;
+      if (savedLean === undefined) delete process.env['SHIZUHA_LEAN_MCP'];
+      else process.env['SHIZUHA_LEAN_MCP'] = savedLean;
     }
   });
 });
@@ -216,7 +245,8 @@ describe('Qwen3.8 model profile', () => {
       expect(prof.benefitsFromPrefixCaching, id).toBe(true);
       expect(prof.defaultTemperature, id).toBe(0.6);
       expect(prof.defaultTopP, id).toBe(0.95);
-      expect(prof.defaultReasoningEffort, id).toBe('high');
+      expect(prof.defaultReasoningEffort, id).toBe('xhigh');
+      expect(resolveReasoningEffortForRequest(id, { reasoningEffort: 'high' }), id).toBe('xhigh');
     }
   });
 
@@ -224,9 +254,9 @@ describe('Qwen3.8 model profile', () => {
     for (const id of ['Qwen3.8-27B-Q4', 'cortex/Qwen3.8-27B-Q4', 'vllm/Qwen3.8-27B-Q4']) {
       const prof = getModelProfile(id);
       expect(prof.displayName, id).toBe('Qwen3.8-27B-Q4');
-      expect(prof.nativeContextWindow, id).toBe(40960);
+      expect(prof.nativeContextWindow, id).toBe(122880);
       expect(prof.defaultTemperature, id).toBe(0.6);
-      expect(prof.defaultReasoningEffort, id).toBe('high');
+      expect(prof.defaultReasoningEffort, id).toBe('xhigh');
     }
   });
 });
