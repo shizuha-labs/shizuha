@@ -1,10 +1,921 @@
-# Public-export staging (shizuha-labs/shizuha).
-# Cluster / fleet CI belongs on shizuha-beta only.
+# build-agent-runtime (SCLI-331) — CI multi-arch build of shizuha-agent-runtime,
+# replacing the manual host script build-agent-runtime.sh. Harness pins
+# (claude-code/codex/antigravity/openclaw) are workflow inputs → Dockerfile ARGs, so
+# Hive can dispatch a rebuild the moment a new harness version ships and the
+# idle-gated roller (daemon reconcileHarnessImageRoll) rolls the fleet one agent
+# at a time to the new image.
+#
+# Source-only commits derive two candidates from one reviewed immutable OCI
+# index by appending deterministic whiteout/content layers without unpacking
+# its browser payload. Installed-input or harness changes fall back to native
+# Kaniko (amd64 on s1 / arm64 on gx10, no QEMU). Both paths run native smoke on
+# both candidate children before crane can publish the promotable index.
 name: build-agent-runtime
+# PLAT-4740: CI re-fire after YAML-safe smoke renderer (supersedes e669884/ef5e520 failures).
 on:
-  workflow_dispatch: {}
+  # The runtime contains the bundled SCLI itself, not only third-party harnesses.
+  # Rebuild on every runtime-source landing so a bridge/daemon fix cannot remain
+  # published as a standalone tarball while every fleet pod keeps old code.
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'skills/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'runtime-skills.lock'
+      - 'esbuild.config.js'
+      - 'Dockerfile.agent-runtime'
+      - 'agent-runtime-entrypoint.sh'
+      - 'requirements-agent-runtime.txt'
+      - '.forgejo/workflows/build-agent-runtime.yml'
+      # The smoke Job is rendered by this script and is the gate that decides
+      # whether a build is promotable at all — a change to it changes the build
+      # contract, so it must be able to trigger a rebuild on its own.
+      - 'scripts/render-agent-runtime-smoke-job.py'
+      - 'scripts/agent_runtime_overlay.py'
+      - 'scripts/render-agent-runtime-overlay-job.py'
+      - 'scripts/wait-k8s-job-terminal.py'
+      - 'scripts/render-agent-runtime-manifest-job.py'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (default harness-<UTCyyyymmddHHMM>)'
+        required: false
+        default: ''
+      claude_code_version:
+        description: '@anthropic-ai/claude-code version'
+        required: false
+        default: ''
+      codex_version:
+        description: '@openai/codex version'
+        required: false
+        default: ''
+      antigravity_version:
+        description: 'Antigravity CLI (agy) version — official Google release, not npm'
+        required: false
+        default: ''
+      openclaw_version:
+        description: 'openclaw version'
+        required: false
+        default: ''
+
+# A native multi-arch build is a release operation and may take several minutes.
+# Never cancel an in-progress build when another push/dispatch arrives: Forgejo
+# cancellation stops the runner shell but cannot atomically stop every external
+# Kubernetes builder, and repeated dispatches used to discard valid progress
+# before any manifest could be promoted. Serialize releases and let the
+# monotonic Hive promotion gate make an older completed candidate a safe no-op.
+concurrency:
+  group: build-agent-runtime
+  cancel-in-progress: false
+
 jobs:
-  skip:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: deploy-lane
     steps:
-      - run: echo "Skipped on public-export repo; run this workflow from shizuha-beta."
+      # The runner job normally renders Kubernetes builders without needing a
+      # local checkout. The pinned skills revision is source-controlled input,
+      # however, so materialize the exact event commit before reading its lock.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      # Serialized releases (concurrency above) mean queued push-builds drain
+      # one full ~25-minute multi-arch build at a time. The idle-gated roller
+      # only ever targets the NEWEST published tag, so building a superseded
+      # commit is 25 minutes of work the fleet will never run — and it delays
+      # the build the fleet is actually waiting for by the same amount.
+      # Observed 2026-08-05: four fixes pushed over an afternoon; the last
+      # (a fleet-degrading spin-loop fix) queued ~50 minutes behind two
+      # already-superseded builds while the operator watched the rollout crawl
+      # ("harness rollouts should be really superfast").
+      #
+      # Cancel-in-progress remains deliberately OFF (see the concurrency note:
+      # Forgejo cancellation cannot atomically stop the external Kubernetes
+      # builders). Instead, a QUEUED push-build checks whether it is still the
+      # branch head when it finally starts, and skips itself in seconds if a
+      # newer commit exists — that newer commit has its own queued run which
+      # builds everything. workflow_dispatch runs (Hive pin-bump rebuilds with
+      # explicit inputs) never skip: their intent is the dispatched content,
+      # not the branch head.
+      - name: Skip if superseded by a newer push
+        id: supersede
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "superseded=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          HEAD_SHA="$(git ls-remote origin "refs/heads/${{ github.ref_name }}" | awk '{print $1}')"
+          if [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" != "${{ github.sha }}" ]; then
+            echo "superseded by $HEAD_SHA — its own queued run builds the newest source; skipping"
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "superseded=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install kubectl + cluster access
+        if: steps.supersede.outputs.superseded != 'true'
+        run: |
+          set -euo pipefail
+          # PLAT-4781: a fetched-and-executed binary must be integrity-pinned —
+          # if the registry URL is hijacked, an attacker otherwise executes
+          # arbitrary code in the build job. Same v1.34.1 digests the deploy
+          # repo's workflows pin for this exact package.
+          KUBECTL_ARCH=$(uname -m)
+          case "$KUBECTL_ARCH" in
+            x86_64) KUBECTL_ARCH=amd64; KUBECTL_SHA256=7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3 ;;
+            aarch64) KUBECTL_ARCH=arm64; KUBECTL_SHA256=420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450 ;;
+            *) echo "Unsupported runner architecture: $KUBECTL_ARCH" >&2; exit 1 ;;
+          esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Multi-arch build + push + manifest
+        id: build
+        if: steps.supersede.outputs.superseded != 'true'
+        env:
+          # PLAT-4740: never interpolate untrusted github.* into the shell script
+          # text. Bind through env and expand with double-quotes in bash.
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_BRANCH: ${{ github.ref_name }}
+          ORIGIN_RUN_ID: ${{ github.run_id }}
+          INPUT_CLAUDE_CODE_VERSION: ${{ github.event.inputs.claude_code_version }}
+          INPUT_CODEX_VERSION: ${{ github.event.inputs.codex_version }}
+          INPUT_ANTIGRAVITY_VERSION: ${{ github.event.inputs.antigravity_version }}
+          INPUT_OPENCLAW_VERSION: ${{ github.event.inputs.openclaw_version }}
+        run: |
+          set -euo pipefail
+          # Deterministic tag (CI has no interactive clock dependency): the runner
+          # provides a UTC stamp; fall back to the workflow input when given.
+          STAMP="$(date -u +%Y%m%d%H%M)"
+          SHORT_SHA="$(printf '%s' "$SOURCE_SHA" | cut -c1-7)"
+          RUN_ID="$ORIGIN_RUN_ID"
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            # Source-triggered builds carry an immutable revision suffix. This
+            # avoids a same-minute collision with a Hive version-upgrade build.
+            TAG="harness-${STAMP}-${SHORT_SHA}"  # lowercase DNS-1123 Job-name safe
+          fi
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          # All unqualified per-arch candidates and Kubernetes evidence Jobs
+          # are immutable to this Forgejo run. Even if runner serialization
+          # regresses, a retry cannot rewrite images another run is smoking.
+          printf '%s' "$RUN_ID" | grep -Eq '^[0-9]+$' || {
+            echo "::error::invalid Forgejo run id"; exit 1;
+          }
+          CANDIDATE_TAG="candidate-${RUN_ID}-${SHORT_SHA}"
+          CC_VER="${INPUT_CLAUDE_CODE_VERSION:-}"
+          CODEX_VER="${INPUT_CODEX_VERSION:-}"
+          ANTIGRAVITY_VER="${INPUT_ANTIGRAVITY_VERSION:-}"
+          OPENCLAW_VER="${INPUT_OPENCLAW_VERSION:-}"
+          # PLAT-4740: treat every dispatch input as untrusted. Reject values that
+          # cannot safely appear in Job names, image tags, or nested shell/YAML
+          # before any heredoc render or kubectl apply.
+          # Production validator is the shared script (same path the regression runs).
+          # shellcheck source=scripts/require-safe-token.sh
+          . "${GITHUB_WORKSPACE:-.}/scripts/require-safe-token.sh"
+          require_safe_token_or_die() {
+            require_safe_token "$@" || exit 1
+          }
+          # TAG may still be empty here (auto-generated below); validate after finalization.
+          # npm version tokens: no quotes, whitespace, shell metacharacters, or newlines.
+          VERSION_RE="$PLAT4740_VERSION_RE"
+          require_safe_token_or_die CC_VER "$CC_VER" "$VERSION_RE"
+          require_safe_token_or_die CODEX_VER "$CODEX_VER" "$VERSION_RE"
+          require_safe_token_or_die ANTIGRAVITY_VER "$ANTIGRAVITY_VER" "$VERSION_RE"
+          require_safe_token_or_die OPENCLAW_VER "$OPENCLAW_VER" "$VERSION_RE"
+          require_safe_token_or_die SOURCE_SHA "$SOURCE_SHA" "$PLAT4740_SHA_RE"
+          # Empty inputs mean "resolve latest", never "fall back to a stale
+          # workflow pin".  Rebuilds are also used for source-only scli fixes;
+          # fixed defaults used to silently downgrade every npm harness during
+          # those builds (e.g. Codex 0.144.4 -> 0.144.1 on 2026-07-14).
+          # Resolve release intent from npm's authoritative metadata endpoint.
+          # The Verdaccio proxy remains the byte source for installs, but its
+          # /latest dist-tag can lag the upstream registry even after maxage
+          # (SCLI-334: OpenClaw stayed on 2026.7.1 while npm and Hive had
+          # 2026.7.1-2). Exact-version reads still populate/use the LAN cache.
+          NPM_META_REG="https://registry.npmjs.org"
+          NPM_REG="http://npm-cache.registry.svc.cluster.local:4873"
+          npm_latest() {
+            local encoded_pkg="$1"
+            # PLAT-4733: download the npm metadata to a temp file and parse the FILE
+            # instead of piping curl output into the interpreter (Semgrep
+            # gha-curl-pipe-shell). Fetch AND parse failures both propagate as a
+            # non-zero return; the temp file is removed on every path. The resolved
+            # value is still validated by require_safe_token_or_die below (137-140).
+            local response version
+            response="$(mktemp)" || return 1
+            if ! curl --retry 12 --retry-all-errors --retry-delay 5 \
+                --connect-timeout 15 --max-time 120 -fsS \
+                "${NPM_META_REG}/${encoded_pkg}/latest" -o "$response"; then
+              rm -f "$response"
+              return 1
+            fi
+            if ! version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$response")"; then
+              rm -f "$response"
+              return 1
+            fi
+            rm -f "$response"
+            printf '%s\n' "$version"
+          }
+          npm_exact_available_in_cache() {
+            local encoded_pkg="$1" expected="$2"
+            local response version
+            response="$(mktemp)" || return 1
+            # Ask the proxy for the exact authoritative version. Unlike its
+            # cached /latest route this fetches a missing version from the
+            # uplink and proves the subsequent offline-friendly build can
+            # install the exact bytes selected above.
+            if ! curl --retry 12 --retry-all-errors --retry-delay 5 \
+                --connect-timeout 15 --max-time 120 -fsS \
+                "${NPM_REG}/${encoded_pkg}/${expected}" -o "$response"; then
+              rm -f "$response"
+              return 1
+            fi
+            if ! version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$response")"; then
+              rm -f "$response"
+              return 1
+            fi
+            rm -f "$response"
+            [ "$version" = "$expected" ]
+          }
+          # PLAT-5577: Antigravity manifest fetch must not pipe curl into python
+          # (Semgrep gha-curl-pipe-shell). Same download-to-temp + parse-file
+          # pattern as npm_latest / npm_exact_available_in_cache above.
+          antigravity_manifest_version() {
+            local url="$1"
+            local response version
+            response="$(mktemp)" || return 1
+            if ! curl --retry 12 --retry-all-errors --retry-delay 5 \
+                --connect-timeout 15 --max-time 60 -fsS \
+                "$url" -o "$response"; then
+              rm -f "$response"
+              return 1
+            fi
+            if ! version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$response")"; then
+              rm -f "$response"
+              return 1
+            fi
+            rm -f "$response"
+            printf '%s\n' "$version"
+          }
+          [ -n "$CC_VER" ] || CC_VER="$(npm_latest '%40anthropic-ai%2Fclaude-code')"
+          [ -n "$CODEX_VER" ] || CODEX_VER="$(npm_latest '%40openai%2Fcodex')"
+          # Antigravity CLI is a native Google binary (NOT @google/gemini-cli).
+          AGY_MANIFEST_URL="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json"
+          [ -n "$ANTIGRAVITY_VER" ] || ANTIGRAVITY_VER="$(antigravity_manifest_version "$AGY_MANIFEST_URL")"
+          [ -n "$OPENCLAW_VER" ] || OPENCLAW_VER="$(npm_latest 'openclaw')"
+          for version in "$CC_VER" "$CODEX_VER" "$ANTIGRAVITY_VER" "$OPENCLAW_VER"; do
+            [ -n "$version" ] || { echo "::error::failed to resolve every harness version"; exit 1; }
+            require_safe_token_or_die resolved_version "$version" "$VERSION_RE"
+          done
+          npm_exact_available_in_cache '%40anthropic-ai%2Fclaude-code' "$CC_VER" \
+            || { echo "::error::authoritative Claude Code ${CC_VER} is unavailable through the npm cache"; exit 1; }
+          npm_exact_available_in_cache '%40openai%2Fcodex' "$CODEX_VER" \
+            || { echo "::error::authoritative Codex ${CODEX_VER} is unavailable through the npm cache"; exit 1; }
+          # Prove the pinned Antigravity version is still published on the official channel.
+          AGY_PUBLISHED="$(antigravity_manifest_version "$AGY_MANIFEST_URL")"
+          [ "$ANTIGRAVITY_VER" = "$AGY_PUBLISHED" ] || [ -n "${INPUT_ANTIGRAVITY_VERSION:-}" ] \
+            || { echo "::error::Antigravity pin ${ANTIGRAVITY_VER} != published ${AGY_PUBLISHED}"; exit 1; }
+          npm_exact_available_in_cache 'openclaw' "$OPENCLAW_VER" \
+            || { echo "::error::authoritative OpenClaw ${OPENCLAW_VER} is unavailable through the npm cache"; exit 1; }
+          # scli version scheme: <pkgver>.<distBuildStampUTC> for numeric compare.
+          PKGVER="$(grep -m1 '"version"' package.json 2>/dev/null | sed -E 's/.*"version" *: *"([^"]+)".*/\1/' || echo 0.1.0)"
+          SCLI_VER="${PKGVER}.${STAMP}"
+          SKILLS_SHA="$(tr -d '[:space:]' < runtime-skills.lock)"
+          printf '%s' "$SKILLS_SHA" | grep -Eq '^[0-9a-f]{40}$' || {
+            echo "::error::runtime-skills.lock must contain one full git SHA"; exit 1;
+          }
+          # P2: TAG is embedded in Kubernetes Job metadata.name — DNS-1123 lowercase only.
+          require_safe_token_or_die TAG "$TAG" "$PLAT4740_TAG_RE"
+          require_safe_token_or_die SCLI_VER "$SCLI_VER" "$VERSION_RE"
+          REG="registry.registry.svc.cluster.local:5000"
+          IMG="shizuha-agent-runtime"
+          echo "Building ${IMG}:${TAG}  claude-code=${CC_VER} codex=${CODEX_VER} antigravity=${ANTIGRAVITY_VER} openclaw=${OPENCLAW_VER} scli=${SCLI_VER}"
+
+          # Source-only releases derive two new OCI children directly from this
+          # reviewed immutable base. The derivation appends deterministic
+          # dist/skills/entrypoint/ledger layers through crane and therefore
+          # never downloads or unpacks the multi-gigabyte browser/base rootfs.
+          # Any installed dependency, Dockerfile, harness, or ancestry change
+          # falls back to the existing full native Kaniko build.
+          OVERLAY_BASE_INDEX_DIGEST="sha256:07d955d1c51de47c79cbf844208dade74b6062f96c683fab47b5c99d30e90179"
+          OVERLAY_BASE_SOURCE_SHA="c989cdca3155a9dd7c8ad6256f803d503b6ec198"
+          OVERLAY_BASE_CC_VER="2.1.228"
+          OVERLAY_BASE_CODEX_VER="0.147.0"
+          OVERLAY_BASE_ANTIGRAVITY_VER="1.1.12"
+          OVERLAY_BASE_OPENCLAW_VER="2026.7.1-2"
+          OVERLAY_ELIGIBLE=false
+          # checkout@v4 uses fetch-depth=1. Deepen only this branch enough to
+          # prove the immutable base is an ancestor; failure is a safe full-build
+          # fallback, never permission to overlay an unrelated source tree.
+          git fetch --quiet --deepen=256 origin "$SOURCE_BRANCH" || true
+          if python3 scripts/agent_runtime_overlay.py eligible \
+              --repo-root . \
+              --base-source-sha "$OVERLAY_BASE_SOURCE_SHA" \
+              --source-sha "$SOURCE_SHA" \
+              --claude-code "$CC_VER" \
+              --codex "$CODEX_VER" \
+              --antigravity "$ANTIGRAVITY_VER" \
+              --openclaw "$OPENCLAW_VER" \
+              --base-claude-code "$OVERLAY_BASE_CC_VER" \
+              --base-codex "$OVERLAY_BASE_CODEX_VER" \
+              --base-antigravity "$OVERLAY_BASE_ANTIGRAVITY_VER" \
+              --base-openclaw "$OVERLAY_BASE_OPENCLAW_VER"; then
+            OVERLAY_ELIGIBLE=true
+            echo "::notice::source-only OCI overlay eligible base=${OVERLAY_BASE_INDEX_DIGEST} source=${SOURCE_SHA}"
+          else
+            echo "::notice::full native runtime build required: source ancestry, installed inputs, or harness pins differ from the reviewed overlay base"
+          fi
+
+          render_overlay_job() {
+            python3 scripts/render-agent-runtime-overlay-job.py \
+              --candidate-tag "$CANDIDATE_TAG" \
+              --image-repo "$IMG" \
+              --base-index-digest "$OVERLAY_BASE_INDEX_DIGEST" \
+              --base-source-sha "$OVERLAY_BASE_SOURCE_SHA" \
+              --source-sha "$SOURCE_SHA" \
+              --claude-code "$CC_VER" \
+              --codex "$CODEX_VER" \
+              --antigravity "$ANTIGRAVITY_VER" \
+              --openclaw "$OPENCLAW_VER" \
+              --scli "$SCLI_VER" \
+              --skills-sha "$SKILLS_SHA"
+          }
+
+          render_build_job() {
+            local ARCH="$1"
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-agentrt-${CANDIDATE_TAG}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, service: agent-runtime }
+          spec:
+            backoffLimit: 0
+            # A wedged package/CDN transfer must become a terminal Job for the
+            # next serialized release to investigate; never occupy an arch
+            # builder indefinitely with no Failed condition.
+            activeDeadlineSeconds: 4200
+            # A critical control-plane pod may legitimately preempt the amd64
+            # builder on s1. Preserve fail-fast behavior for real init/build
+            # errors, but do not count Kubernetes-initiated disruptions against
+            # the zero-retry budget; the Job controller creates a replacement.
+            podFailurePolicy:
+              rules:
+                - action: Ignore
+                  onPodConditions:
+                    - type: DisruptionTarget
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                initContainers:
+                  # busybox sh only (alpine/git) — POSIX, no bashisms.
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        # Build the exact event revision. Cloning whichever
+                        # commit happens to be current later can label newer
+                        # bytes with an older github.sha while pushes overlap.
+                        # Use an ephemeral auth header so the token is never
+                        # persisted in .git/config or copied into the image.
+                        git init /workspace/src
+                        git -C /workspace/src remote add origin http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git
+                        AUTH="\$(printf 'x-token-auth:%s' "\$GIT_PASSWORD" | base64 | tr -d '\n')"
+                        git -C /workspace/src -c http.extraHeader="Authorization: Basic \${AUTH}" \
+                          fetch --depth=1 origin "$SOURCE_SHA"
+                        git -C /workspace/src checkout --detach FETCH_HEAD
+                        test "\$(git -C /workspace/src rev-parse HEAD)" = "$SOURCE_SHA"
+                        git -C /workspace/src remote remove origin
+                        # Materialize the exact canonical skill revision pinned
+                        # by this source commit. Both architecture jobs fetch
+                        # the same SHA, so a concurrent skills push cannot make
+                        # the multi-arch image internally inconsistent.
+                        rm -rf /workspace/src/.runtime-skills
+                        git init /workspace/src/.runtime-skills
+                        git -C /workspace/src/.runtime-skills remote add origin http://forgejo-http.origin.svc.cluster.local/shizuha-labs/skills.git
+                        git -C /workspace/src/.runtime-skills -c http.extraHeader="Authorization: Basic \${AUTH}" \
+                          fetch --depth=1 origin '${SKILLS_SHA}'
+                        git -C /workspace/src/.runtime-skills checkout --detach FETCH_HEAD
+                        test "\$(git -C /workspace/src/.runtime-skills rev-parse HEAD)" = '${SKILLS_SHA}'
+                        rm -rf /workspace/src/.runtime-skills/.git
+                        test "\$(find /workspace/src/.runtime-skills -mindepth 2 -maxdepth 2 -name SKILL.md | wc -l)" -ge 50
+                        # Kaniko's experimental new-run snapshotter can reuse a
+                        # RUN cache entry even when only Dockerfile ARG values
+                        # changed. Put the resolved harness set in the build
+                        # context so COPY changes the parent layer digest and
+                        # necessarily invalidates the global-install RUN layer.
+                        # The Dockerfile also verifies this file against its
+                        # ARGs before installing, preventing label/binary drift.
+                        printf '%s\n' \
+                          'claude_code=${CC_VER}' \
+                          'codex=${CODEX_VER}' \
+                          'antigravity=${ANTIGRAVITY_VER}' \
+                          'openclaw=${OPENCLAW_VER}' \
+                          > /workspace/src/.harness-build-versions.lock
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                  # esbuild dist bundle — Dockerfile.agent-runtime COPYs dist/.
+                  - name: dist-build
+                    image: node:22-bookworm
+                    command: ["/bin/bash","-c"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        cd /workspace/src
+                        # This init only emits architecture-neutral dist JS.
+                        # Native modules are compiled later by Dockerfile.agent-runtime's
+                        # per-architecture npm ci. Running lifecycle scripts here made
+                        # arm64 download/build node-gyp headers for 15+ minutes before
+                        # kaniko could even start.
+                        npm ci --ignore-scripts --registry=http://npm-cache.registry.svc.cluster.local:4873 --no-audit --no-fund
+                        npm run build:public
+                        test -f dist/shizuha.js || { echo "dist build produced no bundle"; exit 1; }
+                    env:
+                      - { name: NPM_CONFIG_REGISTRY, value: "http://npm-cache.registry.svc.cluster.local:4873/" }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/Dockerfile.agent-runtime
+                      - --destination=${REG}/${IMG}:${CANDIDATE_TAG}-${ARCH}
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      # Kaniko does not auto-inject TARGETARCH the way buildx does;
+                      # empty TARGETARCH fails Dockerfile kubectl install
+                      # ("unsupported TARGETARCH="). Pass the job arch explicitly.
+                      - --build-arg=TARGETARCH=${ARCH}
+                      - --build-arg=CLAUDE_CODE_VERSION=${CC_VER}
+                      - --build-arg=CODEX_VERSION=${CODEX_VER}
+                      - --build-arg=ANTIGRAVITY_VERSION=${ANTIGRAVITY_VER}
+                      - --build-arg=OPENCLAW_VERSION=${OPENCLAW_VER}
+                      - --build-arg=SCLI_VERSION=${SCLI_VER}
+                      - --build-arg=SCLI_SOURCE_SHA=$SOURCE_SHA
+                      - --build-arg=SKILLS_SOURCE_SHA=${SKILLS_SHA}
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/cli-build-agent-runtime-${ARCH}
+                      - --cache-copy-layers=true
+                      - --cache-ttl=336h
+                      - --compressed-caching=false
+                      - --cleanup
+                      # Full snapshots call syncfs on the shared amd64 node;
+                      # concurrent release jobs blocked there for 10–30m. Redo
+                      # plus new-run avoids full-filesystem snapshots for RUN.
+                      - --snapshot-mode=redo
+                      - --use-new-run
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          # Forgejo cancellation stops only the runner shell; the external
+          # Kubernetes builders keep making useful, content-addressed cache
+          # layers. Never delete one mid-download. A replacement release waits
+          # for all prior builders to finish (or fail) before it creates its own
+          # two jobs. This is also a cluster-side serialization fence if Forgejo
+          # ever violates cancel-in-progress:false again. The bound is longer
+          # than one builder's normal cold path but finite, so a genuinely stuck
+          # external job fails closed for investigation instead of being erased.
+          # One-time migration for pre-fence builders. A new run can reach this
+          # step only after Forgejo's cancel-in-progress:false group has made
+          # every older workflow run terminal. Once the live coalescer also
+          # proves this workflow protected, an old-source harness-* Job is an
+          # orphan with no runner left to observe/promote it. Capture its logs
+          # and remove only that exact legacy name class before the donor-backed
+          # candidate starts. New candidate-* Jobs are never handled here.
+          # The deploy-lane identity intentionally cannot read Deployments. Resolve
+          # one deterministic Ready Pod through its narrower Pod-list permission,
+          # then exec that exact object. Do not swallow exec/RBAC failures: an
+          # unreadable live policy is distinct from a readable unprotected policy.
+          live_coalescer_pod="$(kubectl get pods -n origin \
+            -l app=run-coalescer -o json | jq -r '
+              [.items[]
+                | select(.status.phase == "Running")
+                | select(any(.status.containerStatuses[]?; .ready == true))]
+              | sort_by(.metadata.name)
+              | .[0].metadata.name // empty
+            ')"
+          [ -n "$live_coalescer_pod" ] || {
+            echo "::error::no Ready run-coalescer pod found"; exit 1;
+          }
+          if ! live_coalescer="$(kubectl exec -n origin "$live_coalescer_pod" -- \
+            sh -c 'cat /app/server.py')"; then
+            echo "::error::could not read live run-coalescer policy from ${live_coalescer_pod}"
+            exit 1
+          fi
+          grep -F '"build-agent-runtime.yml"' <<<"$live_coalescer" >/dev/null \
+            || { echo "::error::live run-coalescer does not protect runtime releases"; exit 1; }
+          legacy_orphans="$(kubectl get jobs -n build \
+            -l app=ci-build,service=agent-runtime -o json | jq -r '
+              .items[]
+              | select([
+                  .status.conditions[]?
+                  | select(
+                      (.type == "Complete" or .type == "Failed")
+                      and .status == "True"
+                    )
+                ] | length == 0)
+              | select(.metadata.name | test(
+                  "^ci-build-agentrt-harness-[0-9]{12}-[0-9a-f]{7}-(amd64|arm64)$"
+                ))
+              | .metadata.name
+            ')"
+          while IFS= read -r legacy_job; do
+            [ -n "$legacy_job" ] || continue
+            echo "::notice::retiring terminal-owner legacy runtime builder: ${legacy_job}"
+            kubectl logs -n build "job/${legacy_job}" --all-containers --tail=120 || true
+            kubectl delete job -n build "$legacy_job" --wait=true
+          done <<<"$legacy_orphans"
+
+          wait_for_prior_runtime_release_jobs() {
+            local deadline=$((SECONDS + 4500))
+            local nonterminal_jobs job
+            while true; do
+              # status.active is absent during admission and can briefly be 0
+              # for a nonterminal Job. Conditions are the only safe fence.
+              nonterminal_jobs="$(kubectl get jobs -n build \
+                -l service=agent-runtime -o json | jq -r '
+                  .items[]
+                  | select([
+                      .status.conditions[]?
+                      | select(
+                          (.type == "Complete" or .type == "Failed")
+                          and .status == "True"
+                        )
+                    ] | length == 0)
+                  | .metadata.name
+                ')"
+              [ -n "$nonterminal_jobs" ] || return 0
+              echo "Waiting for prior runtime release Jobs: $(tr '\n' ' ' <<<"$nonterminal_jobs")"
+              if (( SECONDS >= deadline )); then
+                echo "::error::prior runtime release did not become terminal within 4500s" >&2
+                while IFS= read -r job; do
+                  [ -n "$job" ] || continue
+                  kubectl get job -n build "$job" -o wide || true
+                  kubectl logs -n build "job/${job}" --all-containers --tail=120 || true
+                done <<<"$nonterminal_jobs"
+                return 1
+              fi
+              sleep 10
+            done
+          }
+          wait_for_prior_runtime_release_jobs
+          kubectl delete job -n build "ci-build-agentrt-${CANDIDATE_TAG}-amd64" "ci-build-agentrt-${CANDIDATE_TAG}-arm64" --ignore-not-found
+          OVERLAY_JOB="ci-overlay-agentrt-${CANDIDATE_TAG}"
+          kubectl delete job -n build "$OVERLAY_JOB" --ignore-not-found
+          if [ "$OVERLAY_ELIGIBLE" = true ]; then
+            cleanup_overlay_on_failure() {
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                kubectl logs -n build "job/${OVERLAY_JOB}" --all-containers --tail=160 || true
+                kubectl delete job -n build "$OVERLAY_JOB" --ignore-not-found || true
+              fi
+              exit "$rc"
+            }
+            trap cleanup_overlay_on_failure EXIT INT TERM
+            render_overlay_job | kubectl apply -f -
+            python3 scripts/wait-k8s-job-terminal.py \
+              --namespace build \
+              --job "$OVERLAY_JOB" \
+              --timeout-seconds 1200 || {
+              echo "::error::source-only OCI candidate derivation failed or timed out"
+              exit 1
+            }
+            trap - EXIT INT TERM
+          else
+            # The existing native build guard remains the sole terminal
+            # observer for the full-build fallback and proves both scheduling
+            # lanes before either architecture is admitted.
+            BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+            BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+            BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+            kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+              -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+            echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+            job_name_for_arch() {
+              local ARCH="$1"
+              render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
+            }
+            AMD64_JOB="$(job_name_for_arch amd64)"
+            ARM64_JOB="$(job_name_for_arch arm64)"
+            test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+            cleanup_build_pair() {
+              python3 "$BUILD_GUARD" cleanup \
+                --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+            }
+            cleanup_on_failure() {
+              rc=$?
+              if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+              exit "$rc"
+            }
+            trap cleanup_on_failure EXIT INT TERM
+            python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+            cleanup_build_pair
+            render_build_job amd64 | kubectl apply -f -
+            render_build_job arm64 | kubectl apply -f -
+            python3 "$BUILD_GUARD" wait-pair --namespace build \
+              --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+              --timeout-seconds 1800
+            trap - EXIT INT TERM
+          fi
+
+          # The per-arch tags kaniko just pushed are what the smoke Jobs below
+          # exercise directly; the promotable ${TAG} manifest is combined from
+          # these SAME two manifests only after that gate passes (see below).
+          # OCI labels alone are not sufficient promotion evidence: Kaniko once
+          # reused a stale npm-install cache layer while emitting the requested
+          # new labels. Execute every baked CLI on both architectures and compare
+          # its real output plus the in-image version ledger before Hive sees the
+          # image. This keeps the operator-facing version state tied to reality.
+          CANDIDATE_DIGESTS="$(python3 scripts/agent_runtime_overlay.py resolve-candidates \
+            --registry-v2 "http://${REG}/v2" \
+            --repo "$IMG" \
+            --candidate-tag "$CANDIDATE_TAG")"
+          AMD64_CANDIDATE_DIGEST="$(jq -er '.amd64' <<<"$CANDIDATE_DIGESTS")"
+          ARM64_CANDIDATE_DIGEST="$(jq -er '.arm64' <<<"$CANDIDATE_DIGESTS")"
+          printf '%s\n' "$AMD64_CANDIDATE_DIGEST" "$ARM64_CANDIDATE_DIGEST" \
+            | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+              echo "::error::candidate digest resolution failed"; exit 1;
+            }
+          render_smoke_job() {
+            local ARCH="$1"
+            local DIGEST
+            if [ "$ARCH" = amd64 ]; then
+              DIGEST="$AMD64_CANDIDATE_DIGEST"
+            else
+              DIGEST="$ARM64_CANDIDATE_DIGEST"
+            fi
+            # PLAT-4740: external script emits JSON Job; versions only in env.
+            python3 scripts/render-agent-runtime-smoke-job.py \
+              "$ARCH" "$CANDIDATE_TAG" "$IMG" \
+              "$CC_VER" "$CODEX_VER" "$ANTIGRAVITY_VER" "$OPENCLAW_VER" \
+              "$SCLI_VER" "$SKILLS_SHA" "$DIGEST"
+          }
+          kubectl delete job -n build \
+            "ci-smoke-agentrt-${CANDIDATE_TAG}-amd64" "ci-smoke-agentrt-${CANDIDATE_TAG}-arm64" \
+            --ignore-not-found
+          render_smoke_job amd64 | kubectl apply -f -
+          render_smoke_job arm64 | kubectl apply -f -
+          wait_smoke_job() {
+            local ARCH="$1" WAIT_PID POD_PHASE WAIT_STATUS
+            SMOKE_JOB="ci-smoke-agentrt-${CANDIDATE_TAG}-${ARCH}"
+            # A cold agent-runtime pull can take more than ten minutes on a
+            # bandwidth-constrained node. Also, a successful Pod can precede
+            # the Job controller's Complete condition by tens of seconds; the
+            # old 600s job-only wait lost that race and rejected an exit-0
+            # smoke. Keep kubectl's event-driven Job wait as the primary
+            # observer, but accept the single-Pod success directly and fail
+            # promptly on its terminal failure.
+            kubectl wait -n build --for=condition=complete "job/${SMOKE_JOB}" --timeout=1800s &
+            WAIT_PID=$!
+            while kill -0 "$WAIT_PID" 2>/dev/null; do
+              POD_PHASE="$(kubectl get pods -n build -l "job-name=${SMOKE_JOB}" \
+                -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)"
+              case "$POD_PHASE" in
+                Succeeded)
+                  kill "$WAIT_PID" 2>/dev/null || true
+                  wait "$WAIT_PID" 2>/dev/null || true
+                  return 0
+                  ;;
+                Failed)
+                  kill "$WAIT_PID" 2>/dev/null || true
+                  wait "$WAIT_PID" 2>/dev/null || true
+                  echo "::error::${ARCH} runtime image smoke failed"
+                  kubectl logs -n build "job/${SMOKE_JOB}" --all-containers --tail=120 || true
+                  return 1
+                  ;;
+              esac
+              sleep 5
+            done
+            WAIT_STATUS=0
+            wait "$WAIT_PID" || WAIT_STATUS=$?
+            if [ "$WAIT_STATUS" -ne 0 ]; then
+              echo "::error::${ARCH} runtime image smoke failed or timed out"
+              kubectl logs -n build "job/${SMOKE_JOB}" --all-containers --tail=120 || true
+              return "$WAIT_STATUS"
+            fi
+          }
+          wait_smoke_job amd64 &
+          AMD64_SMOKE_WAIT_PID=$!
+          wait_smoke_job arm64 &
+          ARM64_SMOKE_WAIT_PID=$!
+          SMOKE_WAIT_STATUS=0
+          wait "$AMD64_SMOKE_WAIT_PID" || SMOKE_WAIT_STATUS=$?
+          wait "$ARM64_SMOKE_WAIT_PID" || SMOKE_WAIT_STATUS=$?
+          [ "$SMOKE_WAIT_STATUS" -eq 0 ] || exit "$SMOKE_WAIT_STATUS"
+          # ── Promotable manifest: published ONLY after the smoke gate passes ──
+          # (fleet outage 2026-07-25) Hive's harness_autoupgrade promotes a
+          # pending build to fleet:desired-runtime-image on "does ${TAG} exist in
+          # the registry?". This combine used to run BEFORE the smoke gate, so
+          # that predicate went true while the gate still had no verdict — and
+          # the smoke Jobs TTL out in 300s, far inside the 15-minute autoupgrade
+          # cron, so they can never serve as the ledger either. Result:
+          # harness-202607250300 (claude-code 2.1.220 installed with none of its
+          # platform-native optional deps) went red HERE on the version assert
+          # and still rolled onto every Claude agent, whose `claude` binary then
+          # could not execute. Combining only after both arches pass makes "tag
+          # exists" mean "tag was proven", by construction — no extra job, no
+          # second registry marker, and a red build now skips the combine and
+          # pre-pull entirely instead of paying for them.
+          kubectl delete job -n build "ci-manifest-agentrt-${CANDIDATE_TAG}" --ignore-not-found
+          python3 scripts/render-agent-runtime-manifest-job.py \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --tag "$TAG" \
+            --image-repo "$IMG" \
+            --base-index-digest "$OVERLAY_BASE_INDEX_DIGEST" \
+            --amd64-digest "$AMD64_CANDIDATE_DIGEST" \
+            --arm64-digest "$ARM64_CANDIDATE_DIGEST" | kubectl apply -f -
+          kubectl wait -n build --for=condition=complete "job/ci-manifest-agentrt-${CANDIDATE_TAG}" --timeout=300s || {
+            echo "::error::manifest combine failed"; kubectl logs -n build "job/ci-manifest-agentrt-${CANDIDATE_TAG}" --tail=80 || true; exit 1
+          }
+          # Warm the now-proven manifest on every agent-eligible node in
+          # parallel. Without this, the deliberately serial agent replacement
+          # also serialized multi-gigabyte image pulls across the fleet, making
+          # Hive remain "rolling" for tens of minutes even though each agent was
+          # otherwise ready to restart. Per-node finite Jobs are used instead of
+          # a DaemonSet so cancellation cannot leave a perpetual controller
+          # behind; all Jobs start before any wait, preserving parallel pulls,
+          # and TTL cleanup handles a runner crash.
+          # Bind finite pre-pull Jobs to every Ready, schedulable worker plus
+          # Ready platform nodes. Agents may deliberately run on platform/
+          # control-plane nodes; omitting those nodes makes the serial rollout
+          # pay the multi-gigabyte pull cost. The authoritative platform label
+          # avoids widening the Origin CI identity to read fleet Pods. A
+          # nodeName bypasses the scheduler, so NotReady nodes must still be
+          # excluded or their Jobs can sit Pending until the release timeout.
+          # PLAT-6173: nodeName also bypasses CNPG/pod affinity, so skip
+          # shizuha.io/disk-class=small (gx10-13 512G, i9-ws 980) — those
+          # nodes cannot take another 1.7Gi harness layer per CI run.
+          PREPULL_NODES="$(
+            kubectl get nodes -o json |
+              jq -r '
+                .items[]
+                | select(.spec.unschedulable != true)
+                | select(any(.status.conditions[]?;
+                    .type == "Ready" and .status == "True"))
+                | select(.metadata.labels["shizuha.io/disk-class"] != "small")
+                | .metadata.name as $node
+                | select(
+                    .metadata.labels["node-role.kubernetes.io/control-plane"] == null
+                    or .metadata.labels["shizuha.io/platform"] == "true"
+                  )
+                | $node
+              ' |
+              sort -u
+          )"
+          [ -n "$PREPULL_NODES" ] || { echo "::error::no Ready agent-eligible pre-pull nodes found"; exit 1; }
+          for NODE in $PREPULL_NODES; do
+            PREPULL_JOB="ci-prepull-agentrt-${CANDIDATE_TAG}-${NODE}"
+            kubectl delete job -n build "$PREPULL_JOB" --ignore-not-found
+            cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${PREPULL_JOB}
+            namespace: build
+            labels: { app: ci-prepull, service: agent-runtime }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 900
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                nodeName: ${NODE}
+                tolerations:
+                  - { operator: Exists }
+                containers:
+                  - name: prepull
+                    image: localhost:30500/${IMG}:${TAG}
+                    imagePullPolicy: Always
+                    command: ["/bin/true"]
+                    resources:
+                      requests: { cpu: 10m, memory: 16Mi }
+                      limits: { cpu: 100m, memory: 64Mi }
+          YAML
+          done
+          wait_prepull_job() {
+            local NODE="$1"
+            local PREPULL_JOB="ci-prepull-agentrt-${CANDIDATE_TAG}-${NODE}"
+            local DEADLINE=$((SECONDS + 900))
+            local JOB_COMPLETE JOB_FAILED NODE_READY
+            while true; do
+              JOB_COMPLETE="$(kubectl get job -n build "$PREPULL_JOB" \
+                -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
+              [ "$JOB_COMPLETE" = True ] && return 0
+              JOB_FAILED="$(kubectl get job -n build "$PREPULL_JOB" \
+                -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+              if [ "$JOB_FAILED" = True ]; then
+                echo "::error::runtime image fleet pre-pull failed on ${NODE}"
+                kubectl describe job -n build "$PREPULL_JOB" || true
+                return 1
+              fi
+              # Readiness can change after PREPULL_NODES is snapshotted. A
+              # nodeName-bound pod cannot be rescheduled, so waiting on a node
+              # that has since gone Unknown/NotReady only wedges this release.
+              # Pre-pull is an optimization: healthy replacement nodes have
+              # their own Jobs and an unavailable node will pull when it returns.
+              NODE_READY="$(kubectl get node "$NODE" \
+                -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+              if [ "$NODE_READY" != True ]; then
+                echo "::notice::skipping runtime image pre-pull on ${NODE}: node became ${NODE_READY:-unavailable}"
+                kubectl delete job -n build "$PREPULL_JOB" --wait=false || true
+                return 0
+              fi
+              if [ "$SECONDS" -ge "$DEADLINE" ]; then
+                echo "::error::runtime image fleet pre-pull timed out on ${NODE}"
+                kubectl describe job -n build "$PREPULL_JOB" || true
+                return 1
+              fi
+              sleep 5
+            done
+          }
+          # Jobs and their readiness observers both run concurrently. A slow
+          # but healthy node therefore cannot serialize observation of peers.
+          PREPULL_WAIT_PIDS=""
+          for NODE in $PREPULL_NODES; do
+            wait_prepull_job "$NODE" &
+            PREPULL_WAIT_PIDS="$PREPULL_WAIT_PIDS $!"
+          done
+          PREPULL_WAIT_STATUS=0
+          for WAIT_PID in $PREPULL_WAIT_PIDS; do
+            wait "$WAIT_PID" || PREPULL_WAIT_STATUS=$?
+          done
+          [ "$PREPULL_WAIT_STATUS" -eq 0 ] || exit "$PREPULL_WAIT_STATUS"
+          echo "::notice::published ${REG}/${IMG}:${TAG} (multi-arch amd64+arm64). Auto-promote appends this digest as the next DesiredRuntimeRelease so idle seats can roll within a minute."
+      - name: Auto-promote DesiredRuntimeRelease
+        if: steps.supersede.outputs.superseded != 'true' && steps.build.outputs.tag != ''
+        env:
+          PUBLISHED_TAG: ${{ steps.build.outputs.tag }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TAG="$PUBLISHED_TAG"
+          printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$' || {
+            echo "::error::refusing to promote an unsafe runtime tag"; exit 1;
+          }
+          printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' || {
+            echo "::error::refusing to promote without a full source SHA"; exit 1;
+          }
+          DIGEST="$(
+            curl -fsSI -H 'Accept: application/vnd.oci.image.index.v1+json' \
+              "http://registry.registry.svc.cluster.local:5000/v2/shizuha-agent-runtime/manifests/${TAG}" \
+              | tr -d '\r' \
+              | awk 'tolower($1)=="docker-content-digest:"{print $2; exit}'
+          )"
+          printf '%s' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+            echo "::error::published tag ${TAG} has no immutable digest"; exit 1;
+          }
+          TOKEN="$(kubectl -n build get secret forgejo-token -o jsonpath='{.data.password}' | base64 -d)"
+          test -n "$TOKEN" || { echo "::error::build/forgejo-token missing"; exit 1; }
+          WORKDIR="$(mktemp -d)"
+          AUTH="$(printf 'x-token-auth:%s' "$TOKEN" | base64 | tr -d '\n')"
+          unset TOKEN
+          git -c http.extraHeader="Authorization: Basic ${AUTH}" clone --depth=1 \
+            "http://forgejo-http.origin.svc.cluster.local/shizuha-labs/deploy.git" \
+            "$WORKDIR/deploy"
+          python3 "$WORKDIR/deploy/k3s/scripts/append-desired-runtime-release.py" \
+            --manifest "$WORKDIR/deploy/k3s/manifests/shizuha-runtime-fleet.yaml" \
+            --display-tag "localhost:30500/shizuha-agent-runtime:${TAG}" \
+            --image-digest "$DIGEST" \
+            --source-commit "$SOURCE_SHA" > "$WORKDIR/promote.json"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r); sys.exit(0 if True else 1)' \
+            "$WORKDIR/promote.json"
+          CHANGED="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["changed"])' "$WORKDIR/promote.json")"
+          if [ "$CHANGED" != "True" ]; then
+            echo "::notice::DesiredRuntimeRelease already selects ${TAG}; no promote commit"
+            exit 0
+          fi
+          git -C "$WORKDIR/deploy" config user.name "shizuha-runtime-ci"
+          git -C "$WORKDIR/deploy" config user.email "runtime-ci@shizuha.com"
+          git -C "$WORKDIR/deploy" add k3s/manifests/shizuha-runtime-fleet.yaml
+          git -C "$WORKDIR/deploy" commit -m "release(runtime): promote ${TAG} after smoked multi-arch publish"
+          git -C "$WORKDIR/deploy" push origin HEAD:master
+          echo "::notice::promoted ${TAG} (${DIGEST}) — deploy-runtime-fleet-broker will apply DesiredRuntimeRelease"

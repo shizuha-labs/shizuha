@@ -1,0 +1,10 @@
+[Unit]
+Description=Shizuha agent roster watcher (AT-113) — alert CoS on unattributed agents
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/shizuha/scripts/agent-roster-watch.py
+Environment=SHIZUHA_DAEMON_URL=http://localhost:8015
+StandardOutput=journal
+StandardError=journal

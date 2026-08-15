@@ -6626,7 +6626,7 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
     let token = process.env['MCP_AUTH_PROXY_COORDINATOR_TOKEN'] || '';
     if (!token) {
       const tokenFile = process.env['MCP_AUTH_PROXY_COORDINATOR_TOKEN_FILE']
-        || `${process.env['HOME'] ?? process.env['USERPROFILE'] ?? ''}/.shizuha/mcp-auth-proxy/coordinator-token.txt`;
+        || `${process.env['HOME'] || '/home/phoenix'}/.shizuha/mcp-auth-proxy/coordinator-token.txt`;
       try { token = require('node:fs').readFileSync(tokenFile, 'utf-8').trim(); } catch { return false; }
     }
     if (!token) return false;

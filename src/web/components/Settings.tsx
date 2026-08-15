@@ -1480,7 +1480,7 @@ function AgentsSection({ data, onRefresh }: { data: SettingsData; onRefresh: () 
                           value={editValue}
                           onChange={(e) => setEditValue(e.target.value)}
                           rows={6}
-                          placeholder={'{\n  "CORTEX_BASE_URL": "https://cortex.shizuha.com/v1",\n  "VLLM_BASE_URL": "http://host.docker.internal:9002",\n  "VLLM_CONTEXT_WINDOW": "65536"\n}'}
+                          placeholder={'{\n  "CORTEX_BASE_URL": "http://gx10-1:31428/v1",\n  "VLLM_BASE_URL": "http://host.docker.internal:9002",\n  "VLLM_CONTEXT_WINDOW": "65536"\n}'}
                           className="w-full bg-zinc-900 border border-zinc-600 rounded px-2 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none focus:border-shizuha-500 resize-none"
                         />
                         <InlineSaveCancel
@@ -2308,7 +2308,7 @@ function BackendSection() {
         />
         <p className="text-[10px] text-zinc-600 mt-1">
           Default is this dashboard's origin (local mode). Change to the real platform URL
-          (e.g. <span className="font-mono">https://shizuha.com</span>) for full features.
+          (e.g. <span className="font-mono">https://s1.tail.shizuha.com</span>) for full features.
         </p>
       </div>
 

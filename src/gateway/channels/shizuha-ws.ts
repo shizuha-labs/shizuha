@@ -275,7 +275,7 @@ export class ShizuhaWSChannel implements Channel {
 
     try {
       const agentUsername = process.env['AGENT_USERNAME'];
-      const platformUrl = process.env['SHIZUHA_PLATFORM_URL'] ?? process.env['PLATFORM_URL'] ?? 'https://shizuha.com';
+      const platformUrl = process.env['SHIZUHA_PLATFORM_URL'] ?? process.env['PLATFORM_URL'] ?? 'http://s1.tail.shizuha.com';
       if (!agentUsername) {
         logger.warn({ reason }, 'Cannot fall back to agent token: AGENT_USERNAME is not set');
         this.scheduleReconnect();

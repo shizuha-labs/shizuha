@@ -68,4 +68,29 @@ roles:
   product:
     - drive
 
-overrides: {}
+# ─── Per-agent overrides (PLAT-309 — singleton roles; status-quo-preserving) ──
+# Keyed by agent username. Applied LAST: add then remove (remove wins).
+# Default-deny for any agent not listed here — role table is the ceiling.
+overrides:
+  # shizuha: Chief of Staff (role = "General Assistant", intentionally unmapped).
+  # Standing extra beyond base admin/id: agent lifecycle (cron).
+  shizuha:
+    add:
+      - cron
+
+  # shion: Deputy Chief of Staff (role = "Deputy Chief of Staff", intentionally unmapped).
+  # Deputy coordination uses base admin/id. No cron v1 (least privilege).
+  shion:
+    add: []
+
+  # CEO Office talkable seats — lean MCP so SuperGrok prefix stays cacheable.
+  hina:
+    remove:
+      - admin
+      - id
+      - scs
+  aya:
+    remove:
+      - admin
+      - id
+      - scs

@@ -1,10 +1,150 @@
-# Public-export staging (shizuha-labs/shizuha).
-# Cluster / fleet CI belongs on shizuha-beta only.
+# PLAT-4720 — scheduled Cortex long-e2e (NOT a PR gate).
+#
+# Rationale for keeping this off pull_request:
+#   - Needs live Cortex credentials + a real model (CORTEX_BASE_URL / API key).
+#   - Runtime is multi-minute and flaky under cluster load; a PR gate would
+#     red-light unrelated product PRs on provider blips.
+#   - The PR-merge gate is premerge-full-suite (npm run ci = tsc + build + vitest).
+#
+# Benchmark campaigns are intentionally NOT re-homed here: they already run via
+# dedicated bench infrastructure (CTX bench lane, DeepSeek admission, production
+# guard). Folding them into a generic scheduled workflow would either (a) fight
+# that admission control or (b) false-green without a real campaign. See task
+# comment on PLAT-4720 for the drop rationale.
 name: scheduled-long-e2e
 on:
+  schedule:
+    # Daily 03:17 UTC — off-peak relative to IST business hours.
+    - cron: "17 3 * * *"
   workflow_dispatch: {}
+concurrency:
+  group: scheduled-long-e2e
+  cancel-in-progress: true
 jobs:
-  skip:
-    runs-on: ubuntu-latest
+  long-e2e:
+    runs-on: deploy-lane
     steps:
-      - run: echo "Skipped on public-export repo; run this workflow from shizuha-beta."
+      - name: Install kubectl (dispatcher only)
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"
+          case "$KUBECTL_ARCH" in
+            x86_64)  KUBECTL_ARCH=amd64; KUBECTL_SHA256="7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3" ;;
+            aarch64) KUBECTL_ARCH=arm64; KUBECTL_SHA256="420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450" ;;
+            *) echo "::error::unsupported runner arch $KUBECTL_ARCH"; exit 1 ;;
+          esac
+          curl --retry 3 --retry-all-errors --max-time 60 -fsSL -o kubectl \
+            "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Dispatch long-e2e Job (skip cleanly when Cortex secrets absent)
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          CORTEX_BASE_URL: ${{ secrets.CORTEX_BASE_URL }}
+          CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CORTEX_BASE_URL:-}" ] || [ -z "${CORTEX_API_KEY:-}" ]; then
+            echo "::warning::CORTEX_BASE_URL/CORTEX_API_KEY not configured on this runner — long-e2e not executed (scheduled probe only)."
+            exit 0
+          fi
+          SHORT="$(printf '%s' "${SOURCE_SHA:-manual}" | cut -c1-7)"
+          JOB="ci-longe2e-beta-${SHORT}"
+          kubectl -n build delete job "${JOB}" --ignore-not-found
+          # Minimal Job: clone + npm ci + build + long-e2e. Same credential split
+          # as premerge-full-suite (git -c extraheader, rm -rf .git, no secrets in
+          # the suite container beyond the Cortex endpoint needed for the probe).
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-longe2e, service: shizuha-beta, shizuha.io/plat-task: PLAT-4720 }
+          spec:
+            activeDeadlineSeconds: 2400
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 600
+            template:
+              spec:
+                restartPolicy: Never
+                securityContext:
+                  runAsUser: 1000
+                  runAsGroup: 1000
+                  fsGroup: 1000
+                  runAsNonRoot: true
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        test -n "\${GIT_PASSWORD}"
+                        AUTH="Authorization: Basic \$(printf 'x-token-auth:%s' "\${GIT_PASSWORD}" | base64 -w0)"
+                        REPO=http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git
+                        git -c http.extraheader="\${AUTH}" clone --depth=50 "\${REPO}" /workspace/src
+                        cd /workspace/src
+                        if [ -n "\${EXPECTED_SHA}" ] && [ "\${EXPECTED_SHA}" != "manual" ]; then
+                          if ! git checkout "\${EXPECTED_SHA}" 2>/dev/null; then
+                            git -c http.extraheader="\${AUTH}" fetch --depth=500 origin "\${EXPECTED_SHA}" \
+                              || git -c http.extraheader="\${AUTH}" fetch --unshallow origin
+                            git checkout "\${EXPECTED_SHA}"
+                          fi
+                        fi
+                        rm -rf /workspace/src/.git
+                        if grep -rqIF "\${GIT_PASSWORD}" /workspace 2>/dev/null; then
+                          echo "refusing handoff: credential material present in /workspace" >&2
+                          exit 1
+                        fi
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                      - name: EXPECTED_SHA
+                        value: "${SOURCE_SHA}"
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: longe2e
+                    image: node:22-bookworm
+                    workingDir: /workspace/src
+                    command: ["/bin/bash","-c"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        npm config set registry "\${NPM_CONFIG_REGISTRY}"
+                        npm ci --prefer-offline --no-audit --no-fund
+                        npm run build
+                        npm run test:e2e:long
+                    env:
+                      - name: NPM_CONFIG_REGISTRY
+                        value: "http://npm-cache.registry.svc.cluster.local:4873/"
+                      - name: CI
+                        value: "true"
+                      - name: CORTEX_BASE_URL
+                        value: "${CORTEX_BASE_URL}"
+                      - name: CORTEX_API_KEY
+                        value: "${CORTEX_API_KEY}"
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                    resources:
+                      requests: { cpu: "1", memory: 2Gi }
+                      limits: { cpu: "4", memory: 6Gi }
+                volumes: [{ name: workspace, emptyDir: {} }]
+          YAML
+          if ! kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=2300s; then
+            echo "::error::long-e2e did not complete"
+            kubectl -n build logs "job/${JOB}" --tail=200 || true
+            kubectl -n build delete job "${JOB}" --ignore-not-found
+            exit 1
+          fi
+          kubectl -n build logs "job/${JOB}" --tail=80 || true
+          kubectl -n build delete job "${JOB}" --ignore-not-found
+          echo "long-e2e completed for ${SOURCE_SHA}"

@@ -25,7 +25,7 @@ const REAL_AMNESIA_SUMMARY = `I need to understand the actual bugs. The conversa
 
 Let me check if there's a way to run tests locally, and look at the specific test files that reference the bugs.
 
-[assistant]: [{"type":"text","text":"Let me check if there's a local postgres/redis available, and look at the test settings to understand how to run tests.\\n\\n"},{"type":"tool_use","id":"call_7a1b2c3d4e5f6a7b8c9d0e1f","name":"bash","input":{"command":"cd /home/user/work/shizuha-stack/pulse && cat manage.py"}}]`;
+[assistant]: [{"type":"text","text":"Let me check if there's a local postgres/redis available, and look at the test settings to understand how to run tests.\\n\\n"},{"type":"tool_use","id":"call_7a1b2c3d4e5f6a7b8c9d0e1f","name":"bash","input":{"command":"cd /home/phoenix/work/shizuha-stack/pulse && cat manage.py"}}]`;
 
 describe('isDegenerateSummary', () => {
   it('rejects the exact summary that caused the amnesia', () => {
@@ -59,7 +59,7 @@ The user asked me to verify the RBAC fix and clean up forgejo-pull-local.
 - Forgejo CI, ImagePullBackOff, Pulse workflow transitions
 
 3. Files and Code Sections
-- /home/user/work/shizuha-stack/deploy/k3s/origin/rbac.yaml
+- /home/phoenix/work/shizuha-stack/deploy/k3s/origin/rbac.yaml
 
 4. Errors and Fixes
 - BLOCKER_FOCUS_REQUIRED blocked the comment API; used the Defer transition.

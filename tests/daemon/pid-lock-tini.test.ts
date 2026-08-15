@@ -22,7 +22,7 @@ describe('isShizuhaDaemonProcess — tini/init safety', () => {
       '/usr/bin/node\0/opt/shizuha/dist/shizuha.js\0up\0--foreground',
     )).toBe(true);
     expect(cmdlineLooksLikeShizuhaDaemon(
-      'node\0/home/user/.shizuha/lib/shizuha.js\0up\0--platform\0http://example',
+      'node\0/home/phoenix/.shizuha/lib/shizuha.js\0up\0--platform\0http://example',
     )).toBe(true);
   });
 

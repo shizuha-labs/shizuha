@@ -8,7 +8,7 @@
  * and still have a working chat experience.
  *
  * - Default: `window.location.origin` → the daemon serving this dashboard.
- * - User can switch to the real platform (e.g. `https://shizuha.com`)
+ * - User can switch to the real platform (e.g. `https://s1.tail.shizuha.com`)
  *   in Settings → Backend URL, and the same chat UI starts talking to real
  *   shizuha-connect / shizuha-id with no protocol change.
  */

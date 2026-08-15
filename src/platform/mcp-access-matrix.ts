@@ -85,7 +85,17 @@ export const MCP_ACCESS_MATRIX: McpAccessMatrix = {
   },
   // Per-agent overrides (PLAT-309 singleton roles — intentionally unmapped roles
   // whose non-base access comes exclusively from these entries, not the role table).
-  overrides: {},
+  overrides: {
+    // shizuha: Chief of Staff (role = "General Assistant", intentionally unmapped).
+    // admin/id now base; the standing extra is agent lifecycle (cron).
+    shizuha: { add: ['cron'] },
+    // shion: Deputy Chief of Staff — admin/id now base; no standing extras (add cron via override if needed).
+    shion: { add: [] },
+    // CEO Office talkable seats: pulse/connect/wiki only. Admin/id/scs bloat
+    // the tool head and break SuperGrok prefix cache (operator 2026-08-15).
+    hina: { remove: ['admin', 'id', 'scs'] },
+    aya: { remove: ['admin', 'id', 'scs'] },
+  },
 };
 
 // ─── SCLI-67: file loader + hot-reload cache ──────────────────────────────────

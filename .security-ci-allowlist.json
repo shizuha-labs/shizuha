@@ -1,0 +1,13 @@
+{
+  "_comment": "security-ci suppressions. Entries must identify an accepted false positive and include an accountable owner and reason.",
+  "allowlist": [
+    {
+      "source_id": "security-ci:a8d052ce9db1c7a6f5d0b04e",
+      "tool": "semgrep",
+      "rule": "yaml.github-actions.security.run-shell-injection.run-shell-injection",
+      "path_contains": ".forgejo/workflows/build-publish-scli.yml",
+      "owner": "security@shizuha.com",
+      "reason": "Accepted false positive (PLAT-4771): github.sha is a Forgejo-generated hexadecimal commit identifier, not attacker-controlled free-form context, so using it to derive the artifact release ID cannot inject shell syntax."
+    }
+  ]
+}

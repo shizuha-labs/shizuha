@@ -163,7 +163,7 @@ async function getValidMcpAccessToken(): Promise<string | null> {
     ?? process.env['SHIZUHA_ID_URL']
     ?? process.env['SHIZUHA_ID_API_URL']
     ?? process.env['BACKEND_URL']
-    ?? 'https://shizuha.com'
+    ?? 'http://s1.tail.shizuha.com'
   ).replace(/\/+$/, '');
 
   const manager = new AgentTokenManager({

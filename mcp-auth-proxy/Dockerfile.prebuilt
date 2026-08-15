@@ -1,0 +1,4 @@
+FROM scratch
+COPY mcp-auth-proxy /mcp-auth-proxy
+USER 65532:65532
+ENTRYPOINT ["/mcp-auth-proxy"]

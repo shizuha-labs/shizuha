@@ -221,7 +221,7 @@ printf 'gemini 0.50.0\n'
     expect(workflow).toContain('hostPath dist stage + s1 pin RETIRED');
     expect(workflow).toContain('Do not re-add s1 hostPath staging');
     expect(workflow).toContain('fleet-daemon-k8s + agent-runtime image');
-    expect(workflow).not.toContain('path: /home/user/work/shizuha-stack/cli');
+    expect(workflow).not.toContain('path: /home/phoenix/work/shizuha-stack/cli');
     expect(workflow).not.toContain('dist.previous-\\${DEPLOY_ID}');
     expect(workflow).not.toContain('wait_runtime_fleet_rollout()');
     expect(workflow).not.toContain('ci-rollback-runtime-fleet-${SHORT}');

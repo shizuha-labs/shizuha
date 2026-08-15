@@ -1,5 +1,5 @@
 /**
- * Regression tests for the 2026-07-03 TUI wedge: a `grep path=/home/user`
+ * Regression tests for the 2026-07-03 TUI wedge: a `grep path=/home/phoenix`
  * pinned the agent loop at 100% CPU for 17+ minutes because
  *  (a) rg/grep TIMEOUT kills were misclassified as "binary missing" and
  *      cascaded into the unbounded pure-JS grep fallback, and

@@ -1,10 +1,28 @@
-# Public-export staging (shizuha-labs/shizuha).
-# Cluster / fleet CI belongs on shizuha-beta only.
 name: premerge-parity
 on:
-  workflow_dispatch: {}
+  pull_request:
+  push:
+    branches: [master, main]
 jobs:
-  skip:
+  parity:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Skipped on public-export repo; run this workflow from shizuha-beta."
+      - uses: actions/checkout@v4
+      - name: Agent runtime workflow parity
+        run: python3 -m unittest -v tests.ci.test_agent_runtime_workflow_parity
+      - name: Agent runtime Python lock parity
+        run: python3 -m unittest -v tests.ci.test_agent_runtime_python_lock
+      - name: Agent runtime OCI overlay contract
+        run: python3 -m unittest -v tests.ci.test_agent_runtime_overlay
+      # PLAT-5803 / PLAT-4720: negative controls for the full-suite gate must
+      # execute on every PR so removing a fail-closed guard turns CI red.
+      - name: Full-suite gate fail-closed guards (PLAT-4720)
+        run: python3 -m unittest -v tests.ci.test_plat4720_full_suite_gate
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install Node dependencies
+        run: npm ci
+      - name: Gateway rate-limit key isolation (PLAT-4654)
+        run: npx vitest run tests/gateway/rate-limiter.test.ts
