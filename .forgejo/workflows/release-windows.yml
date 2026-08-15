@@ -1,0 +1,237 @@
+# Shizuha CLI — Windows x64 release build (SCLI-160).
+# Produces an UNSIGNED portable .zip for Windows x64 (cross-compiled on Linux).
+# No paid signing cert (Authenticode deferred — paid-vendor freeze).
+# SmartScreen "unknown publisher" prompt is the known, documented limitation.
+#
+# Trigger: push tag v* (same as release.yml) — add Windows to the release.
+# Runner: Origin/Forgejo ubuntu-latest runner (no Windows runner needed).
+# Strategy: download node.exe from nodejs.org; bundle with dist/shizuha.js.
+name: release-windows-x64
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v*'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run runtime test suite before release
+        env:
+          GIT_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NODE_VERSION="22.14.0"
+          echo "=== Clone shizuha @ ${GITHUB_SHA} ==="
+          FORGEJO_HOST="${GITHUB_SERVER_URL#https://}"
+          git clone --depth=50 \
+            "https://x-token-auth:${GIT_PASSWORD}@${FORGEJO_HOST}/shizuha-labs/shizuha.git" src
+          cd src
+          git checkout "${GITHUB_SHA}"
+
+          echo "=== Install Node ${NODE_VERSION} ==="
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+            -o /tmp/node-linux.tar.xz
+          tar -xJf /tmp/node-linux.tar.xz -C /tmp
+          export PATH="/tmp/node-v${NODE_VERSION}-linux-x64/bin:$PATH"
+          node --version
+
+          echo "=== Install deps + run tests ==="
+          npm ci --silent
+          npm run build
+          export HOME=/tmp/shizuha-ci-home
+          mkdir -p "$HOME"
+          npm test -- tests/tui/e2e-smoke.test.ts tests/tools/tool-search.test.ts tests/agent/loop-detector.test.ts
+  build-windows-x64:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build + package Windows x64 (cross-compile on Linux)
+        env:
+          GIT_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          NODE_VERSION="22.14.0"
+          NAME="shizuha-${VERSION}-windows-x64"
+          SHA="${GITHUB_SHA}"
+
+          echo "=== Clone shizuha @ ${TAG} ==="
+          FORGEJO_HOST="${GITHUB_SERVER_URL#https://}"
+          git clone --depth=1 --branch "${TAG}" \
+            "https://x-token-auth:${GIT_PASSWORD}@${FORGEJO_HOST}/shizuha-labs/shizuha.git" src
+          cd src
+
+          echo "=== Install Linux Node ${NODE_VERSION} ==="
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+            -o /tmp/node-linux.tar.xz
+          tar -xJf /tmp/node-linux.tar.xz -C /tmp
+          export PATH="/tmp/node-v${NODE_VERSION}-linux-x64/bin:$PATH"
+          node --version
+
+          echo "=== Install deps + build ==="
+          npm ci --silent
+          npm run build
+
+          echo "=== Download Windows Node ${NODE_VERSION} ==="
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-win-x64.zip" \
+            -o /tmp/node-win.zip
+          unzip -q /tmp/node-win.zip "node-v${NODE_VERSION}-win-x64/node.exe" -d /tmp/node-win
+          NODEEXE="/tmp/node-win/node-v${NODE_VERSION}-win-x64/node.exe"
+
+          echo "=== Package ${NAME}.zip ==="
+          mkdir -p /tmp/release/${NAME}
+
+          # Windows Node runtime
+          cp "${NODEEXE}" /tmp/release/${NAME}/node.exe
+
+          # Built JS bundle
+          cp dist/shizuha.js /tmp/release/${NAME}/shizuha.js
+
+          # Optional web dashboard
+          if [ -d dist/web ]; then
+            cp -r dist/web /tmp/release/${NAME}/web
+          fi
+
+          # CMD launcher (Windows batch script — no bash on Windows by default)
+          cat > /tmp/release/${NAME}/shizuha.cmd << 'CMDEOF'
+          @echo off
+          setlocal
+          set "SCRIPT_DIR=%~dp0"
+          "%SCRIPT_DIR%node.exe" "%SCRIPT_DIR%shizuha.js" %*
+          CMDEOF
+
+          # PowerShell launcher (optional — friendlier on PS7+)
+          cat > /tmp/release/${NAME}/shizuha.ps1 << 'PSEOF'
+          $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+          & "$dir\node.exe" "$dir\shizuha.js" @args
+          PSEOF
+
+          # Version + install notes
+          echo "${VERSION}" > /tmp/release/${NAME}/VERSION
+
+          cat > /tmp/release/${NAME}/INSTALL.txt << TXTEOF
+          Shizuha CLI for Windows x64 (unsigned)
+          =======================================
+          This build is NOT code-signed. Windows SmartScreen will show an
+          "Unknown publisher" warning — click "More info" -> "Run anyway".
+
+          To install:
+            1. Extract this zip to any folder (e.g. C:\shizuha or %USERPROFILE%\shizuha)
+            2. Add that folder to your PATH:
+                 [Search "Environment Variables" -> Edit PATH -> New -> paste the folder path]
+            3. Open a NEW Command Prompt or PowerShell and run:
+                 shizuha
+
+          Launcher scripts:
+            shizuha.cmd  — works in cmd.exe and PowerShell
+            shizuha.ps1  — works in PowerShell 5+ / PS7
+
+          Runtime:
+            node.exe     — bundled Node.js v${NODE_VERSION} (no separate install needed)
+            shizuha.js   — the CLI bundle
+          TXTEOF
+
+          (cd /tmp/release && zip -r "${NAME}.zip" "${NAME}")
+          echo "Built: ${NAME}.zip ($(du -sh /tmp/release/${NAME}.zip | cut -f1))"
+          ls -lh /tmp/release/${NAME}.zip
+
+      - name: Create or update Forgejo Release + upload artifact
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          NAME="shizuha-${VERSION}-windows-x64"
+          export TAG VERSION NAME
+
+          python3 << 'PYEOF'
+          import json
+          import mimetypes
+          import os
+          import pathlib
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import uuid
+
+          server = os.environ['GITHUB_SERVER_URL'].rstrip('/')
+          repo = os.environ.get('GITHUB_REPOSITORY', 'shizuha-labs/shizuha')
+          token = os.environ['FORGEJO_TOKEN']
+          tag = os.environ['TAG']
+          version = os.environ['VERSION']
+          name = os.environ['NAME']
+          artifact = pathlib.Path(f'/tmp/release/{name}.zip')
+          api = f'{server}/api/v1'
+          auth_headers = {
+              'Authorization': f'token {token}',
+              'Accept': 'application/json',
+          }
+
+          if not artifact.exists():
+              raise SystemExit(f'missing release artifact: {artifact}')
+
+          def api_request(method, path, data=None, content_type='application/json'):
+              headers = dict(auth_headers)
+              if data is not None and content_type:
+                  headers['Content-Type'] = content_type
+              req = urllib.request.Request(f'{api}{path}', data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as resp:
+                      body = resp.read().decode('utf-8')
+                      return resp.status, (json.loads(body) if body else {})
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode('utf-8', 'replace')
+                  if exc.code == 404:
+                      return 404, {}
+                  raise RuntimeError(f'{method} {path} failed HTTP {exc.code}: {body}') from exc
+
+          notes = f"""## Shizuha CLI {version}
+
+          ### Windows build note
+          The Windows build is **unsigned** (no Authenticode cert). Windows SmartScreen
+          will prompt 'Unknown publisher' — click **More info → Run anyway** to proceed.
+          This is expected and documented in INSTALL.txt (included in the zip)."""
+
+          status, release = api_request('GET', f'/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe="")}', content_type=None)
+          if status == 404:
+              print(f'Creating Forgejo release {tag}')
+              payload = {
+                  'tag_name': tag,
+                  'target_commitish': os.environ.get('GITHUB_SHA', ''),
+                  'name': f'Shizuha {version}',
+                  'body': notes,
+                  'draft': False,
+                  'prerelease': '-' in tag,
+              }
+              _, release = api_request('POST', f'/repos/{repo}/releases', json.dumps(payload).encode('utf-8'))
+          else:
+              print(f'Found existing Forgejo release {tag}')
+
+          release_id = release['id']
+          for asset in release.get('assets', []):
+              if asset.get('name') == artifact.name:
+                  print(f'Deleting existing asset {artifact.name}')
+                  api_request('DELETE', f'/repos/{repo}/releases/{release_id}/assets/{asset["id"]}', content_type=None)
+
+          boundary = f'----shizuha-release-{uuid.uuid4().hex}'
+          ctype = mimetypes.guess_type(artifact.name)[0] or 'application/octet-stream'
+          head = (
+              f'--{boundary}\r\n'
+              f'Content-Disposition: form-data; name="attachment"; filename="{artifact.name}"\r\n'
+              f'Content-Type: {ctype}\r\n\r\n'
+          ).encode('utf-8')
+          tail = f'\r\n--{boundary}--\r\n'.encode('utf-8')
+          body = head + artifact.read_bytes() + tail
+          asset_name = urllib.parse.quote(artifact.name, safe='')
+          print(f'Uploading {artifact.name} to Forgejo release {tag}')
+          api_request(
+              'POST',
+              f'/repos/{repo}/releases/{release_id}/assets?name={asset_name}',
+              body,
+              content_type=f'multipart/form-data; boundary={boundary}',
+          )
+          print(f'Done — uploaded {artifact.name} to {server}/{repo}/releases/tag/{tag}')
+          PYEOF

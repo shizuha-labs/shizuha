@@ -1,0 +1,22 @@
+[package]
+name = "shizuha"
+version = "0.1.0"
+description = "Shizuha desktop app (macOS + Windows) — thin client over local headless agent core"
+authors = ["Shizuha Global Pvt. Ltd."]
+edition = "2021"
+
+[lib]
+name = "shizuha_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+thiserror = "1"
+url = "2"

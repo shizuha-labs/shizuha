@@ -1,0 +1,222 @@
+name: release-vscode-extension
+
+# Only canonical-master code may select the public release workflow. The
+# Marketplace mutation is owned by the independently reviewed deploy reconciler;
+# this candidate repository never receives the publishing credential.
+#
+# Origin note (ALERT-25166 / PLAT-5813 / SCLI-473, 3rd stranded-repo iteration):
+# This lane is GitHub-oriented (upload-artifact@v4+, Marketplace-adjacent evidence).
+# Origin/GHES-compat runners reject @actions/artifact v2+ (GHESNotSupportedError).
+# `shizuha` is pending archival (ADR-0057 / PLAT-5398); real VS Code release is
+# re-homed to shizuha-beta (SCLI-326). Match PLAT-5767/stalwart: no-op green on
+# Origin, full job only when github.server_url == https://github.com.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-vscode-extension
+  cancel-in-progress: false
+
+jobs:
+  origin-skip:
+    name: Origin skip (GitHub-only release lane)
+    if: ${{ github.server_url != 'https://github.com' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Skip GitHub-only VS Code release on Origin
+        run: |
+          set -euo pipefail
+          echo "Skipping release-vscode on ${GITHUB_SERVER_URL:-unknown}."
+          echo "Reason: upload-artifact@v4+ / @actions/artifact v2+ unsupported on GHES/Origin (ALERT-25166)."
+          echo "Durable path: ADR-0057 archival of shizuha; VS Code release re-homed to shizuha-beta (SCLI-326)."
+          echo "GitHub.com continues to run the full package-and-test job below."
+
+  package-and-test:
+    if: ${{ github.server_url == 'https://github.com' }}
+    runs-on: ubuntu-latest
+    container: node:22.23.1-bookworm@sha256:a25c9934ff6382cd4f08b6bc26c82bf4ea69b1e6f8dabfb2ead457374127c365
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      source_sha: ${{ steps.release-output.outputs.source_sha }}
+      release_version: ${{ steps.release-output.outputs.release_version }}
+      vsix_sha256: ${{ steps.release-output.outputs.vsix_sha256 }}
+    env:
+      RELEASE_REF: ${{ github.ref }}
+      RELEASE_SHA: ${{ github.sha }}
+      RELEASE_REPOSITORY: ${{ github.repository }}
+      NODE_VERSION: "22.23.1"
+      NPM_VERSION: "10.9.8"
+    steps:
+      - name: Checkout canonical Origin revision
+        uses: https://github.com/actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate immutable canonical Origin merge event
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+        run: |
+          set -euo pipefail
+          node scripts/validate-vscode-release.mjs
+
+      - name: Run release static and test gates without repository credentials
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v${NODE_VERSION}"
+          test "$(npm --version)" = "${NPM_VERSION}"
+          npm ci
+          npm --prefix extensions/vscode ci --ignore-scripts
+          npm --prefix extensions/vscode run compile
+          git diff --check "${RELEASE_SHA}^1" "${RELEASE_SHA}"
+          npm test -- --run \
+            tests/local-core-protocol.test.ts \
+            tests/local-core-server-cancel.test.ts \
+            tests/vscode-chat-state.test.ts \
+            tests/vscode-extension-lifecycle.test.ts \
+            tests/vscode-file-diff.test.ts \
+            tests/vscode-provider-settings.test.ts \
+            tests/vscode-run-monitor.test.ts
+
+      - name: Build twice from clean source trees and require byte equality
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "${RELEASE_SHA}")"
+          RELEASE_VERSION="$(node -p "require('./extensions/vscode/package.json').version")"
+          export SOURCE_DATE_EPOCH
+          mkdir -p artifacts /tmp/shizuha-vscode-build-1 /tmp/shizuha-vscode-build-2
+          for build in 1 2; do
+            git archive "${RELEASE_SHA}" | tar -x -C "/tmp/shizuha-vscode-build-${build}"
+            (
+              cd "/tmp/shizuha-vscode-build-${build}"
+              npm ci --ignore-scripts
+              ./scripts/package-vscode-extension.sh \
+                "${RELEASE_SHA}" "/tmp/shizuha-vscode-${build}.vsix"
+              node scripts/verify-vscode-vsix.mjs \
+                "/tmp/shizuha-vscode-${build}.vsix" "${RELEASE_SHA}" "${RELEASE_VERSION}" \
+                > "/tmp/shizuha-vscode-${build}.verification.json"
+            )
+          done
+          cmp /tmp/shizuha-vscode-1.vsix /tmp/shizuha-vscode-2.vsix
+          cmp /tmp/shizuha-vscode-1.verification.json /tmp/shizuha-vscode-2.verification.json
+          cp /tmp/shizuha-vscode-1.vsix artifacts/shizuha-vscode.vsix
+          node scripts/verify-vscode-vsix.mjs \
+            artifacts/shizuha-vscode.vsix "${RELEASE_SHA}" "${RELEASE_VERSION}" \
+            > artifacts/verification.json
+          sha256sum artifacts/shizuha-vscode.vsix | tee artifacts/SHA256SUMS
+
+      - name: Reverify immutable bytes before crossing the publisher boundary
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+        run: |
+          set -euo pipefail
+          RELEASE_VERSION="$(node -p "require('./extensions/vscode/package.json').version")"
+          node scripts/verify-vscode-vsix.mjs \
+            artifacts/shizuha-vscode.vsix "${RELEASE_SHA}" "${RELEASE_VERSION}" \
+            | cmp - artifacts/verification.json
+          sha256sum -c artifacts/SHA256SUMS
+
+      - name: Export digest-bound release metadata (no large blobs in job outputs)
+        id: release-output
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+        run: |
+          set -euo pipefail
+          {
+            echo "source_sha=${RELEASE_SHA}"
+            echo "release_version=$(node -p "require('./extensions/vscode/package.json').version")"
+            echo "vsix_sha256=$(sha256sum artifacts/shizuha-vscode.vsix | cut -d' ' -f1)"
+          } >> "${FORGEJO_OUTPUT:-${GITHUB_OUTPUT}}"
+
+      # GitHub-only: artifact handoff works on github.com (not Origin/GHES).
+      - name: Upload package-and-test candidate bytes
+        uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+        with:
+          name: shizuha-vscode-candidate-${{ github.sha }}
+          path: |
+            artifacts/shizuha-vscode.vsix
+            artifacts/verification.json
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
+  retain-candidate-evidence:
+    if: ${{ github.server_url == 'https://github.com' }}
+    needs: package-and-test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ""
+      FORGEJO_TOKEN: ""
+      EXPECTED_VSIX_SHA256: ${{ needs.package-and-test.outputs.vsix_sha256 }}
+    steps:
+      - name: Download package-and-test candidate bytes
+        uses: https://github.com/actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+        with:
+          name: shizuha-vscode-candidate-${{ github.sha }}
+          path: artifacts
+
+      - name: Stage immutable candidate evidence before any external mutation
+        run: |
+          set -euo pipefail
+          test -n "${EXPECTED_VSIX_SHA256}"
+          test -s artifacts/shizuha-vscode.vsix
+          test -s artifacts/verification.json
+          printf '%s  %s\n' "${EXPECTED_VSIX_SHA256}" artifacts/shizuha-vscode.vsix \
+            > artifacts/SHA256SUMS.expected
+          sha256sum -c artifacts/SHA256SUMS.expected
+          if [ -f artifacts/SHA256SUMS ]; then
+            sha256sum -c artifacts/SHA256SUMS
+          fi
+          cp artifacts/SHA256SUMS.expected artifacts/SHA256SUMS
+
+      - name: Upload credential-free candidate evidence
+        uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        env:
+          GITHUB_TOKEN: ""
+          FORGEJO_TOKEN: ""
+        with:
+          name: shizuha-vscode-${{ needs.package-and-test.outputs.source_sha }}
+          path: |
+            artifacts/shizuha-vscode.vsix
+            artifacts/verification.json
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90
+
+# Marketplace mutation intentionally does not exist in this candidate-controlled
+# repository. The deploy-owned publisher reconciler independently revalidates
+# current Origin review provenance, rebuilds/verifies the exact canonical Origin merge,
+# stages evidence, and only then admits the managed VSCE_PAT to an immutable
+# publisher tool closure. See the SCLI-326 deploy companion.

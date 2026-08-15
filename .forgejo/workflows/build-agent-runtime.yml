@@ -1,0 +1,10 @@
+# Public-export staging (shizuha-labs/shizuha).
+# Cluster / fleet CI belongs on shizuha-beta only.
+name: build-agent-runtime
+on:
+  workflow_dispatch: {}
+jobs:
+  skip:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Skipped on public-export repo; run this workflow from shizuha-beta."
