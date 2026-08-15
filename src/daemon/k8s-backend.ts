@@ -1,10 +1,9 @@
 /**
  * Fleet k8s actuator entry.
  *
- * Internal builds load `src/plugins/fleet/k8s-backend.ts` (our Hive/k3s
- * control plane). Public / `--no-fleet-plugin` builds swap that module for
- * `k8s-backend.stub.ts` so external users get TUI + dashboard without the
- * cluster actuator.
+ * Always the same source as public. The `fleet` profile mounts the real
+ * actuator; `default` leaves it unmounted (`isK8sAgent` is false).
+ * `build:public --no-fleet-plugin` may also alias the stub at bundle time.
  *
  * Callers keep importing `./k8s-backend.js`.
  */

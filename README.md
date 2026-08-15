@@ -108,6 +108,7 @@ shizuha up
 | Command | Description |
 |---------|-------------|
 | `shizuha` | Interactive TUI |
+| `shizuha plugins` | Show the composed plugin profile (`default` or `fleet`) |
 | `shizuha up` | Start daemon + dashboard |
 | `shizuha down` | Stop daemon |
 | `shizuha status` | Show daemon and agent status |

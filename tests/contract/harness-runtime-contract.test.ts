@@ -26,6 +26,7 @@ const REQUIRED_COMMANDS = [
   'antigravity-bridge',
   'openclaw-bridge',
   'up',
+  'plugins',
 ] as const;
 
 function read(rel: string): string {
@@ -60,6 +61,7 @@ describe('harness/runtime compatibility contract', () => {
   it('keeps the fleet k8s actuator behind a default-off plugin', () => {
     expect(fs.existsSync(path.join(root, 'src/plugins/fleet/k8s-backend.ts'))).toBe(true);
     expect(fs.existsSync(path.join(root, 'src/plugins/fleet/k8s-backend.stub.ts'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'src/plugins/profile.ts'))).toBe(true);
     const loader = read('src/daemon/k8s-backend.ts');
     expect(loader).toMatch(/from '\.\.\/plugins\/fleet\/k8s-backend\.js'/);
     expect(loader).not.toMatch(/SHIZUHA_FLEET_NAMESPACE/);
@@ -69,6 +71,12 @@ describe('harness/runtime compatibility contract', () => {
     expect(stub).not.toMatch(/SHIZUHA_FLEET_NAMESPACE/);
     const impl = read('src/plugins/fleet/k8s-backend.ts');
     expect(impl).toMatch(/SHIZUHA_FLEET_NAMESPACE/);
+    expect(impl).toMatch(/isBuiltinPluginEnabled\('fleet\/k8s'\)/);
+    const profile = read('src/plugins/profile.ts');
+    expect(profile).toMatch(/PROFILE_IDS = \['default', 'fleet'\]/);
+    expect(profile).toMatch(/id: 'fleet\/k8s'/);
+    const index = read('src/index.ts');
+    expect(index).toMatch(/\.command\('plugins'/);
     const pkg = read('package.json');
     expect(pkg).toMatch(/"build:public":/);
     expect(pkg).toMatch(/--no-fleet-plugin/);

@@ -2818,6 +2818,13 @@ exit 2
 // ── PLAT-4027: gh-auth probe target-set scoping ──
 
 describe('PLAT-4027: gh-auth probe scopes to enabled + active agents', () => {
+  beforeEach(() => {
+    process.env['SHIZUHA_FLEET_NAMESPACE'] = 'test-fleet';
+  });
+  afterEach(() => {
+    delete process.env['SHIZUHA_FLEET_NAMESPACE'];
+  });
+
   it('skips eligible-but-disabled agents so they do not page deployment_unready', async () => {
     const { probeK8sGithubCredentialHealth } = await import('../../src/daemon/k8s-backend.js');
     const akira = { ...agentWithGithub('akira'), status: 'active' as const };

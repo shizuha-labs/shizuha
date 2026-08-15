@@ -43,6 +43,13 @@ process.noDeprecation = true;
 
 
 const program = new Command();
+program.option('--profile <name>', 'Plugin profile: default | fleet');
+program.hook('preAction', (thisCommand) => {
+  const profile = thisCommand.optsWithGlobals()['profile'];
+  if (typeof profile === 'string' && profile.trim()) {
+    process.env['SHIZUHA_PROFILE'] = profile.trim();
+  }
+});
 
 function truncateInline(value: string, max = 220): string {
   const normalized = value.replace(/\s+/g, ' ').trim();
@@ -1634,6 +1641,20 @@ pulseCmd
       else console.error(message);
       process.exitCode = 1;
     }
+  });
+
+program
+  .command('plugins')
+  .description('Show the composed built-in plugin tree for this profile')
+  .action(async () => {
+    const { composePluginTree, formatPluginTree, PROFILE_IDS } = await import('./plugins/profile.js');
+    const explicit = (process.env['SHIZUHA_PROFILE'] ?? '').trim().toLowerCase();
+    if (explicit && !(PROFILE_IDS as readonly string[]).includes(explicit)) {
+      console.error(`Unknown profile "${explicit}". Use: ${PROFILE_IDS.join(' | ')}`);
+      process.exitCode = 1;
+      return;
+    }
+    process.stdout.write(formatPluginTree(composePluginTree()));
   });
 
 // ── Daemon commands: up / down / status ──

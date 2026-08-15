@@ -63,6 +63,7 @@ describe('PLAT-4546 — runtime mutation delegates to fresh k8s resolution', () 
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'plat-4546-runtime-update-'));
     previousHome = process.env['HOME'];
     process.env['HOME'] = tmpHome;
+    process.env['SHIZUHA_PROFILE'] = 'fleet';
     fs.mkdirSync(path.join(tmpHome, '.shizuha'), { recursive: true });
 
     const agent = baseAgent();
@@ -93,6 +94,7 @@ describe('PLAT-4546 — runtime mutation delegates to fresh k8s resolution', () 
     store.close();
     if (previousHome === undefined) delete process.env['HOME'];
     else process.env['HOME'] = previousHome;
+    delete process.env['SHIZUHA_PROFILE'];
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 

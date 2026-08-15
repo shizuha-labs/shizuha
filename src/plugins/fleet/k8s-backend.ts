@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { promisify } from 'node:util';
 import { agentEffectiveCapabilityEnv } from '../../platform/effective-capabilities.js';
+import { isBuiltinPluginEnabled } from '../profile.js';
 import type { AgentInfo } from '../../daemon/types.js';
 import { HEARTBEAT_OUTCOME_LOG_PREFIX } from '../../daemon/heartbeat-outcome.js';
 import { isAgentCredentialGrantCurrentlyActive, normalizeAgentCredential } from '../../daemon/agent-credential.js';
@@ -325,6 +326,10 @@ export interface K8sGitHubCredentialProbeResult {
 }
 
 export function isK8sAgent(agent: AgentInfo | undefined): boolean {
+  // Same tree as public; the `default` profile does not mount this actuator.
+  // rt-fleet sets SHIZUHA_DAEMON_RUNTIME=k8s (or SHIZUHA_FLEET_NAMESPACE),
+  // which selects the `fleet` profile. See src/plugins/profile.ts.
+  if (!isBuiltinPluginEnabled('fleet/k8s')) return false;
   // Prefer per-agent runtimeEnvironment; also honor fleet-daemon env so a
   // mis-tagged bare_metal/container row cannot dual-spawn as a host process
   // when the control plane is the k3s rt-fleet daemon.

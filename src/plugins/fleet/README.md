@@ -1,17 +1,15 @@
-# Fleet plugin (internal)
+# Fleet plugin (`fleet/k8s`)
 
-This directory is the **Hive/k3s fleet actuator**. It is how Shizuha
-runs named agents as cluster pods.
+Hive/k3s actuator. Same tree as the public product. It is **mounted**
+only on the `fleet` profile (DeepSeek-style composition: one source,
+different boot rows).
 
-It is **not** part of the default coding harness. External users get
-the TUI **and** the browser dashboard (`src/web` + `src/daemon/dashboard.ts`)
-without this plugin. Keep `src/daemon` in the public tree — the dashboard
-server lives there. Only this plugin is swapped for a stub.
+| Profile | How you get it | `fleet/k8s` |
+|---|---|---|
+| `default` | local `shizuha` / `shizuha up` | not mounted |
+| `fleet` | `SHIZUHA_PROFILE=fleet`, or a k8s fleet daemon (`SHIZUHA_DAEMON_RUNTIME=k8s` / `SHIZUHA_FLEET_NAMESPACE`) | mounted |
 
-| Build | What loads |
-|---|---|
-| Internal (`npm run build:node`) | `k8s-backend.ts` — real kubectl/Hive actuator |
-| Public (`npm run build:public`) | `k8s-backend.stub.ts` — no-op (`isK8sAgent` is always false) plus `dist/web` |
+`shizuha plugins` prints the composed tree. `build:public --no-fleet-plugin`
+can still alias the stub at bundle time; it is optional. The source stays.
 
-Callers keep importing `src/daemon/k8s-backend.ts`. That file only
-re-exports the plugin.
+Callers keep importing `src/daemon/k8s-backend.ts`.
