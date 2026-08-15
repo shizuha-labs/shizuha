@@ -5,7 +5,7 @@ import {
   isBuiltinPluginEnabled,
   resolveProfile,
 } from '../../src/plugins/profile.js';
-import { isK8sAgent } from '../../src/plugins/fleet/k8s-backend.js';
+import { isK8sAgent } from '../../src/daemon/k8s-backend.js';
 
 const touched = [
   'SHIZUHA_PROFILE',
@@ -29,7 +29,7 @@ afterEach(() => {
 });
 
 describe('plugin profiles', () => {
-  it('defaults to default and leaves the fleet actuator unmounted', () => {
+  it('defaults to TUI + dashboard + harness with no k8s actuator row', () => {
     const resolved = resolveProfile({
       SHIZUHA_PROFILE: undefined,
       SHIZUHA_DAEMON_RUNTIME: undefined,
@@ -42,16 +42,17 @@ describe('plugin profiles', () => {
     expect(isBuiltinPluginEnabled('tui', resolvedEnv())).toBe(true);
     const tree = composePluginTree(resolvedEnv());
     expect(tree.mounted.map((row) => row.id)).toEqual(['tui', 'dashboard', 'harness']);
-    expect(tree.available.map((row) => row.id)).toEqual(['fleet/k8s']);
+    expect(tree.available.map((row) => row.id)).toEqual([]);
     expect(formatPluginTree(tree)).toContain('profile: default');
-    expect(formatPluginTree(tree)).toContain('fleet/k8s');
+    expect(formatPluginTree(tree)).not.toContain('fleet/k8s');
   });
 
-  it('selects fleet when SHIZUHA_PROFILE=fleet', () => {
+  it('still recognizes SHIZUHA_PROFILE=fleet but does not mount a k8s writer', () => {
+    expect(resolveProfile({ SHIZUHA_PROFILE: 'fleet' }).profile).toBe('fleet');
+    expect(isBuiltinPluginEnabled('fleet/k8s', { SHIZUHA_PROFILE: 'fleet' })).toBe(false);
     expect(
-      resolveProfile({ SHIZUHA_PROFILE: 'fleet' }).profile,
-    ).toBe('fleet');
-    expect(isBuiltinPluginEnabled('fleet/k8s', { SHIZUHA_PROFILE: 'fleet' })).toBe(true);
+      composePluginTree({ SHIZUHA_PROFILE: 'fleet' }).mounted.map((row) => row.id),
+    ).toEqual(['tui', 'dashboard', 'harness']);
   });
 
   it('selects fleet for a k8s fleet daemon even without SHIZUHA_PROFILE', () => {
@@ -70,15 +71,9 @@ describe('plugin profiles', () => {
         SHIZUHA_DAEMON_RUNTIME: 'k8s',
       }),
     ).toEqual({ profile: 'default', source: 'env' });
-    expect(
-      isBuiltinPluginEnabled('fleet/k8s', {
-        SHIZUHA_PROFILE: 'default',
-        SHIZUHA_DAEMON_RUNTIME: 'k8s',
-      }),
-    ).toBe(false);
   });
 
-  it('does not treat a local agent as a k8s pod on the default profile', () => {
+  it('never treats a local agent as a k8s pod', () => {
     setEnv({
       SHIZUHA_PROFILE: 'default',
       SHIZUHA_DAEMON_RUNTIME: undefined,
@@ -86,11 +81,8 @@ describe('plugin profiles', () => {
       SHIZUHA_FLEET_NAMESPACE: undefined,
     });
     expect(isK8sAgent({ id: 'x', username: 'kai', runtimeEnvironment: 'k8s' } as never)).toBe(false);
-  });
-
-  it('actuates k8s agents on the fleet profile', () => {
     setEnv({ SHIZUHA_PROFILE: 'fleet' });
-    expect(isK8sAgent({ id: 'x', username: 'kai', runtimeEnvironment: 'k8s' } as never)).toBe(true);
+    expect(isK8sAgent({ id: 'x', username: 'kai', runtimeEnvironment: 'k8s' } as never)).toBe(false);
   });
 });
 

@@ -58,28 +58,24 @@ describe('harness/runtime compatibility contract', () => {
     }
   });
 
-  it('keeps the fleet k8s actuator behind a default-off plugin', () => {
-    expect(fs.existsSync(path.join(root, 'src/plugins/fleet/k8s-backend.ts'))).toBe(true);
-    expect(fs.existsSync(path.join(root, 'src/plugins/fleet/k8s-backend.stub.ts'))).toBe(true);
+  it('does not ship the Hive/k3s actuator (that lives in hive-runtime)', () => {
+    expect(fs.existsSync(path.join(root, 'src/plugins/fleet/k8s-backend.ts'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'src/plugins/fleet'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'Dockerfile.k8s-daemon'))).toBe(false);
     expect(fs.existsSync(path.join(root, 'src/plugins/profile.ts'))).toBe(true);
-    const loader = read('src/daemon/k8s-backend.ts');
-    expect(loader).toMatch(/from '\.\.\/plugins\/fleet\/k8s-backend\.js'/);
-    expect(loader).not.toMatch(/SHIZUHA_FLEET_NAMESPACE/);
-    const stub = read('src/plugins/fleet/k8s-backend.stub.ts');
-    expect(stub).toMatch(/isK8sAgent/);
-    expect(stub).toMatch(/return false/);
-    expect(stub).not.toMatch(/SHIZUHA_FLEET_NAMESPACE/);
-    const impl = read('src/plugins/fleet/k8s-backend.ts');
-    expect(impl).toMatch(/SHIZUHA_FLEET_NAMESPACE/);
-    expect(impl).toMatch(/isBuiltinPluginEnabled\('fleet\/k8s'\)/);
+    const adapter = read('src/daemon/k8s-backend.ts');
+    expect(adapter).toMatch(/isK8sAgent/);
+    expect(adapter).toMatch(/return false/);
+    expect(adapter).not.toMatch(/SHIZUHA_FLEET_NAMESPACE/);
+    expect(adapter).not.toMatch(/from '\.\.\/plugins\/fleet\/k8s-backend\.js'/);
     const profile = read('src/plugins/profile.ts');
     expect(profile).toMatch(/PROFILE_IDS = \['default', 'fleet'\]/);
-    expect(profile).toMatch(/id: 'fleet\/k8s'/);
+    expect(profile).not.toMatch(/id: 'fleet\/k8s'/);
     const index = read('src/index.ts');
     expect(index).toMatch(/\.command\('plugins'/);
     const pkg = read('package.json');
     expect(pkg).toMatch(/"build:public":/);
-    expect(pkg).toMatch(/--no-fleet-plugin/);
+    expect(pkg).not.toMatch(/--no-fleet-plugin/);
     expect(pkg).toMatch(/vite build --config vite\.web\.config\.ts/);
   });
 

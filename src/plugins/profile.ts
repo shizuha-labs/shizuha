@@ -1,10 +1,11 @@
 /**
  * Built-in plugin profiles (DeepSeek harness idea, without Cordis).
  *
- * Same source tree for us and for public users. A profile is the ordered
- * set of in-tree rows that boot. `default` is TUI + dashboard + harness.
- * `fleet` adds the Hive/k3s actuator. Disk plugins (~/.shizuha/plugins)
- * still load through PluginLoader on top of this catalog.
+ * Shizuha Code ships TUI + dashboard + harness. The Hive/k3s actuator
+ * lives in Origin `shizuha-labs/hive-runtime`, not this tree. `fleet`
+ * remains a recognized profile id so existing SHIZUHA_PROFILE=fleet /
+ * k8s-daemon env still resolve, but it mounts the same rows as `default`.
+ * Disk plugins (~/.shizuha/plugins) still load through PluginLoader.
  *
  * Resolve order:
  *   1. SHIZUHA_PROFILE=default|fleet
@@ -41,12 +42,6 @@ export const BUILTIN_PLUGIN_ROWS: readonly BuiltinPluginRow[] = [
     title: 'Agent harness',
     description: 'exec / resume / gateway / provider bridges',
     profiles: '*',
-  },
-  {
-    id: 'fleet/k8s',
-    title: 'Hive/k3s fleet actuator',
-    description: 'Writes per-agent Deployments in the fleet namespace',
-    profiles: ['fleet'],
   },
 ];
 
