@@ -1,0 +1,299 @@
+# PLAT-4720 — full-suite premerge gate for shizuha-beta.
+#
+# Before this existed, NO workflow in this repo ran the test suite. `premerge-parity.yml`
+# runs `unittest tests.ci.test_agent_runtime_workflow_parity` — assertions about the
+# workflow files agreeing with each other — not vitest and not tsc. A green check on a
+# shizuha-beta PR therefore did not mean tests ran (@sara, PLAT-4720 §1 / PLAT-5075).
+#
+# Shape: the runner DISPATCHES, the Job EXECUTES. That split is load-bearing for
+# security, not stylistic:
+#
+#   - `deploy-lane` is the only runner label this Forgejo serves that carries kubectl,
+#     and it holds KUBE_CONFIG_B64. PR-authored code must never execute beside a cluster
+#     credential — that is the PLAT-4718 defect @aoi caught, where a green run concealed
+#     a credential-exfiltration path.
+#   - So the runner does `kubectl create` + wait + report and nothing else. The suite runs
+#     inside the Job, whose test container has NO kubeconfig and NO secret env at all.
+#   - Only the git-clone initContainer holds a credential — a repo-read token from the
+#     `forgejo-token` Secret — and it does nothing but clone. Pattern copied from
+#     shizuha-labs/drive `.forgejo/workflows/deploy.yml`, which is green on main today.
+#
+# Fail-closed on BOTH axes. A Job can dispatch, exit 0, and have compiled nothing:
+#   1. non-zero `.status.failed` -> fail
+#   2. the suite must PROVE it ran -> assert the summary line AND a non-zero test count.
+#      "summary present" alone passes against a suite that collected 0 tests, which is
+#      the same defect class as a deny-only authz assertion passing against a surface
+#      that serves nothing (@sara, PLAT-5685 item 2).
+name: premerge-full-suite
+on:
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch: {}
+concurrency:
+  group: premerge-full-suite-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  full-suite:
+    runs-on: deploy-lane
+    steps:
+      - name: Install kubectl (dispatcher only)
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"
+          case "$KUBECTL_ARCH" in
+            x86_64)  KUBECTL_ARCH=amd64; KUBECTL_SHA256="7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3" ;;
+            aarch64) KUBECTL_ARCH=arm64; KUBECTL_SHA256="420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450" ;;
+            *) echo "::error::unsupported runner arch $KUBECTL_ARCH"; exit 1 ;;
+          esac
+          curl --retry 3 --retry-all-errors --max-time 60 -fsSL -o kubectl \
+            "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Dispatch full suite (node:22-bookworm Job) and gate on real results
+        env:
+          # Bound through env rather than interpolated into shell text
+          # (semgrep run-shell-injection / CWE-78; the fix PLAT-4740 applied here).
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT="$(printf '%s' "$SOURCE_SHA" | cut -c1-7)"
+          JOB="ci-fullsuite-beta-${SHORT}"
+          kubectl -n build delete job "${JOB}" --ignore-not-found
+
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-fullsuite, service: shizuha-beta, shizuha.io/plat-task: PLAT-4720 }
+          spec:
+            # Healthy full-suite finishes in ~90s (see ALERT-25167 green baselines).
+            # 20m is generous for npm cold-cache + contended nodes; the prior 3600s
+            # deadline burned an hour with zero logs when the Job vanished first.
+            activeDeadlineSeconds: 1200
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 600
+            template:
+              spec:
+                restartPolicy: Never
+                # The suite MUST NOT run as root. Three tests assert that a
+                # read-only file cannot be written (workspace-writable-repair,
+                # sqlite-writable-repair); root bypasses permission bits, so they
+                # fail as root and pass as any normal uid. Verified both ways:
+                # 3 failed / 3040 passed as root, 6/6 of those same tests passing
+                # as uid 1000.
+                #
+                # Without this the gate red-lights every PR on an environment
+                # mismatch — and worse, it would look like the gate was "finding
+                # bugs" on its first run. fsGroup gives the emptyDir to the same
+                # gid so the clone, npm ci, and the suite can all write it.
+                securityContext:
+                  runAsUser: 1000
+                  runAsGroup: 1000
+                  fsGroup: 1000
+                  runAsNonRoot: true
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                initContainers:
+                  # The ONLY component holding a credential, and it only clones.
+                  #
+                  # The credential must not reach the shared volume either. Putting it
+                  # in the clone URL persists it verbatim into .git/config, and
+                  # /workspace is an emptyDir the PR-code container mounts — so
+                  # `cat .git/config` would hand the repo token to PR-authored code
+                  # regardless of it holding no secret ENV (@sara, PLAT-4720 review).
+                  #
+                  # `git -c` BEFORE the subcommand is invocation-scoped and is not
+                  # written to the new repo. `git clone -c` is NOT equivalent: it
+                  # persists the value into the cloned repo's config, which would
+                  # reintroduce this exact defect. Verified both forms empirically.
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        test -n "\${GIT_PASSWORD}"
+                        AUTH="Authorization: Basic \$(printf 'x-token-auth:%s' "\${GIT_PASSWORD}" | base64 -w0)"
+                        REPO=http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git
+                        git -c http.extraheader="\${AUTH}" clone --depth=50 "\${REPO}" /workspace/src
+                        cd /workspace/src
+                        if ! git checkout "\${EXPECTED_SHA}" 2>/dev/null; then
+                          git -c http.extraheader="\${AUTH}" fetch --depth=500 origin "\${EXPECTED_SHA}" \
+                            || git -c http.extraheader="\${AUTH}" fetch --unshallow origin
+                          git checkout "\${EXPECTED_SHA}"
+                        fi
+                        test "\$(git rev-parse HEAD)" = "\${EXPECTED_SHA}"
+                        # The suite does not use git (scripts/ci/full-ci.mjs has no git
+                        # dependency), so remove the metadata rather than sanitising it.
+                        rm -rf /workspace/src/.git
+                        # Assert the PROPERTY at runtime, not a proxy for it: if any
+                        # credential material survives anywhere in the shared volume,
+                        # refuse to hand off. A manifest-env assertion cannot see this.
+                        if grep -rqIF "\${GIT_PASSWORD}" /workspace 2>/dev/null; then
+                          echo "refusing handoff: credential material present in /workspace" >&2
+                          exit 1
+                        fi
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                      - name: EXPECTED_SHA
+                        value: "${SOURCE_SHA}"
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  # PR-authored code executes HERE. Deliberately no kubeconfig and no
+                  # secret env — if a future change adds one, that is the review flag.
+                  - name: fullsuite
+                    image: node:22-bookworm
+                    workingDir: /workspace/src
+                    command: ["/bin/bash","-c"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        npm config set registry "\${NPM_CONFIG_REGISTRY}"
+                        # Fail closed on a wedged registry instead of sitting until
+                        # activeDeadline (ALERT-25167: hour-long runs, zero suite logs).
+                        npm ci --prefer-offline --no-audit --no-fund --fetch-timeout=120000 --fetch-retries=3
+                        npm run ci
+                    env:
+                      - name: NPM_CONFIG_REGISTRY
+                        value: "http://npm-cache.registry.svc.cluster.local:4873/"
+                      - name: CI
+                        value: "true"
+                      # Cap vitest workers so two concurrent fullsuite Jobs cannot
+                      # oversubscribe a node into multi-hour stalls (ALERT-25167).
+                      - name: SHIZUHA_CI_MAX_WORKERS
+                        value: "2"
+                      - name: npm_config_fetch_timeout
+                        value: "120000"
+                      - name: npm_config_fetch_retries
+                        value: "3"
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                    resources:
+                      requests: { cpu: "1", memory: 2Gi }
+                      limits: { cpu: "4", memory: 8Gi }
+                volumes: [{ name: workspace, emptyDir: {} }]
+          YAML
+
+          dump_fullsuite_evidence() {
+            echo "::group::fullsuite evidence for ${JOB}"
+            # Diagnostics are best-effort reads; disable errexit for the body so a
+            # failed `get`/`describe`/`logs` cannot abort the dump (PLAT-4720: no
+            # bare `|| true` on non-cleanup lines). Restore it after the group.
+            set +e
+            kubectl -n build get job "${JOB}" -o wide 2>/dev/null
+            kubectl -n build describe job "${JOB}" 2>/dev/null | tail -80
+            kubectl -n build get pods -l "job-name=${JOB}" -o wide 2>/dev/null
+            for pod in $(kubectl -n build get pods -l "job-name=${JOB}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+              echo "--- pod/${pod} describe (tail) ---"
+              kubectl -n build describe "pod/${pod}" 2>/dev/null | tail -60
+              for c in git-clone fullsuite; do
+                echo "--- pod/${pod} logs container=${c} ---"
+                kubectl -n build logs "pod/${pod}" -c "${c}" --tail=200 2>/dev/null
+              done
+              echo "--- pod/${pod} logs --all-containers ---"
+              kubectl -n build logs "pod/${pod}" --all-containers --tail=200 2>/dev/null
+            done
+            set -e
+            echo "::endgroup::"
+          }
+
+          # Axis 1 — the Job must complete without failure.
+          # Fail-fast (SCLI-387) + evidence dumps (ALERT-25167): background the
+          # completion wait and poll .status.failed so a failed Job (which NEVER
+          # becomes 'complete') cannot burn the full deadline; on any failure dump
+          # full evidence and exit. The bounded pledge (1260s) keeps a wedged but
+          # not-failed Job from running the wait to its 3900s ceiling silently.
+          WAIT_DEADLINE_SECS=1260
+          POLL_SECS=30
+          elapsed=0
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=3900s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            # Failed condition (including activeDeadline) — dump and stop.
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::full suite Job reported failed pod(s) for ${SOURCE_SHA}"
+              dump_fullsuite_evidence
+              # Stop the background wait without `|| true` on the pass path
+              # (PLAT-4720 soft-failure ban). set +e only for cleanup signals.
+              set +e
+              kill "$WP" 2>/dev/null
+              wait "$WP" 2>/dev/null
+              set -e
+              kubectl -n build delete job "${JOB}" --ignore-not-found
+              exit 1
+            fi
+            # Bounded pledge: emit evidence if the suite hasn't completed in time.
+            if [ "${elapsed}" -ge "${WAIT_DEADLINE_SECS}" ]; then
+              echo "::error::full suite did not complete for ${SOURCE_SHA} within ${WAIT_DEADLINE_SECS}s"
+              dump_fullsuite_evidence
+              set +e
+              kill "$WP" 2>/dev/null
+              wait "$WP" 2>/dev/null
+              set -e
+              kubectl -n build delete job "${JOB}" --ignore-not-found
+              exit 1
+            fi
+            # Lightweight progress breadcrumb every ~2 minutes.
+            if [ $((elapsed % 120)) -lt "${POLL_SECS}" ]; then
+              echo "fullsuite still running at ${elapsed}s — $(kubectl -n build get pods -l "job-name=${JOB}" --no-headers 2>/dev/null || echo 'no pods')"
+            fi
+            sleep "${POLL_SECS}"
+            elapsed=$((elapsed + POLL_SECS))
+          done
+          # Wait exited on its own — verify it completed, not timed out.
+          if ! wait "$WP"; then
+            echo "::error::full suite did not complete for ${SOURCE_SHA}"
+            dump_fullsuite_evidence
+            kubectl -n build delete job "${JOB}" --ignore-not-found
+            exit 1
+          fi
+          FAILED="$(kubectl -n build get job "${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)"
+          if [ -n "${FAILED}" ] && [ "${FAILED}" != "0" ]; then
+            echo "::error::full suite Job reported ${FAILED} failed pod(s)"
+            dump_fullsuite_evidence
+            kubectl -n build delete job "${JOB}" --ignore-not-found
+            exit 1
+          fi
+
+          # Axis 2 — the suite must PROVE it ran. A Job can exit 0 having executed
+          # nothing; `npm run ci` prints "tests: N passed, M failed, K skipped".
+          # Require the line AND N > 0, so a 0-collected run cannot pass.
+          LOG="$(kubectl -n build logs "job/${JOB}" --all-containers --tail=400 2>/dev/null || true)"
+          if [ -z "${LOG}" ]; then
+            LOG="$(kubectl -n build logs -l "job-name=${JOB}" --all-containers --tail=400 2>/dev/null || true)"
+          fi
+          printf '%s\n' "$LOG" | tail -40
+          kubectl -n build delete job "${JOB}" --ignore-not-found
+
+          # errexit is disabled narrowly rather than using `|| true`: a no-match grep
+          # must yield an empty SUMMARY so the explicit check below reports WHY, and
+          # `|| true` on an assertion-adjacent line is the exact shape that makes a
+          # gate inert. (Caught by the committed negative control on its first run.)
+          set +e
+          SUMMARY="$(printf '%s\n' "$LOG" | grep -oE 'tests: [0-9]+ passed' | tail -1)"
+          set -e
+          if [ -z "${SUMMARY}" ]; then
+            echo "::error::no full-suite summary in Job log — the suite did not run. Refusing to pass."
+            exit 1
+          fi
+          PASSED="$(printf '%s' "${SUMMARY}" | grep -oE '[0-9]+' | head -1)"
+          if [ -z "${PASSED}" ] || [ "${PASSED}" -le 0 ]; then
+            echo "::error::full suite collected ${PASSED:-0} tests — a green run that verified nothing. Refusing to pass."
+            exit 1
+          fi
+          echo "full suite verified: ${SUMMARY} at ${SOURCE_SHA}"

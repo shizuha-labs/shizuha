@@ -1,0 +1,107 @@
+# Dependencies
+node_modules/
+node_modules.broken*/
+
+# Build output
+dist/
+dist*
+tmp-dist/
+*.tsbuildinfo
+
+# Credentials / secrets
+.env
+.env.*
+!.env.example
+benchmark/.env
+benchmark/.env.local
+benchmark/benchmark.db.*
+
+# Databases (generated at runtime)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Benchmark artifacts
+benchmark/logs/
+benchmark/results/
+benchmark/reports/
+benchmark/__pycache__/
+benchmark/*.pyc
+# Source moved to cortex/benchboard (6a963cb). The leftover directory is
+# local DBs/archives/logs/.env only — never re-add it to this repo.
+/benchmark/
+
+# Test artifacts
+test-results/
+coverage/
+ci-artifacts/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Screenshots
+*.png
+
+# Runtime state
+.shizuha/
+.runtime-skills/*
+!.runtime-skills/.gitkeep
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Lock files (npm — keep package-lock.json, exclude others)
+pnpm-lock.yaml
+bun.lockb
+
+__pycache__
+
+# Agent identity / keypairs (cryptographic material)
+.identity/
+
+# Agent audit/telemetry logs (may contain sensitive tool output)
+.audit-log.jsonl
+.telemetry.jsonl
+
+# Scratch files
+app.py
+test_app.py
+test-litellm.ts
+.claude
+# Transient dist rollback snapshots (CI + local). Never commit; CI must not
+# accumulate unbounded dist.previous-<id> trees on the s1 hostPath checkout.
+dist.backup-*/
+dist.previous/
+dist.previous-*/
+dist.failed/
+dist.failed-*/
+dist.next/
+dist.next-*/
+
+# Ad-hoc benchmark scratch scripts
+benchmark/final_clean_pass.sh
+benchmark/fix_and_rerun_infra.sh
+
+# Local environments, caches, and editor scratch (never commit)
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.claude/
+.pytest_cache/
+**/.pytest_cache/
+
+# Local bench credentials — never ship
+benchmark/.local/

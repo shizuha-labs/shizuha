@@ -1,0 +1,8 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for the Shizuha desktop app — scoped to local-core IPC only",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

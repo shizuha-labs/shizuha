@@ -1,0 +1,12 @@
+# Quarantined tests — excluded from the full-CI gate (scripts/ci/full-ci.mjs).
+#
+# Format: <test-file path relative to repo root>  # reason (owner, date)
+# A reason comment is MANDATORY — entries without one fail the gate.
+#
+# Rules (SCLI-11):
+# - Quarantine is for flaky/slow tests parked EXPLICITLY, never a dumping ground.
+# - Every entry is printed loudly on every CI run; fix or remove promptly.
+# - Removing a test from the suite any other way (deleting, .skip without a
+#   linked task) is not allowed.
+#
+# (empty — keep it that way)

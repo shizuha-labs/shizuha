@@ -1,0 +1,12 @@
+[Unit]
+Description=RETIRED legacy Shizuha SCLI host publisher
+ConditionPathExists=!/
+RefuseManualStart=yes
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,294 @@
+name: build-mcp-auth-proxy
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    paths:
+      - mcp-auth-proxy/**
+      - .forgejo/workflows/build-mcp-auth-proxy.yml
+
+concurrency:
+  group: build-mcp-auth-proxy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: deploy-lane
+    steps:
+      - name: Configure cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"
+          case "$KUBECTL_ARCH" in
+            x86_64) KUBECTL_ARCH=amd64 ;;
+            aarch64|arm64) KUBECTL_ARCH=arm64 ;;
+            *) echo "unsupported runner architecture: $KUBECTL_ARCH" >&2; exit 1 ;;
+          esac
+          curl -fsSL -o kubectl \
+            "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Test, build, publish, and verify both architectures
+        run: |
+          set -euo pipefail
+          SOURCE_SHA='${{ github.sha }}'
+          SHORT="$(printf '%s' "$SOURCE_SHA" | cut -c1-12)"
+          TAG="src-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          IMAGE="mcp-auth-proxy"
+
+          render_build_job() {
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-mcp-auth-${SHORT}
+            namespace: build
+            labels: { app: ci-build, service: mcp-auth-proxy }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 3600
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                # The broker is pure Go/CGO-disabled. Compile both targets on
+                # one amd64 worker, then package scratch images with explicit
+                # OCI platforms. This avoids QEMU and arm64 Kaniko base-layer
+                # unpack deadlocks while still producing native binaries.
+                nodeSelector: { kubernetes.io/arch: amd64 }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                        - matchExpressions:
+                            - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        git clone --filter=blob:none --no-checkout \
+                          "http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git" \
+                          /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin "${SOURCE_SHA}"
+                        git checkout --detach "${SOURCE_SHA}"
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                  - name: compile-and-test
+                    # Image identity stays canonical. Host containerd routes
+                    # docker.io through the declarative node-local mirror.
+                    image: docker.io/library/golang:1.22-alpine
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        cd /workspace/src/mcp-auth-proxy
+                        go test ./...
+                        mkdir -p bin/amd64 bin/arm64
+                        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/amd64/mcp-auth-proxy ./cmd/mcp-auth-proxy
+                        CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o bin/arm64/mcp-auth-proxy ./cmd/mcp-auth-proxy
+                        cp Dockerfile.prebuilt bin/amd64/Dockerfile
+                        cp Dockerfile.prebuilt bin/arm64/Dockerfile
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko-amd64
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src/mcp-auth-proxy/bin/amd64
+                      - --dockerfile=/workspace/src/mcp-auth-proxy/bin/amd64/Dockerfile
+                      - --destination=${REG}/${IMAGE}:${TAG}-amd64
+                      - --cleanup
+                      - --custom-platform=linux/amd64
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/${IMAGE}-amd64
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                  - name: kaniko-arm64
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src/mcp-auth-proxy/bin/arm64
+                      - --dockerfile=/workspace/src/mcp-auth-proxy/bin/arm64/Dockerfile
+                      - --destination=${REG}/${IMAGE}:${TAG}-arm64
+                      - --cleanup
+                      - --custom-platform=linux/arm64
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/${IMAGE}-arm64
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          BUILD_JOB="$(render_build_job)"
+          printf '%s\n' "$BUILD_JOB" | grep -Fq 'image: docker.io/library/golang:1.22-alpine'
+          if printf '%s\n' "$BUILD_JOB" | grep -E 'image:[[:space:]]+([^/]+\.)?svc\.cluster\.local(:[0-9]+)?/|image:[[:space:]]+(localhost|127\.0\.0\.1|\[?::1\]?)(:[0-9]+)?/'; then
+            echo "build Job rendered a transport-specific Docker Hub mirror as image identity" >&2
+            exit 1
+          fi
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          BUILD_JOB_NAME="ci-build-mcp-auth-${SHORT}"
+          cleanup_build_job() {
+            python3 "$BUILD_GUARD" cleanup --namespace build --job "$BUILD_JOB_NAME"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_job || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64
+          cleanup_build_job
+          printf '%s\n' "$BUILD_JOB" | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-jobs --namespace build \
+            --job "amd64=${BUILD_JOB_NAME}" --timeout-seconds 1800
+          trap - EXIT INT TERM
+
+          wait_job() {
+            local JOB="ci-build-mcp-auth-${SHORT}"
+            kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1800s &
+            local waiter=$!
+            while kill -0 "$waiter" 2>/dev/null; do
+              if kubectl get "job/${JOB}" -n build -o jsonpath='{.status.failed}' | grep -q '[1-9]'; then
+                kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true
+                return 1
+              fi
+              sleep 5
+            done
+            wait "$waiter"
+          }
+          wait_job
+
+          kubectl delete job -n build "ci-manifest-mcp-auth-${SHORT}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-manifest-mcp-auth-${SHORT}
+            namespace: build
+            labels: { app: ci-manifest, service: mcp-auth-proxy }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 3600
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: crane
+                    image: gcr.io/go-containerregistry/crane:latest
+                    args:
+                      - index
+                      - append
+                      - --insecure
+                      - -t
+                      - ${REG}/${IMAGE}:${TAG}
+                      - -m
+                      - ${REG}/${IMAGE}:${TAG}-amd64
+                      - -m
+                      - ${REG}/${IMAGE}:${TAG}-arm64
+          YAML
+          kubectl wait -n build --for=condition=complete "job/ci-manifest-mcp-auth-${SHORT}" --timeout=300s
+
+          for ARCH in amd64 arm64; do
+            kubectl delete job -n build "ci-smoke-mcp-auth-${SHORT}-${ARCH}" --ignore-not-found
+            cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-smoke-mcp-auth-${SHORT}-${ARCH}
+            namespace: build
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 3600
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                containers:
+                  - name: smoke
+                    image: localhost:30500/${IMAGE}:${TAG}
+                    command: ["/mcp-auth-proxy"]
+                    args: ["healthcheck", "--help"]
+          YAML
+          done
+          kubectl wait -n build --for=condition=complete "job/ci-smoke-mcp-auth-${SHORT}-amd64" --timeout=300s &
+          SMOKE_AMD64_PID=$!
+          kubectl wait -n build --for=condition=complete "job/ci-smoke-mcp-auth-${SHORT}-arm64" --timeout=300s &
+          SMOKE_ARM64_PID=$!
+          SMOKE_FAILED=0
+          wait "${SMOKE_AMD64_PID}" || SMOKE_FAILED=1
+          wait "${SMOKE_ARM64_PID}" || SMOKE_FAILED=1
+          if [ "${SMOKE_FAILED}" -ne 0 ]; then
+            kubectl logs -n build "job/ci-smoke-mcp-auth-${SHORT}-amd64" --tail=80 || true
+            kubectl logs -n build "job/ci-smoke-mcp-auth-${SHORT}-arm64" --tail=80 || true
+            exit 1
+          fi
+
+          kubectl delete job -n build "ci-verify-mcp-auth-${SHORT}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-verify-mcp-auth-${SHORT}
+            namespace: build
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 3600
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: verify
+                    image: alpine:3.20
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        wget -qO /tmp/manifest.json \
+                          --header='Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+                          "http://${REG}/v2/${IMAGE}/manifests/${TAG}"
+                        grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"amd64"' /tmp/manifest.json
+                        grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"arm64"' /tmp/manifest.json
+          YAML
+          kubectl wait -n build --for=condition=complete "job/ci-verify-mcp-auth-${SHORT}" --timeout=300s
+          BROKER_IMAGE="localhost:30500/${IMAGE}:${TAG}"
+          echo "published ${BROKER_IMAGE} for linux/amd64 + linux/arm64"
+
+          # Publishing alone does not deploy the broker. The runtime controller
+          # owns the desired sidecar image and its paced roller converges every
+          # running and stopped agent template. Advance that authoritative pin
+          # only after the multi-arch manifest and both native smoke tests pass;
+          # otherwise a source change can look shipped while every agent keeps
+          # the old proxy contract indefinitely.
+          kubectl -n rt-fleet set env deployment/shizuha-runtime-fleet \
+            "SHIZUHA_BROKER_IMAGE=${BROKER_IMAGE}"
+          kubectl -n rt-fleet rollout status deployment/shizuha-runtime-fleet --timeout=300s
+          LIVE_BROKER_IMAGE="$(kubectl -n rt-fleet get deployment/shizuha-runtime-fleet \
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="runtime")].env[?(@.name=="SHIZUHA_BROKER_IMAGE")].value}')"
+          test "${LIVE_BROKER_IMAGE}" = "${BROKER_IMAGE}"

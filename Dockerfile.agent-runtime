@@ -1,0 +1,306 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# shizuha-agent-runtime — multi-arch (amd64+arm64) k3s-native agent image
+# =============================================================================
+# PLAT-150 (EPIC PLAT-146), HLD PLAT-147 v0.2 §3/§5. The image the hive
+# FleetAgent provisioner (PLAT-148) runs as ONE agent per native k3s pod.
+# Docker-capable agents get DinD as a Hive-declared sidecar, not baked into this
+# image. Base = the non-DinD AGENT_DOCKERFILE (src/daemon/
+# manager.ts, v3): ubuntu:24.04 + node22 + python + claude-code/codex/agy
+# CLIs. On top we BAKE the shizuha runtime + bundled skill registry (HLD §5;
+# dynamic per-agent skills stay on the workspace PVC).
+#
+# dist/ is an esbuild artifact (NOT committed) — build it first, then build the
+# image: `build-agent-runtime.sh` runs `npm run build:public` then buildx.
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f Dockerfile.agent-runtime \
+#     -t gx10-1:30500/shizuha-agent-runtime:<tag> --push .
+#
+# NOTE: push via gx10-1:30500 (s1's trusted registry path); fleet pods PULL via
+# each node's loopback localhost:30500 (same in-cluster registry).
+# =============================================================================
+# Browser bytes are inherited from the last qualified multi-arch runtime, by
+# immutable index digest. This keeps lockfile-only rebuilds off Playwright's
+# public CDN while retaining native amd64/arm64 selection at manifest resolve.
+FROM registry.registry.svc.cluster.local:5000/shizuha-agent-runtime@sha256:a1c8a4935fd098217f52926505b08e050ffdd230e6a32f01222fe5774a76d4f5 AS playwright-donor
+
+FROM ubuntu:24.04
+
+ARG PACKAGE_CACHE_HOST=s1.tail.shizuha.com
+ARG TARGETARCH
+ARG KUBECTL_VERSION=v1.34.6
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NODE_MAJOR=22
+ENV NPM_CONFIG_REGISTRY=http://${PACKAGE_CACHE_HOST}:30512/
+ENV PIP_INDEX_URL=http://${PACKAGE_CACHE_HOST}:30511/simple/
+ENV PIP_TRUSTED_HOST=${PACKAGE_CACHE_HOST}
+RUN printf 'registry=http://%s:30512/\n' "${PACKAGE_CACHE_HOST}" > /etc/npmrc \
+  && printf '[global]\nindex-url = http://%s:30511/simple/\ntrusted-host = %s\n' "${PACKAGE_CACHE_HOST}" "${PACKAGE_CACHE_HOST}" > /etc/pip.conf
+
+# Route apt through the in-cluster apt-cache proxy (apt-cacher-ng). The build
+# nodes can't reach http://ports.ubuntu.com (arm64 archive) directly over WAN —
+# "Network is unreachable" broke every arm64 agent-runtime build (2026-07-16).
+# The cache has egress and serves both archive.ubuntu.com (amd64) and
+# ubuntu-ports (arm64). https stays DIRECT (cli.github/nodesource are reachable).
+RUN printf 'Acquire::http::Proxy "http://apt-cache.registry.svc.cluster.local:3142";\nAcquire::https::Proxy "DIRECT";\nAcquire::Retries "3";\n' > /etc/apt/apt.conf.d/00shizuha-apt-cache
+
+# ── Layer 1: System packages + Node.js 22 + gh ──
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl gnupg git openssh-client \
+    python3 python3-pip python3-venv python3-dev \
+    build-essential pkg-config \
+    jq wget unzip tar gzip bzip2 xz-utils \
+    ripgrep fd-find tree less file procps htop \
+    tmux \
+    sqlite3 libsqlite3-dev \
+    libffi-dev libssl-dev \
+    sudo lsb-release tini \
+    bubblewrap \
+  && mkdir -p /etc/apt/keyrings \
+  && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+  && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
+  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/etc/apt/keyrings/gh.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/gh.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update && apt-get install -y --no-install-recommends nodejs gh \
+  && rm -rf /var/lib/apt/lists/*
+
+# PLAT-3412: privileged k3s-native agents must have kubectl in the immutable
+# image, not only on a mutable workspace PVC. Pin to the cluster minor and
+# verify the per-architecture binary against Kubernetes' published checksum.
+RUN case "${TARGETARCH}" in amd64|arm64) ;; *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; esac \
+  && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
+  && curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl.sha256" \
+  && echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum --check \
+  && chmod 0755 /usr/local/bin/kubectl \
+  && rm -f /tmp/kubectl.sha256
+
+# ── Layer 2: Python packages (agent capability parity) ──
+# PLAT-4701: cryptography is version-locked via requirements-agent-runtime.txt.
+# Install cryptography wheel-only first so pip cannot source-build or backtrack
+# to 2.6 (run-79 ModuleNotFoundError: pkg_resources). The import assertion reads
+# that exact pin from the copied lock; never duplicate the version here.
+# Capability packages stay unpinned EXCEPT where an upstream release silently
+# breaks agent-authored code (see the aiohttp/aioresponses pin below).
+COPY requirements-agent-runtime.txt /tmp/requirements-agent-runtime.txt
+RUN pip3 install --no-cache-dir --break-system-packages --ignore-installed \
+    --only-binary=:all: -r /tmp/requirements-agent-runtime.txt \
+  && python3 -c "from pathlib import Path; import cryptography; pins = [line.split('==', 1)[1].strip() for line in Path('/tmp/requirements-agent-runtime.txt').read_text().splitlines() if line.startswith('cryptography==')]; assert len(pins) == 1, pins; assert cryptography.__version__ == pins[0], (cryptography.__version__, pins[0])" \
+  && pip3 install --no-cache-dir --break-system-packages --ignore-installed \
+    pytest pytest-timeout pytest-asyncio pytest-django \
+    django djangorestframework django-cors-headers \
+    flask requests httpx "aiohttp<3.13" aioresponses websockets \
+    sqlalchemy aiosqlite redis celery \
+    pydantic beautifulsoup4 lxml \
+    black ruff mypy pylint \
+    pyyaml toml python-dotenv \
+    Pillow numpy pandas \
+  && python3 - <<'PY'
+# aiohttp 3.14 made ClientResponse.__init__ require `stream_writer`, which no
+# released aioresponses (<=0.7.9) passes. Under 3.14 EVERY agent that mocks
+# aiohttp the idiomatic way fails, while one that hand-rolls mocks passes —
+# i.e. the image silently grades style instead of correctness. Measured
+# 2026-07-27: one bench task went 8F/4P -> 12P on 3.11.18, model code
+# unchanged. aioresponses must be present for the mock path to exist at all.
+# Unpin only when aioresponses supports 3.14.
+import asyncio, aiohttp, aioresponses
+assert tuple(int(x) for x in aiohttp.__version__.split(".")[:2]) < (3, 13), aiohttp.__version__
+async def _probe():
+    with aioresponses.aioresponses() as m:
+        m.get("http://x/", status=200, body="ok")
+        async with aiohttp.ClientSession() as s:
+            async with s.get("http://x/") as r:
+                assert await r.text() == "ok"
+asyncio.run(_probe())
+print(f"OK aiohttp={aiohttp.__version__} aioresponses={aioresponses.__version__}")
+PY
+
+# ── Layer 4: aliases + non-root agent user (UID 1000) ──
+RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true \
+  && ln -sf /usr/bin/python3 /usr/local/bin/python 2>/dev/null || true \
+  && existing_user=$(getent passwd 1000 | cut -d: -f1) \
+  && if [ -n "$existing_user" ] && [ "$existing_user" != "agent" ]; then \
+       usermod -l agent -d /home/agent -m "$existing_user" \
+       && groupmod -n agent "$existing_user" 2>/dev/null || true; \
+     elif [ -z "$existing_user" ]; then \
+       useradd -m -s /bin/bash -u 1000 agent; \
+     fi \
+  && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
+
+# ── Layer 5: qualified browser payload + shizuha runtime ──
+# The donor is Playwright 1.58.2 with chromium-1208,
+# chromium_headless_shell-1208, and ffmpeg-1011 on both architectures. Copying
+# it before package manifests keeps these ~180 MiB payloads stable when an
+# unrelated npm lock entry changes. The post-npm-ci assertion below refuses a
+# future Playwright upgrade until this qualified donor digest is advanced.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+COPY --from=playwright-donor /opt/playwright-browsers /opt/playwright-browsers
+RUN test -d /opt/playwright-browsers/chromium-1208 \
+  && test -d /opt/playwright-browsers/chromium_headless_shell-1208 \
+  && test -d /opt/playwright-browsers/ffmpeg-1011 \
+  && chmod -R 755 /opt/playwright-browsers
+
+WORKDIR /opt/shizuha
+# package manifests first for layer caching; npm ci compiles native deps
+# (better-sqlite3, etc.) NATIVELY for each target arch under buildx.
+COPY package.json package-lock.json ./
+RUN PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --omit=dev --no-audit --no-fund
+
+# Install Playwright Chromium for the browser MCP (fast mode headless browsing, BRW-26).
+# The default cache (/root/.cache/ms-playwright) is root-only; redirect to a world-readable
+# path so the uid-1000 agent user can locate the browser binary at runtime.
+# Invoke cli.js directly: npm's .bin symlink for `playwright` does not
+# materialize under `npm ci --omit=dev` with the current lock (npm bin-link
+# quirk; package + cli.js ARE installed) — the bin path 127'd every build.
+# `install-deps` runs its own `apt-get install` for browser system deps (fonts,
+# libs). Line 53 above did `rm -rf /var/lib/apt/lists/*`, so without a fresh
+# `apt-get update` here apt cannot locate the font packages and the step fails
+# with "Unable to locate package" on a cache-miss arch (arm64 build, 2026-07-16).
+# Retry apt-get update: apt-cacher-ng can serve a BADSIG InRelease for
+# ports.ubuntu.com (arm64) after a partial fetch; a clean lists dir + retry
+# usually pulls a good copy without disabling signature checks.
+RUN set -eux; \
+    for attempt in 1 2 3 4 5; do \
+      rm -rf /var/lib/apt/lists/*; \
+      if apt-get -o Acquire::Retries=3 update; then break; fi; \
+      echo "apt-get update failed (attempt ${attempt}); retrying..." >&2; \
+      sleep $((attempt * 3)); \
+      if [ "$attempt" -eq 5 ]; then exit 1; fi; \
+    done; \
+    node -e 'const fs=require("fs"); const bs=require("./node_modules/playwright-core/browsers.json").browsers; for (const n of ["chromium","chromium-headless-shell","ffmpeg"]) { const b=bs.find(x=>x.name===n); if (!b) throw new Error(`missing Playwright browser metadata: ${n}`); const d=`${n.replaceAll("-","_")}-${b.revision}`; if (!fs.existsSync(`/opt/playwright-browsers/${d}`)) throw new Error(`qualified browser donor mismatch: ${d}`); }'; \
+    node ./node_modules/playwright/cli.js install-deps chromium; \
+    rm -rf /var/lib/apt/lists/*; \
+    chmod -R 755 /opt/playwright-browsers
+
+# ── Layer 5b: Node.js global CLIs — ALL harnesses pinned for reproducibility +
+# HIVE-600 fleet version tracking. The CI-supplied ARGs drive installation,
+# the version ledger, and OCI labels together; never duplicate literal pins in
+# metadata or a correctly upgraded binary will still report as stale.
+# NOTE: in-pod `npm i -g` harness upgrades are EPHEMERAL — pod restarts revert
+# to these baked pins; the ONLY durable upgrade is a new image + manifest bump.
+# ORDERING: install global harnesses after heavy base layers but before volatile
+# SCLI dist and skill content. Source-only builds then reuse this expensive layer;
+# a changed version-lock COPY is the only intended invalidator.
+# Harness pins are ARGs so CI (build-agent-runtime.yml) can bump any single
+# harness — e.g. claude-code 2.1.206→2.1.207 — without editing the Dockerfile.
+# Defaults track the current fleet build; the harness-versions.json + LABELs
+# below are rendered from these ARGs so Hive's version drift view stays honest.
+ARG CLAUDE_CODE_VERSION=2.1.211
+ARG CODEX_VERSION=0.144.5
+ARG OPENCLAW_VERSION=2026.7.1
+# Antigravity CLI (agy) — official Google release channel (native binary).
+# Gemini CLI is permanently removed from the agent image.
+ARG ANTIGRAVITY_VERSION=1.1.11
+# This generated lock is intentionally COPYed immediately before the install.
+# Its content changes whenever any resolved harness version changes, forcing a
+# Kaniko parent-layer cache miss even under --use-new-run. Without it, Kaniko
+# reused an older global-install layer while emitting newer OCI labels.
+COPY .harness-build-versions.lock /opt/shizuha/.harness-build-versions.lock
+# The install is followed, IN THE SAME LAYER, by proof that each harness really
+# executes. npm treats a platform-native optionalDependency whose tarball fetch
+# fails as non-fatal: it exits 0 having installed a launcher whose binary is
+# missing. That shipped harness-202607250300 with an empty
+# @anthropic-ai/claude-code/node_modules/@anthropic-ai/ on arm64 ("Error: claude
+# native binary not installed") and took the entire Claude tier down.
+#
+# Verifying HERE — not only in the CI smoke Job — is what breaks the nastier
+# second-order failure: a RUN that exits 0 gets its layer CACHED, and the
+# version lock above cannot force a miss while the resolved harness versions are
+# unchanged. Four consecutive "successful" builds therefore re-served the same
+# poisoned 03:17 layer. A FAILING RUN caches nothing, so the next build is
+# guaranteed to re-attempt a clean install instead of inheriting the damage.
+RUN grep -qx "claude_code=${CLAUDE_CODE_VERSION}" /opt/shizuha/.harness-build-versions.lock \
+ && grep -qx "codex=${CODEX_VERSION}" /opt/shizuha/.harness-build-versions.lock \
+ && grep -qx "antigravity=${ANTIGRAVITY_VERSION}" /opt/shizuha/.harness-build-versions.lock \
+ && grep -qx "openclaw=${OPENCLAW_VERSION}" /opt/shizuha/.harness-build-versions.lock \
+ && npm install -g \
+      @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
+      @openai/codex@${CODEX_VERSION} \
+      openclaw@${OPENCLAW_VERSION} \
+      typescript tsx prettier eslint \
+ && for cli in claude codex openclaw; do \
+      "$cli" --version >/dev/null 2>&1 \
+        || { echo "FATAL: '$cli' installed but does not execute (native binary missing?)" >&2; \
+             "$cli" --version || true; exit 1; }; \
+    done \
+ && case "${TARGETARCH}" in \
+      amd64) AGY_PLATFORM=linux_amd64 ;; \
+      arm64) AGY_PLATFORM=linux_arm64 ;; \
+      *) echo "FATAL: unsupported TARGETARCH=${TARGETARCH} for Antigravity CLI" >&2; exit 1 ;; \
+    esac \
+ && AGY_MANIFEST_URL="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/${AGY_PLATFORM}.json" \
+ && curl -fsSL --retry 4 --retry-all-errors --retry-delay 3 --retry-max-time 120 "$AGY_MANIFEST_URL" -o /tmp/agy-manifest.json \
+ && AGY_URL="$(python3 -c 'import json; print(json.load(open("/tmp/agy-manifest.json"))["url"])')" \
+ && AGY_SHA="$(python3 -c 'import json; print(json.load(open("/tmp/agy-manifest.json"))["sha512"])')" \
+ && AGY_VER="$(python3 -c 'import json; print(json.load(open("/tmp/agy-manifest.json"))["version"])')" \
+ && [ "$AGY_VER" = "${ANTIGRAVITY_VERSION}" ] \
+      || { echo "FATAL: antigravity manifest version ${AGY_VER} != pin ${ANTIGRAVITY_VERSION}" >&2; exit 1; } \
+ && curl -fsSL --retry 4 --retry-all-errors --retry-delay 3 --retry-max-time 180 "$AGY_URL" -o /tmp/agy.tgz \
+ && echo "${AGY_SHA}  /tmp/agy.tgz" | sha512sum -c - \
+ && mkdir -p /tmp/agy-extract \
+ && tar -xzf /tmp/agy.tgz -C /tmp/agy-extract \
+ && AGY_BIN="$(find /tmp/agy-extract -type f \( -name agy -o -name antigravity \) | head -1)" \
+ && [ -n "$AGY_BIN" ] || { echo "FATAL: agy binary missing from release tarball" >&2; ls -laR /tmp/agy-extract; exit 1; } \
+ && install -m 0755 "$AGY_BIN" /usr/local/bin/agy \
+ && ln -sfn /usr/local/bin/agy /usr/local/bin/antigravity \
+ && rm -rf /tmp/agy.tgz /tmp/agy-extract /tmp/agy-manifest.json \
+ && ! command -v gemini >/dev/null 2>&1 \
+      || { echo "FATAL: gemini CLI must not be present (replaced by agy)" >&2; exit 1; } \
+ && agy --version >/dev/null 2>&1 \
+      || { echo "FATAL: 'agy' installed but does not execute" >&2; agy --version || true; exit 1; } \
+ && antigravity --version >/dev/null 2>&1 \
+      || { echo "FATAL: 'antigravity' symlink broken" >&2; exit 1; }
+
+# dist (esbuild output) is arch-independent JS and bundles templates/web plus
+# the small integration fallback set. The full operating catalog follows.
+COPY dist ./dist
+
+# The full operating-skill catalog is a separate canonical repository. CI
+# materializes the exact revision from runtime-skills.lock into this build
+# context before kaniko starts. Keep it as an immutable image layer: every
+# k3s-native agent must be able to load its Hive-configured skills without a
+# network clone, while the revision pin keeps amd64 and arm64 byte-identical.
+ARG SKILLS_SOURCE_SHA=unknown
+COPY .runtime-skills /opt/skills
+RUN skill_count="$(find /opt/skills -mindepth 2 -maxdepth 2 -name SKILL.md | wc -l)" \
+ && [ "$skill_count" -ge 50 ] \
+ && test ! -e /opt/skills/.git \
+ && for skill in skill-loader engineering-core fix-root-cause live-verification heartbeat-protocol; do \
+      test -s "/opt/skills/${skill}/SKILL.md"; \
+    done \
+ && printf '%s\n' "$SKILLS_SOURCE_SHA" > /opt/skills/.source-revision
+
+# Keep the cheap, source-specific ledger separate from global npm installation.
+# SCLI_VERSION advances on every source build; folding it into the npm RUN cache
+# key made unchanged harness installs take minutes on every commit.
+ARG SCLI_VERSION=unknown
+ARG SCLI_SOURCE_SHA=unknown
+RUN printf '{"codex":"%s","claude_code":"%s","antigravity":"%s","openclaw":"%s","scli":"%s"}\n' \
+      "${CODEX_VERSION}" "${CLAUDE_CODE_VERSION}" "${ANTIGRAVITY_VERSION}" "${OPENCLAW_VERSION}" "${SCLI_VERSION:-unknown}" \
+      > /opt/shizuha/harness-versions.json
+
+# HIVE-600: self-describing harness versions, readable from the registry manifest
+# config (no pod exec) so Hive can surface fleet-wide version drift + upgrades.
+# scli = OUR OWN harness (the shizuha runtime dist baked above at Layer 5);
+# version scheme <pkgver>.<distBuildStampUTC> so numeric semver comparison works.
+# org.shizuha.harness.gemini is intentionally ABSENT — Gemini CLI removed.
+LABEL org.shizuha.harness.codex="${CODEX_VERSION}" \
+      org.shizuha.harness.claude_code="${CLAUDE_CODE_VERSION}" \
+      org.shizuha.harness.antigravity="${ANTIGRAVITY_VERSION}" \
+      org.shizuha.harness.openclaw="${OPENCLAW_VERSION}" \
+      org.shizuha.harness.scli="${SCLI_VERSION}" \
+      org.shizuha.skills.revision="${SKILLS_SOURCE_SHA}" \
+      org.opencontainers.image.revision="${SCLI_SOURCE_SHA}"
+
+# ── Layer 6: entrypoint (single-agent bridge, env-driven) ──
+COPY agent-runtime-entrypoint.sh /usr/local/bin/agent-runtime-entrypoint.sh
+RUN chmod +x /usr/local/bin/agent-runtime-entrypoint.sh
+
+# Pre-create .shizuha so the browser-profile subdir can be created by uid 1000 (BRW-26).
+RUN mkdir -p /home/agent/.shizuha && chown -R agent:agent /home/agent
+
+ENV SHIZUHA_DIST=/opt/shizuha/dist
+ENV HOME=/home/agent
+USER agent
+WORKDIR /home/agent
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/agent-runtime-entrypoint.sh"]

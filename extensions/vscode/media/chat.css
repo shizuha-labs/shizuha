@@ -1,0 +1,36 @@
+:root { color-scheme: light dark; }
+body { margin: 0; font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); }
+main { display: flex; flex-direction: column; height: 100vh; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 0.75rem; border-bottom: 1px solid var(--vscode-panel-border); }
+#status { font-size: 0.8rem; color: var(--vscode-descriptionForeground); }
+#turns { flex: 1; overflow: auto; padding: 0.75rem; }
+.turn { margin-bottom: 0.75rem; padding: 0.65rem; border-radius: 8px; border: 1px solid var(--vscode-panel-border); }
+.turn.user { background: var(--vscode-input-background); }
+.turn.assistant { background: var(--vscode-sideBar-background); }
+.role { font-size: 0.72rem; text-transform: uppercase; color: var(--vscode-descriptionForeground); margin-bottom: 0.35rem; }
+.content { white-space: pre-wrap; line-height: 1.45; }
+.tool { margin-top: 0.5rem; font-size: 0.85rem; }
+.tool pre { white-space: pre-wrap; overflow: auto; }
+.diff-block { margin-top: 0.5rem; padding: 0.5rem; border: 1px solid var(--vscode-panel-border); border-radius: 6px; background: var(--vscode-editor-inactiveSelectionBackground); }
+.diff-block.diff-accepted { border-color: var(--vscode-testing-iconPassed); }
+.diff-block.diff-rejected { border-color: var(--vscode-testing-iconFailed); opacity: 0.6; }
+.diff-header { font-weight: 600; font-size: 0.85rem; margin-bottom: 0.25rem; }
+.diff-file { font-size: 0.75rem; color: var(--vscode-descriptionForeground); margin-bottom: 0.35rem; }
+.diff-content { white-space: pre-wrap; overflow: auto; font-size: 0.8rem; max-height: 12rem; margin: 0.35rem 0; padding: 0.35rem; background: var(--vscode-editor-background); border-radius: 4px; }
+.diff-unsupported { font-style: italic; color: var(--vscode-descriptionForeground); padding: 0.5rem 0; }
+.diff-actions { display: flex; gap: 0.5rem; margin-top: 0.35rem; }
+.diff-accept { background: var(--vscode-testing-iconPassed); color: var(--vscode-button-foreground); border: none; padding: 0.25rem 0.75rem; border-radius: 4px; font-size: 0.8rem; }
+.diff-reject { background: var(--vscode-testing-iconFailed); color: var(--vscode-button-foreground); border: none; padding: 0.25rem 0.75rem; border-radius: 4px; font-size: 0.8rem; }
+.diff-badge { display: inline-block; font-size: 0.7rem; text-transform: uppercase; padding: 0.15rem 0.5rem; border-radius: 3px; margin-top: 0.25rem; }
+.diff-badge-accepted { background: var(--vscode-testing-iconPassed); color: var(--vscode-button-foreground); }
+.diff-badge-rejected { background: var(--vscode-testing-iconFailed); color: var(--vscode-button-foreground); }
+.diff-badge-partial { background: var(--vscode-editorInfo-foreground); color: var(--vscode-button-foreground); }
+.error { margin-top: 0.5rem; padding: 0.5rem; border: 1px solid var(--vscode-inputValidation-errorBorder); background: var(--vscode-inputValidation-errorBackground); }
+.error-code { font-weight: 700; }
+form { display: grid; grid-template-columns: 1fr auto auto; gap: 0.5rem; padding: 0.75rem; border-top: 1px solid var(--vscode-panel-border); }
+textarea { grid-column: 1 / -1; min-height: 5rem; resize: vertical; }
+input, textarea, button { font: inherit; }
+button { cursor: pointer; }
+button:disabled, textarea:disabled { opacity: 0.55; cursor: not-allowed; }
+.meta { display: flex; gap: 0.5rem; }
+.meta input { width: 10rem; }

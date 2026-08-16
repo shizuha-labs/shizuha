@@ -1,0 +1,9 @@
+[Unit]
+Description=Run agent roster watcher hourly (AT-113)
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,44 @@
+# Gitleaks configuration for Shizuha
+# Run locally: gitleaks detect --source . --verbose
+#
+# Known boundary: Base64-encoded raw key bytes (without PEM headers)
+# are not reliably detected — they are indistinguishable from other
+# base64 data. This is an accepted limitation.
+
+title = "Shizuha Secret Scan"
+
+[allowlist]
+  paths = [
+    '''node_modules/''',
+    '''\.md$''',
+    '''tests/''',
+    '''scripts/rotate-agent-keypair\.sh$''',
+  ]
+
+# Rule 1: PEM-encoded private keys (RSA, EC, DSA, Ed25519, generic PKCS#8)
+[[rules]]
+  id = "pem-private-key"
+  description = "PEM-encoded private key (RSA, EC, DSA, Ed25519)"
+  regex = '''-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'''
+  tags = ["key", "private"]
+
+# Rule 2: Hex-encoded private key in JSON fields (64+ hex chars)
+[[rules]]
+  id = "hex-private-key-json"
+  description = "Hex-encoded private key value in JSON field"
+  regex = '''["'](?:private[Kk]ey|privateKeyPem|x25519Private|secretKey)["']\s*:\s*["'][0-9a-fA-F]{64,}["']'''
+  tags = ["key", "private", "json"]
+
+# Rule 3: Hex-encoded PKCS#8 DER private keys (ASN.1 SEQUENCE header)
+[[rules]]
+  id = "pkcs8-der-hex"
+  description = "Hex-encoded PKCS#8 DER private key (ASN.1 SEQUENCE header)"
+  regex = '''302[0-9a-f]020100300[0-9a-f]06[0-9a-f]{4,}'''
+  tags = ["key", "private", "der"]
+
+# Rule 4: Raw Ed25519/x25519 private key in named fields
+[[rules]]
+  id = "ed25519-raw-private-hex"
+  description = "Raw Ed25519 or x25519 private key in named variable or field"
+  regex = '''(?i)(?:ed25519|x25519|signing|identity)[_-]?(?:private|secret|priv)[_-]?(?:key)?["']?\s*[:=]\s*["']?[0-9a-fA-F]{64,}'''
+  tags = ["key", "private", "ed25519"]

@@ -1,0 +1,14 @@
+[Unit]
+Description=RETIRED legacy Shizuha SCLI host publisher
+ConditionPathExists=!/
+RefuseManualStart=yes
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=phoenix
+Environment=HOME=/home/phoenix
+WorkingDirectory=/home/phoenix/work/shizuha-stack/cli/rt-build
+ExecStart=/home/phoenix/work/shizuha-stack/cli/rt-build/build-all-platforms.sh
+TimeoutStartSec=2400

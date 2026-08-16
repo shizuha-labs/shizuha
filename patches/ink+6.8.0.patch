@@ -1,0 +1,39 @@
+diff --git a/node_modules/ink/build/components/ErrorOverview.js b/node_modules/ink/build/components/ErrorOverview.js
+index 0394d90..5053644 100644
+--- a/node_modules/ink/build/components/ErrorOverview.js
++++ b/node_modules/ink/build/components/ErrorOverview.js
+@@ -45,29 +45,29 @@ export default function ErrorOverview({ error }) {
+                 origin.line,
+                 ":",
+                 origin.column))),
+-        origin && excerpt && (React.createElement(Box, { marginTop: 1, flexDirection: "column" }, excerpt.map(({ line, value }) => (React.createElement(Box, { key: line },
++        origin && excerpt && (React.createElement(Box, { marginTop: 1, flexDirection: "column" }, excerpt.map(({ line, value }, idx) => (React.createElement(Box, { key: `excerpt-${idx}` },
+             React.createElement(Box, { width: lineWidth + 1 },
+                 React.createElement(Text, { dimColor: line !== origin.line, backgroundColor: line === origin.line ? 'red' : undefined, color: line === origin.line ? 'white' : undefined, "aria-label": line === origin.line
+                         ? `Line ${line}, error`
+                         : `Line ${line}` },
+                     String(line).padStart(lineWidth, ' '),
+                     ":")),
+-            React.createElement(Text, { key: line, backgroundColor: line === origin.line ? 'red' : undefined, color: line === origin.line ? 'white' : undefined }, ' ' + value)))))),
++            React.createElement(Text, { backgroundColor: line === origin.line ? 'red' : undefined, color: line === origin.line ? 'white' : undefined }, ' ' + value)))))),
+         error.stack && (React.createElement(Box, { marginTop: 1, flexDirection: "column" }, error.stack
+             .split('\n')
+             .slice(1)
+-            .map(line => {
++            .map((line, idx) => {
+             const parsedLine = stackUtils.parseLine(line);
+             // If the line from the stack cannot be parsed, we print out the unparsed line.
+             if (!parsedLine) {
+-                return (React.createElement(Box, { key: line },
++                return (React.createElement(Box, { key: `stack-${idx}` },
+                     React.createElement(Text, { dimColor: true }, "- "),
+                     React.createElement(Text, { dimColor: true, bold: true },
+                         line,
+                         "\\t",
+                         ' ')));
+             }
+-            return (React.createElement(Box, { key: line },
++            return (React.createElement(Box, { key: `stack-${idx}` },
+                 React.createElement(Text, { dimColor: true }, "- "),
+                 React.createElement(Text, { dimColor: true, bold: true }, parsedLine.function),
+                 React.createElement(Text, { dimColor: true, color: "gray", "aria-label": `at ${cleanupPath(parsedLine.file) ?? ''} line ${parsedLine.line} column ${parsedLine.column}` },

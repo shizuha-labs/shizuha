@@ -1,0 +1,11 @@
+.git
+node_modules
+**/node_modules
+benchmark
+rt-build
+releases
+**/*.bak
+**/*.bak.*
+*.log
+*.db
+src/web

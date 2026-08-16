@@ -1,0 +1,9 @@
+# PLAT-5408 AC4: digest-pin the control-proxy base so later registry GC/tag reuse
+# cannot silently change what the control proxy runs. Blob-audited 2026-08-10
+# (config 200, layers 7/7) — this is the last shizuha-runtime-fleet-base reference
+# on master; build-publish-scli.yml in-image jobs were already migrated off it.
+# Tag amd64-20260606 is intentionally MIGRATED SHAs (no SHA); fleet-base is being
+# retired in favour of the maintained multi-arch shizuha-agent-runtime per PLAT-5408.
+FROM localhost:30500/shizuha-runtime-fleet-base@sha256:9b39facdd6324508e5b48be5bbb52d57b356b19619f64c1fa4f10869deb8573f
+
+COPY dist/ /opt/shizuha/dist/

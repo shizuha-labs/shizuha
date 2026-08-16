@@ -1,0 +1,58 @@
+name: security-ci-parity
+on:
+  pull_request:
+    paths:
+      - .forgejo/workflows/security-ci.yml
+      - .forgejo/workflows/security-ci-parity.yml
+      - scripts/check-security-ci-contract.py
+      - scripts/security-ci-to-pulse.py
+  workflow_dispatch: {}
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+      - name: Validate vendored security-ci contract and bytes
+        run: |
+          # PLAT-5093: validate the complete four-file bundle inline.  This does
+          # not trust the checker from the same PR to attest to its own bytes.
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import re
+
+          expected_bundle = "a6e381c3e586eb64b0f03a6475ca2a2730b729ecb922cb1d5f1b982e6e774cad"
+          paths = sorted([
+              ".forgejo/workflows/security-ci.yml",
+              ".forgejo/workflows/security-ci-parity.yml",
+              "scripts/check-security-ci-contract.py",
+              "scripts/security-ci-to-pulse.py",
+          ])
+          digest = hashlib.sha256()
+          for path in paths:
+              data = pathlib.Path(path).read_bytes()
+              if path == ".forgejo/workflows/security-ci-parity.yml":
+                  data = re.sub(
+                      rb'expected_bundle = "[0-9a-f]{64}"',
+                      b'expected_bundle = "' + (b'0' * 64) + b'"',
+                      data,
+                      count=1,
+                  )
+              digest.update(path.encode())
+              digest.update(b"\0")
+              digest.update(str(len(data)).encode())
+              digest.update(b"\0")
+              digest.update(data)
+              digest.update(b"\0")
+          actual = digest.hexdigest()
+          if actual != expected_bundle:
+              raise SystemExit(
+                  f"security-ci bundle sha256 mismatch: expected {expected_bundle}, got {actual}"
+              )
+          print(f"security-ci bundle: ok ({actual})")
+          PY
+          python3 scripts/check-security-ci-contract.py \
+            --workflow .forgejo/workflows/security-ci.yml \
+            --expected-sha256 d1d871eb1bbeb20278d2afbe7c368d6d3ba21566132ff038acd8719a3befbe52

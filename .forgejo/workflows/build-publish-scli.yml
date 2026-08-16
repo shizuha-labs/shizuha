@@ -1,0 +1,463 @@
+# Shizuha Origin CI — SCLI-126: automated stable SCLI build → publish to the
+# Forgejo `scli-builds` package registry, which a singleton
+# `builds-scli-publisher` Job (ns builds, CI-triggered, PLAT-6172) mirrors
+# to https://shizuha.com/builds/releases/ and `install.sh` consumes.
+#
+# What it does (per platform): builds the `shizuha` CLI exactly like release.yml
+# (npm ci --registry=http://npm-cache.registry.svc.cluster.local:4873 -> npm run build -> bundle Node 22.14.0 + prod deps + launcher -> tar),
+# computes sha256/size, uploads both native builds to one run-immutable package
+# version, and promotes `release.json` last as the coherent release pointer.
+# The builds publisher mirrors only that committed release.
+#
+# Multi-arch: native compilation per arch (better-sqlite3 etc. ship arch-specific
+# .node), so each linux target builds in an in-cluster node:22-bookworm Job pinned
+# to a matching-arch node (amd64 = s1, arm64 = gx10) — no QEMU. macOS/darwin builds
+# on the Mac host (`ssh shizuha-mb@v4`) are Phase 2 (needs MAC_SSH_KEY) — intentionally
+# not stubbed as a disabled job (SCLI-364: `if: false` false-failed the whole run).
+#
+# Trigger: source pushes, manual dispatch, and version tags. Rebuilding an
+# unchanged SHA nightly produced byte-different tarballs and needless client
+# updates, so freshness is source-driven and idempotent.
+name: build-publish-scli
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for the artifact (default: package.json version + CI build id)"
+        required: false
+        default: ""
+  push:
+    branches: [main, master]
+    tags:
+      - "v*"
+concurrency:
+  group: build-publish-scli-${{ github.ref }}
+  # Publishing SCLI packages is a release operation. A newer source event must
+  # queue behind the active release instead of abandoning external build Jobs.
+  # (HostPath runtime-fleet dist stage is RETIRED — agents ship via images.)
+  cancel-in-progress: false
+
+jobs:
+  build-publish-linux:
+    # This job publishes the controller/runtime artifacts and drives in-cluster
+    # build Jobs. Keep it on the dedicated deployment lane so ordinary portfolio
+    # test traffic cannot starve a fleet release after its runtime image is ready.
+    runs-on: deploy-lane
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Build + publish all linux targets
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          RUN_NUMBER="${{ github.run_number }}"
+          RUN_ATTEMPT="${{ github.run_attempt }}"
+          RELEASE_ID="${SHORT}-${RUN_NUMBER}-a${RUN_ATTEMPT}"
+          REGISTRY_BASE="http://forgejo-http.origin.svc.cluster.local:80/api/packages/shizuha-labs/generic/scli-builds/${RELEASE_ID}"
+
+          render_build_job() {  # $1=arch (amd64|arm64)  $2=target (linux-x64|linux-arm64)
+            local ARCH="$1" TARGET="$2"
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-scli-${SHORT}-${TARGET}
+            namespace: build
+            labels: { app: ci-scli-build, shizuha.io/task: SCLI-126 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                containers:
+                  - name: build
+                    image: node:22-bookworm
+                    command: ["/bin/bash","-c"]
+                    resources:
+                      requests:
+                        cpu: "1"
+                        memory: 2Gi
+                      limits:
+                        cpu: "4"
+                        memory: 16Gi
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                      - name: FORGEJO_TOKEN
+                        # Managed out-of-band in ns/build. The deployer identity
+                        # intentionally cannot read or mutate Secrets; the build
+                        # pod consumes only this pre-provisioned package token.
+                        valueFrom: { secretKeyRef: { name: scli-forgejo-token, key: token } }
+                      - name: TARGET
+                        value: "${TARGET}"
+                      - name: REGISTRY_BASE
+                        value: "${REGISTRY_BASE}"
+                      - name: VERSION_OVERRIDE
+                        value: "${{ github.event.inputs.version }}"
+                      - name: CI_RUN_NUMBER
+                        value: "${{ github.run_number }}"
+                      - name: CI_SOURCE_SHA
+                        value: "${{ github.sha }}"
+                      - name: CI_SOURCE_REF
+                        value: "${{ github.ref }}"
+                    args:
+                      - |
+                        set -euo pipefail
+                        PLAT="\${TARGET%-*}"; ARCH_N="\${TARGET#*-}"; NODE_VERSION="22.14.0"
+                        # Pin to the exact triggering SHA (SCLI-364 / alert #22345).
+                        # depth=1 of default branch can race the push tip and is not
+                        # the commit Forgejo reported as failing.
+                        test -n "\${CI_SOURCE_SHA:-}"
+                        git init /src
+                        cd /src
+                        git remote add origin "http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git"
+                        git fetch --depth=1 origin "\${CI_SOURCE_SHA}"
+                        git checkout --detach FETCH_HEAD
+                        test "\$(git rev-parse HEAD)" = "\${CI_SOURCE_SHA}"
+                        BASE_VERSION="\$(node -p "require('./package.json').version")"
+                        SHORT_SHA="\$(printf '%s' "\${CI_SOURCE_SHA}" | cut -c1-7)"
+                        if [ -n "\${VERSION_OVERRIDE:-}" ]; then
+                          VERSION="\${VERSION_OVERRIDE}"
+                        elif printf '%s' "\${CI_SOURCE_REF:-}" | grep -q '^refs/tags/v'; then
+                          VERSION="\${CI_SOURCE_REF#refs/tags/v}"
+                        else
+                          # Automatic source-derived build identity. Keep it URL/file-name
+                          # friendly: prerelease identifiers avoid '+' escaping surprises.
+                          VERSION="\${BASE_VERSION}-sha.\${SHORT_SHA}"
+                        fi
+                        NAME="shizuha-\${VERSION}-\${TARGET}"
+                        echo "Building \${NAME}"
+                        npm ci --registry=http://npm-cache.registry.svc.cluster.local:4873
+                        npm run build
+                        # --- package exactly like release.yml ---
+                        mkdir -p "/out/\${NAME}"/{bin,lib}
+                        # PLAT-4678: Node tarball vendored in the Origin package registry — no WAN.
+                        NODE_URL="http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/node/v\${NODE_VERSION}/node-v\${NODE_VERSION}-\${PLAT}-\${ARCH_N}.tar.xz"
+                        curl -fSL "\$NODE_URL" -o /tmp/node.tar
+                        SD="node-v\${NODE_VERSION}-\${PLAT}-\${ARCH_N}"
+                        tar xJf /tmp/node.tar -C /tmp "\${SD}/bin/node" "\${SD}/bin/npm" "\${SD}/bin/npx" "\${SD}/lib/"
+                        mv "/tmp/\${SD}/bin/node" "/out/\${NAME}/bin/node"
+                        mv "/tmp/\${SD}/bin/npm"  "/out/\${NAME}/bin/npm"
+                        mv "/tmp/\${SD}/bin/npx"  "/out/\${NAME}/bin/npx"
+                        cp -r "/tmp/\${SD}/lib" "/out/\${NAME}/"
+                        cp dist/shizuha.js "/out/\${NAME}/lib/shizuha.js"
+                        [ -d dist/web ] && cp -r dist/web "/out/\${NAME}/lib/web" || true
+                        [ -d dist/templates ] && cp -r dist/templates "/out/\${NAME}/lib/templates" || true
+                        cp package.json "/out/\${NAME}/lib/package.json"
+                        cp package-lock.json "/out/\${NAME}/lib/package-lock.json"
+                        # Materialize the small production tree without running native
+                        # lifecycle scripts a second time. Re-running better-sqlite3's
+                        # install hook failed arm64 after an otherwise-good build.
+                        ( cd "/out/\${NAME}/lib" && PATH="\$(pwd)/../bin:\$PATH" npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry=http://npm-cache.registry.svc.cluster.local:4873 )
+                        BUILD_ABI="\$(node -p 'process.versions.modules')"
+                        BUNDLED_ABI="\$(/out/\${NAME}/bin/node -p 'process.versions.modules')"
+                        test "\$BUILD_ABI" = "\$BUNDLED_ABI"
+                        mkdir -p "/out/\${NAME}/lib/node_modules/better-sqlite3/build/Release"
+                        cp node_modules/better-sqlite3/build/Release/better_sqlite3.node \
+                          "/out/\${NAME}/lib/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+                        test -f "/out/\${NAME}/lib/node_modules/pino/package.json"
+                        test -f "/out/\${NAME}/lib/node_modules/better-sqlite3/package.json"
+                        cat > "/out/\${NAME}/bin/shizuha" <<'WRAP'
+                        #!/usr/bin/env bash
+                        SHIZUHA_ROOT="\$(cd "\$(dirname "\$0")/.." && pwd)"
+                        export PATH="\$SHIZUHA_ROOT/bin:\$PATH"
+                        exec "\$SHIZUHA_ROOT/bin/node" "\$SHIZUHA_ROOT/lib/shizuha.js" "\$@"
+                        WRAP
+                        chmod +x "/out/\${NAME}/bin/shizuha"
+                        echo "\$VERSION" > "/out/\${NAME}/VERSION"
+                        ( cd /out && tar czf "\${NAME}.tar.gz" "\${NAME}" )
+                        # --- sanity-gate the artifact before publishing ---
+                        set +e
+                        VOUT="\$(/out/\${NAME}/bin/shizuha --version 2>&1)"
+                        VRC=\$?
+                        set -e
+                        printf '%s\n' "\$VOUT"
+                        if [ "\$VRC" -ne 0 ]; then
+                          echo "FATAL: packaged shizuha --version failed (exit \$VRC)" >&2
+                          exit "\$VRC"
+                        fi
+                        VOUT="\$(printf '%s\n' "\$VOUT" | head -1)"
+                        echo "built --version: \$VOUT"
+                        grep -qi cortex "/out/\${NAME}/lib/shizuha.js" || { echo "FATAL: no cortex in bundle"; exit 1; }
+                        case "\$VOUT" in *codex*) echo "FATAL: built vanilla codex, not shizuha"; exit 1;; esac
+                        SHA="\$(sha256sum /out/\${NAME}.tar.gz | cut -d' ' -f1)"
+                        SIZE="\$(stat -c%s /out/\${NAME}.tar.gz)"
+                        PUBLISHED_AT="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                        cp install.sh /out/install.sh
+                        JSON_OUT="/out/\${TARGET}.json" \
+                        JSON_PLATFORM="\${TARGET}" \
+                        JSON_VERSION="\${VERSION}" \
+                        JSON_BASE_VERSION="\${BASE_VERSION}" \
+                        JSON_URL="https://shizuha.com/builds/releases/\${NAME}.tar.gz" \
+                        JSON_SHA256="\${SHA}" \
+                        JSON_SIZE="\${SIZE}" \
+                        JSON_SOURCE_SHA="\${CI_SOURCE_SHA}" \
+                        JSON_SOURCE_REF="\${CI_SOURCE_REF}" \
+                        JSON_RUN_NUMBER="\${CI_RUN_NUMBER:-}" \
+                        JSON_PUBLISHED_AT="\${PUBLISHED_AT}" \
+                        node -e 'const fs=require("fs"); const e=process.env; fs.writeFileSync(e.JSON_OUT, JSON.stringify({platform:e.JSON_PLATFORM, version:e.JSON_VERSION, baseVersion:e.JSON_BASE_VERSION, url:e.JSON_URL, sha256:e.JSON_SHA256, size:Number(e.JSON_SIZE), sourceSha:e.JSON_SOURCE_SHA, sourceRef:e.JSON_SOURCE_REF, runNumber:e.JSON_RUN_NUMBER, publishedAt:e.JSON_PUBLISHED_AT}) + "\n")'
+                        # Upload into this run's immutable staging version. No
+                        # mutable latest key is touched until both arches pass.
+                        for f in "\${NAME}.tar.gz" "\${TARGET}.json"; do
+                          curl -sSf -X PUT -H "Authorization: token \${FORGEJO_TOKEN}" -T "/out/\${f}" "\${REGISTRY_BASE}/\${f}"
+                        done
+                        # install.sh is platform-independent. Keep exactly one
+                        # writer per immutable release: parallel writers race
+                        # and Forgejo rejects the duplicate package file (409).
+                        if [ "\${TARGET}" = "linux-x64" ]; then
+                          curl -sSf -X PUT -H "Authorization: token \${FORGEJO_TOKEN}" -T /out/install.sh "\${REGISTRY_BASE}/install.sh"
+                        fi
+                        echo "PUBLISHED \${NAME}.tar.gz sha=\${SHA} size=\${SIZE}"
+                    volumeMounts:
+                      - { name: src, mountPath: /src }
+                      - { name: tmp, mountPath: /tmp }
+                      - { name: out, mountPath: /out }
+                volumes:
+                  - name: src
+                    emptyDir: { medium: Memory, sizeLimit: 8Gi }
+                  - name: tmp
+                    emptyDir: { medium: Memory, sizeLimit: 4Gi }
+                  - name: out
+                    emptyDir: { medium: Memory, sizeLimit: 8Gi }
+          YAML
+          }
+
+          # Launch both linux arches in parallel (amd64=s1, arm64=gx10).
+          # Forgejo cancellation stops the runner shell but not Kubernetes Jobs
+          # already created by an older source event. Reap only superseded active
+          # SCLI publishers so canceled runs cannot keep consuming build capacity.
+          for stale_job in $(kubectl get jobs -n build \
+            -l app=ci-scli-build \
+            -o go-template='{{range .items}}{{if .status.active}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}'); do
+            case "$stale_job" in
+              "ci-scli-${SHORT}-linux-x64"|"ci-scli-${SHORT}-linux-arm64") ;;
+              *) echo "Deleting superseded active SCLI publisher: $stale_job"; kubectl delete job -n build "$stale_job" --wait=false ;;
+            esac
+          done
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          AMD64_JOB="ci-scli-${SHORT}-linux-x64"
+          ARM64_JOB="ci-scli-${SHORT}-linux-arm64"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+          render_build_job amd64 linux-x64   | kubectl apply -f -
+          render_build_job arm64 linux-arm64 | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+
+          # Observe both jobs together. Sequential waits hid an arm64 failure for
+          # many minutes whenever the amd64 pod was pending, wedging a deploy slot.
+          while true; do
+            failed=""
+            complete=0
+            for target in linux-x64 linux-arm64; do
+              job="ci-scli-${SHORT}-${target}"
+              if kubectl get "job/${job}" -n build -o jsonpath='{.status.failed}' | grep -q '[1-9]'; then
+                failed="$failed $target"
+              elif kubectl get "job/${job}" -n build -o jsonpath='{.status.succeeded}' | grep -q '[1-9]'; then
+                complete=$((complete + 1))
+              fi
+            done
+            if [ -n "$failed" ]; then
+              for target in $failed; do
+                job="ci-scli-${SHORT}-${target}"
+                echo "::error::$target build+publish FAILED"
+                kubectl logs -n build "job/${job}" --all-containers --tail=120 || true
+              done
+              exit 1
+            fi
+            [ "$complete" -eq 2 ] && break
+            sleep 5
+          done
+          for target in linux-x64 linux-arm64; do
+            echo "::notice::$target build+publish OK"
+            kubectl logs -n build "job/ci-scli-${SHORT}-${target}" --tail=8 || true
+          done
+
+          # Promote one coherent release pointer only after both native builds
+          # and both archive checksums pass. Artifacts land before release.json;
+          # consumers use release.json as the atomic commit marker.
+          FINALIZE_JOB="ci-scli-finalize-${SHORT}-${RUN_NUMBER}-a${RUN_ATTEMPT}"
+          kubectl delete job -n build "${FINALIZE_JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${FINALIZE_JOB}
+            namespace: build
+            labels:
+              app: ci-scli-finalize
+              shizuha.io/source-sha: "${SHORT}"
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 300
+            ttlSecondsAfterFinished: 1800
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: finalize
+                    image: alpine:3.20
+                    env:
+                      - name: FORGEJO_TOKEN
+                        valueFrom: { secretKeyRef: { name: scli-forgejo-token, key: token } }
+                      - { name: CI_SOURCE_SHA, value: "${{ github.sha }}" }
+                      - { name: RELEASE_ID, value: "${RELEASE_ID}" }
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        sed -i "s#https://dl-cdn.alpinelinux.org#http://apk-cache.registry.svc.cluster.local#g" /etc/apk/repositories 2>/dev/null || true
+                        apk add --no-cache curl jq coreutils >/dev/null
+                        ROOT="http://forgejo-http.origin.svc.cluster.local:80/api/packages/shizuha-labs/generic/scli-builds"
+                        STAGE="\${ROOT}/\${RELEASE_ID}"
+                        LATEST="\${ROOT}/latest"
+                        AUTH="Authorization: token \${FORGEJO_TOKEN}"
+                        tmp="\$(mktemp -d)"
+                        for platform in linux-x64 linux-arm64; do
+                          curl -fsS -H "\${AUTH}" "\${STAGE}/\${platform}.json" -o "\${tmp}/\${platform}.json"
+                          test "\$(jq -r .sourceSha "\${tmp}/\${platform}.json")" = "\${CI_SOURCE_SHA}"
+                          artifact="\$(basename "\$(jq -r .url "\${tmp}/\${platform}.json")")"
+                          curl -fsS -H "\${AUTH}" "\${STAGE}/\${artifact}" -o "\${tmp}/\${artifact}"
+                          echo "\$(jq -r .sha256 "\${tmp}/\${platform}.json")  \${tmp}/\${artifact}" | sha256sum -c -
+                        done
+                        test "\$(jq -r .version "\${tmp}/linux-x64.json")" = "\$(jq -r .version "\${tmp}/linux-arm64.json")"
+                        curl -fsS -H "\${AUTH}" "\${STAGE}/install.sh" -o "\${tmp}/install.sh"
+                        jq -n \
+                          --arg releaseId "\${RELEASE_ID}" \
+                          --arg sourceSha "\${CI_SOURCE_SHA}" \
+                          --slurpfile x64 "\${tmp}/linux-x64.json" \
+                          --slurpfile arm64 "\${tmp}/linux-arm64.json" \
+                          '{
+                            schemaVersion: 1,
+                          releaseId: \$releaseId,
+                          sourceSha: \$sourceSha,
+                          version: \$x64[0].version,
+                          publishedAt: \$x64[0].publishedAt,
+                          platforms: {
+                            "linux-x64": \$x64[0],
+                            "linux-arm64": \$arm64[0]
+                          }
+                          }' > "\${tmp}/release.json"
+                        for platform in linux-x64 linux-arm64; do
+                          artifact="\$(basename "\$(jq -r .url "\${tmp}/\${platform}.json")")"
+                          for file in "\${artifact}" "\${platform}.json"; do
+                            curl -sS -X DELETE -H "\${AUTH}" "\${LATEST}/\${file}" >/dev/null || true
+                            curl -fsS -X PUT -H "\${AUTH}" -T "\${tmp}/\${file}" "\${LATEST}/\${file}"
+                          done
+                        done
+                        for file in install.sh release.json; do
+                          curl -sS -X DELETE -H "\${AUTH}" "\${LATEST}/\${file}" >/dev/null || true
+                          curl -fsS -X PUT -H "\${AUTH}" -T "\${tmp}/\${file}" "\${LATEST}/\${file}"
+                        done
+                        echo "PROMOTED releaseId=\${RELEASE_ID} sourceSha=\${CI_SOURCE_SHA}"
+          YAML
+          if ! kubectl wait -n build --for=condition=complete "job/${FINALIZE_JOB}" --timeout=360s; then
+            kubectl logs -n build "job/${FINALIZE_JOB}" --all-containers=true || true
+            exit 1
+          fi
+          kubectl logs -n build "job/${FINALIZE_JOB}" --all-containers=true
+
+      - name: Trigger publisher + indexer (singleton)
+        if: success()
+        run: |
+          # PLAT-6172: Origin is the only trigger. CronJobs are suspended.
+          # At most one in-flight Job per kind (never delete a Pending/Running Job).
+          set -euo pipefail
+          helper="${RUNNER_TEMP:-/tmp}/ensure-singleton-job.sh"
+          cat >"$helper" <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          NS="${1:?}" CRONJOB="${2:?}" JOB="${3:?}"
+          KUBECTL="${KUBECTL:-kubectl}"
+          if ! "$KUBECTL" -n "$NS" get cronjob "$CRONJOB" >/dev/null; then
+            echo "cronjob $NS/$CRONJOB not found" >&2
+            exit 1
+          fi
+          if "$KUBECTL" -n "$NS" get job "$JOB" >/dev/null 2>&1; then
+            raw="$("$KUBECTL" -n "$NS" get job "$JOB" -o jsonpath='{.status.succeeded}{"|"}{.status.failed}{"|"}{.status.active}{"|"}{.spec.completions}')"
+            succeeded="${raw%%|*}"; rest="${raw#*|}"
+            failed="${rest%%|*}"; rest="${rest#*|}"
+            active="${rest%%|*}"; completions="${rest#*|}"
+            succeeded="${succeeded:-0}"; failed="${failed:-0}"
+            active="${active:-0}"; completions="${completions:-1}"
+            if [ "$active" -gt 0 ] 2>/dev/null; then
+              echo "skip: $NS/$JOB already active"; exit 0
+            fi
+            if [ "$succeeded" -lt "$completions" ] 2>/dev/null && [ "$failed" -eq 0 ] 2>/dev/null; then
+              echo "skip: $NS/$JOB already queued"; exit 0
+            fi
+            echo "replace: $NS/$JOB terminal"
+            "$KUBECTL" -n "$NS" delete job "$JOB" --wait=true
+          fi
+          "$KUBECTL" -n "$NS" create job "$JOB" --from="cronjob/$CRONJOB"
+          echo "created: $NS/$JOB"
+          EOS
+          chmod +x "$helper"
+          "$helper" builds builds-scli-publisher builds-scli-publisher-run
+          "$helper" builds builds-release-indexer builds-release-indexer-run
+
+  # RETIRED (2026-08-06): hostPath dist stage + s1-pinned roll of
+  # shizuha-runtime-fleet. That path wrote cli/dist on the workstation via
+  # hostPath and accumulated multi-GB dist.previous-* trees. Agent fleet
+  # updates already ship via build-agent-runtime (multi-arch images → k3s).
+  # Control-plane pure cutover is fleet-daemon-k8s + agent-runtime image
+  # (no hostPath, no hostname pin). Do not re-add s1 hostPath staging.
+  deploy-runtime-fleet:
+    name: runtime-fleet hostPath stage (retired)
+    needs: [build-publish-linux]
+    runs-on: deploy-lane
+    steps:
+      - name: Confirm hostPath stage is retired
+        run: |
+          set -euo pipefail
+          echo "::notice::hostPath dist stage + s1 pin RETIRED"
+          echo "Agent pods: build-agent-runtime / harness images in k3s (not this job)."
+          echo "Hive fleet: SHIZUHA_DAEMON_RUNTIME=k8s only; no host shizuha up."
+          echo "CI does not write /home/phoenix/work/shizuha-stack/cli or roll s1 for SCLI dist."
+          echo "Pure control-plane path: fleet-daemon-k8s + agent-runtime image (no hostPath)."
+          # Explicit non-goals of this workflow after retirement:
+          test ! -f /tmp/should-not-stage-hostpath
+          exit 0
+
+  # Phase 2 (SCLI-126): macOS/darwin build on the Mac host (`ssh shizuha-mb@v4`)
+  # needs MAC_SSH_KEY + v4 Tailscale reachability. The previous `build-darwin`
+  # job stub used `if: false`, which under Forgejo Actions lands as `pending`
+  # and marks the whole publish run `failure` even when linux publish succeeds
+  # (SCLI-364 / recurring on-call pages). Do not re-add a disabled stub job —
+  # restore a real darwin job only when Phase 2 is wired end-to-end.
