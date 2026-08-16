@@ -188,11 +188,22 @@ export function isInvalidModelOrProviderFailure(input: {
   code?: string | number | null;
   type?: string | null;
   status?: number | null;
+  hadSuccessfulProviderTurn?: boolean;
 }): boolean {
   const code = String(input.code ?? '').toLowerCase();
   const type = String(input.type ?? '').toLowerCase();
   const msg = String(input.message ?? '').toLowerCase();
   const blob = `${msg} ${code} ${type}`;
+
+  // Cortex/vLLM mid-session "Model X is not available" is a drained-backend
+  // blip (Q4 compiler cell, 2026-08-15: llama.cpp stayed healthy). First-turn
+  // 404 / unknown id stays fail-fast (SCLI-384).
+  if (
+    input.hadSuccessfulProviderTurn
+    && /is not available/i.test(msg)
+  ) {
+    return false;
+  }
 
   if (
     code === 'model_not_found'
@@ -231,6 +242,7 @@ export function isTransientProviderFailure(input: {
   type?: string | null;
   retryable?: boolean | null;
   status?: number | null;
+  hadSuccessfulProviderTurn?: boolean;
 }): boolean {
   const code = String(input.code ?? '').toLowerCase();
   const type = String(input.type ?? '').toLowerCase();
@@ -250,6 +262,11 @@ export function isTransientProviderFailure(input: {
   // SCLI-384: invalid provider/model is never a transient upstream blip.
   if (isInvalidModelOrProviderFailure(input)) {
     return false;
+  }
+
+  // Mid-session Cortex "not available" is a drained replica, not a bad --model.
+  if (input.hadSuccessfulProviderTurn && /is not available/i.test(msg)) {
+    return true;
   }
 
   // Model exclusivity lease: another agent holds the sprint. Not a sick backend —

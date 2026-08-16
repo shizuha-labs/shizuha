@@ -2,7 +2,13 @@ import * as fs from 'node:fs';
 import type { Message, ContentBlock, ToolResultContent } from '../agent/types.js';
 import type { LLMProvider, ChatMessage } from '../provider/types.js';
 import { countTokens } from '../utils/tokens.js';
-import { estimateTokens, getSafetyFactor, compactionThresholdFor } from '../prompt/context.js';
+import {
+  estimateTokens,
+  getSafetyFactor,
+  compactionThresholdFor,
+  needsCompaction,
+  nextProviderCallFits,
+} from '../prompt/context.js';
 import { logger } from '../utils/logger.js';
 
 function parsePositiveIntEnv(name: string, fallback: number): number {
@@ -751,8 +757,19 @@ ${conversationText}`;
     );
   }
   const outputReserve = Math.min(16_384, Math.floor(maxTokens * 0.15));
+  const fitCeiling = Math.max(1_024, maxTokens - outputReserve);
+  const triggerTokens = maxTokens * compactionThresholdFor(maxTokens);
+  // Target MUST sit strictly below the proactive trigger. Targeting only the
+  // fit ceiling (window − 16k ≈ 85%) left a 70–85% band where compact
+  // "succeeded" and exec/loop then threw provider-call-headroom abort
+  // (Qwen3.8-27B-Q4 remaining-16, 2026-08-16). Hierarchical passes then
+  // shrink the 16k think suffix instead of killing the session.
+  const defaultTarget = Math.min(
+    fitCeiling,
+    Math.max(1_024, Math.floor(triggerTokens * 0.92)),
+  );
   const messagesBudget = Math.min(
-    maxTokens - outputReserve,
+    defaultTarget,
     options?.targetFinalTokens ?? Number.POSITIVE_INFINITY,
   );
   if (compactedTokens > messagesBudget) {
@@ -801,4 +818,59 @@ export async function compactMessagesRequired(
     throw new CompactionCapacityError('No model provider is available for required semantic compaction');
   }
   return compactMessages(messages, provider, model, maxTokens, options);
+}
+
+/**
+ * Automatic-loop compaction. Succeeds when the next provider call fits.
+ * A projection that still sits above the 70% trigger is a hold-off, not a
+ * session abort — the caller should skip the next proactive compact until
+ * the transcript grows. Throw the historical headroom error only when the
+ * next call cannot physically fit.
+ */
+export async function applyRequiredCompactionOrThrow(args: {
+  messages: Message[];
+  provider: LLMProvider | null | undefined;
+  model: string;
+  maxTokens: number;
+  overheadTokens?: number;
+  outputBudget?: number;
+  planFilePath?: string;
+}): Promise<{ messages: Message[]; reachedTrigger: boolean }> {
+  const overhead = args.overheadTokens ?? 0;
+  const outputBudget = args.outputBudget ?? 0;
+  let compacted: { messages: Message[]; compacted: boolean };
+  try {
+    compacted = await compactMessagesRequired(
+      args.messages,
+      args.provider,
+      args.model,
+      args.maxTokens,
+      { overheadTokens: overhead, force: true, planFilePath: args.planFilePath },
+    );
+  } catch (err) {
+    if (!(err instanceof CompactionCapacityError)) throw err;
+    if (nextProviderCallFits(args.messages, args.maxTokens, args.model, overhead, outputBudget)) {
+      logger.warn(
+        { err: err.message },
+        'Semantic compaction could not shrink to the proactive trigger; next provider call still fits — continuing',
+      );
+      return { messages: args.messages, reachedTrigger: false };
+    }
+    throw new Error('Semantic context compaction did not restore provider-call headroom');
+  }
+  if (!nextProviderCallFits(
+    compacted.messages, args.maxTokens, args.model, overhead, outputBudget,
+  )) {
+    throw new Error('Semantic context compaction did not restore provider-call headroom');
+  }
+  const reachedTrigger = !needsCompaction(
+    compacted.messages, args.maxTokens, args.model, overhead, outputBudget,
+  );
+  if (!reachedTrigger) {
+    logger.warn(
+      { maxTokens: args.maxTokens },
+      'Semantic compaction restored provider-call fit but not the proactive trigger — continuing with hold-off',
+    );
+  }
+  return { messages: compacted.messages, reachedTrigger };
 }

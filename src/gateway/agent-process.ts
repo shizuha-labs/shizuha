@@ -1532,21 +1532,18 @@ export class AgentProcess {
       try {
         const mentioned = new Set<string>();
         if (isLeanConversationalEnv()) {
-          // Fixed conversational head — do NOT scrape HEARTBEAT_TRIGGER /
-          // IDLE_HEARTBEAT_NUDGE (those named ~20 Pulse tools and busted SuperGrok cache).
           for (const name of LEAN_CONVERSATIONAL_MCP_TOOL_NAMES) mentioned.add(name);
-        } else {
-          const { HEARTBEAT_TRIGGER } = await import('../agent-base-instructions.js');
-          for (const name of extractMentionedMcpToolNames(this.systemPrompt)) mentioned.add(name);
-          for (const name of extractMentionedMcpToolNames(HEARTBEAT_TRIGGER)) mentioned.add(name);
-          for (const name of extractMentionedMcpToolNames(IDLE_HEARTBEAT_NUDGE)) mentioned.add(name);
-          try {
-            const persisted = JSON.parse(fs.readFileSync(this.activatedMcpToolsPath, 'utf-8')) as unknown;
-            if (Array.isArray(persisted)) {
-              for (const name of persisted) if (typeof name === 'string') mentioned.add(name);
-            }
-          } catch { /* first run or unreadable — fine */ }
         }
+        const { HEARTBEAT_TRIGGER } = await import('../agent-base-instructions.js');
+        for (const name of extractMentionedMcpToolNames(this.systemPrompt)) mentioned.add(name);
+        for (const name of extractMentionedMcpToolNames(HEARTBEAT_TRIGGER)) mentioned.add(name);
+        for (const name of extractMentionedMcpToolNames(IDLE_HEARTBEAT_NUDGE)) mentioned.add(name);
+        try {
+          const persisted = JSON.parse(fs.readFileSync(this.activatedMcpToolsPath, 'utf-8')) as unknown;
+          if (Array.isArray(persisted)) {
+            for (const name of persisted) if (typeof name === 'string') mentioned.add(name);
+          }
+        } catch { /* first run or unreadable — fine */ }
         const preactivated = addExplicitlyMentionedMcpTools(
           this.toolDefs,
           this.toolRegistry.definitions(),
@@ -1561,9 +1558,8 @@ export class AgentProcess {
       } catch { /* diagnostics-only compatibility optimization — never block setup */ }
     }
 
-    // Talk seats reply via Connect auto-reply. Advertising Pulse/wiki tools
-    // starts a multi-round tool loop that holds the single-task inbox and
-    // looks like a dead turn to the next human DM.
+    // Opt-in only (SHIZUHA_TALK_SUPPRESS_TOOLS=1). CEO Office seats advertise
+    // tools and run a normal tool loop — empty tools[] made Ena narrate Pulse.
     if (talkSeatSuppressesTools()) {
       this.toolDefs = [];
       logger.info('Talk seat: empty tools[] (one-shot auto-reply; no Pulse/wiki loops)');
@@ -4361,16 +4357,10 @@ export class AgentProcess {
       ...extractMentionedMcpToolNames(msg.content),
       ...extractMentionedMcpToolNames(this.messages.at(-1)?.content),
     ]);
-    // Lean seats already declare the Pulse work head. Do not grow tools[]
-    // from heartbeat/user text — that rewrite is the SuperGrok cache break.
-    // Talk one-shot seats keep tools[] empty for the whole session.
+    // Opt-in one-shot seats keep tools[] empty. Everyone else, including CEO
+    // Office, may activate any mentioned connected MCP tool.
     if (talkSeatSuppressesTools()) {
       mentionedMcpTools.clear();
-    } else if (isLeanConversationalEnv()) {
-      const allowed = new Set<string>(LEAN_CONVERSATIONAL_MCP_TOOL_NAMES);
-      for (const name of [...mentionedMcpTools]) {
-        if (!allowed.has(name)) mentionedMcpTools.delete(name);
-      }
     }
     if (mentionedMcpTools.size > 0) {
       const activated = activateExplicitlyMentionedMcpToolsForModel(

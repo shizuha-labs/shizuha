@@ -132,7 +132,7 @@ describe('proactive compaction — static force:true invariant', () => {
   it('automatic copied loops use provider-backed semantic compaction before calls and after every subturn', () => {
     for (const path of AUTOMATIC_COMPACTION_ENTRYPOINTS) {
       const source = readRepoFile(path);
-      expect(source, path).toContain('compactMessagesRequired');
+      expect(source, path).toMatch(/applyRequiredCompactionOrThrow|compactMessagesRequired/);
       expect(source, `${path} must not retain deterministic compaction`)
         .not.toMatch(/compactMessagesExtractively|buildExtractiveFallbackSummary/);
       expect(source, `${path} must not destructively trim after automatic compaction`)
@@ -208,7 +208,7 @@ describe('proactive compaction — static force:true invariant', () => {
     ] as const) {
       const source = readRepoFile(path);
       expect(source, path).toContain('needsCompaction');
-      expect(source, path).toContain('compactMessagesRequired');
+      expect(source, path).toMatch(/applyRequiredCompactionOrThrow|compactMessagesRequired/);
       expect(source, `${path} must not retain deterministic compaction`)
         .not.toMatch(/compactMessagesExtractively|buildExtractiveFallbackSummary/);
     }

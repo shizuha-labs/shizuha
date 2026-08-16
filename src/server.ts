@@ -277,35 +277,40 @@ export async function startServer(port = 8015, host = '0.0.0.0'): Promise<void> 
       let lastToolHadErrors = false;
       let postCompactionRequestKind: string | undefined;
 
+      let skipProactiveCompactUntilGrowth = false;
       const compactAutomaticallyIfNeeded = async (reportedPromptTokens = 0): Promise<boolean> => {
-        if (!needsCompaction(
+        const proactive = needsCompaction(
           messages,
           maxContextTokens,
           model,
           systemOverheadTokens,
           maxOutputTokens,
           reportedPromptTokens,
-        )) return false;
+        );
+        if (skipProactiveCompactUntilGrowth && !proactive) {
+          skipProactiveCompactUntilGrowth = false;
+        }
+        if (skipProactiveCompactUntilGrowth) return false;
+        if (!proactive) return false;
 
         // ALWAYS use the LLM-based compaction (operator 2026-08-08): no local-vs-
         // autonomous differentiation — every agent compacts via the LLM so no
         // conversation loses meaning to the lossy extractive projection.
-        const { compactMessagesRequired } = await import('./state/compaction.js');
-        const { messages: compacted } = await compactMessagesRequired(
+        const { applyRequiredCompactionOrThrow } = await import('./state/compaction.js');
+        const compacted = await applyRequiredCompactionOrThrow({
           messages,
           provider,
           model,
-          maxContextTokens,
-          { overheadTokens: systemOverheadTokens, force: true },
-        );
+          maxTokens: maxContextTokens,
+          overheadTokens: systemOverheadTokens,
+          outputBudget: maxOutputTokens,
+        });
         messages.length = 0;
-        messages.push(...compacted);
-        store.replaceMessages(activeSession.id, compacted);
+        messages.push(...compacted.messages);
+        store.replaceMessages(activeSession.id, compacted.messages);
         lastReportedPromptTokens = 0;
         postCompactionRequestKind = 'post_compaction';
-        if (needsCompaction(messages, maxContextTokens, model, systemOverheadTokens, maxOutputTokens)) {
-          throw new Error('Semantic context compaction did not restore provider-call headroom');
-        }
+        skipProactiveCompactUntilGrowth = !compacted.reachedTrigger;
         return true;
       };
 

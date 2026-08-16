@@ -13,9 +13,11 @@ describe('SCLI context-budget guard call sites', () => {
     for (const path of ['src/agent/loop.ts', 'src/index.ts']) {
       const source = readRepoFile(path);
       expect(source, `${path} must use provider-backed semantic compaction at the provider boundary`)
-        .toContain('compactMessagesRequired');
-      expect(source, `${path} must fail closed when semantic compaction cannot restore headroom`)
-        .toContain('Semantic context compaction did not restore provider-call headroom');
+        .toMatch(/applyRequiredCompactionOrThrow|compactMessagesRequired/);
+      expect(
+        readRepoFile('src/state/compaction.ts'),
+        'compaction helper must fail closed when the next provider call cannot fit',
+      ).toContain('Semantic context compaction did not restore provider-call headroom');
       expect(source, `${path} must not retain deterministic compaction code`)
         .not.toMatch(/compactMessagesExtractively|buildExtractiveFallbackSummary/);
       expect(source, `${path} must not fall through to destructive context trimming`)

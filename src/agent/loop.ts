@@ -502,37 +502,33 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
   // may proceed until semantic compaction commits below the invariant. The next
   // ordinary call is marked as the expected cold successor.
   let postCompactionRequestKind: string | undefined;
+  let skipProactiveCompactUntilGrowth = false;
   const applyAutomaticSemanticCompaction = async (
     phase: 'pre-turn' | 'pre-provider' | 'post-turn' | 'overflow-recovery',
   ): Promise<void> => {
     // ALWAYS use the LLM-based compaction (operator 2026-08-08): no local-vs-
     // autonomous differentiation — every agent compacts via the LLM so no
     // conversation loses meaning to the lossy extractive projection.
-    const { compactMessagesRequired } = await import('../state/compaction.js');
-    const { messages: compacted } = await compactMessagesRequired(
+    const { applyRequiredCompactionOrThrow } = await import('../state/compaction.js');
+    const compacted = await applyRequiredCompactionOrThrow({
       messages,
       provider,
       model,
-      effectiveContextTokens,
-      { overheadTokens: systemOverheadTokens, planFilePath, force: true },
-    );
+      maxTokens: effectiveContextTokens,
+      overheadTokens: systemOverheadTokens,
+      outputBudget: maxOutputTokens,
+      planFilePath,
+    });
     messages.length = 0;
-    messages.push(...compacted);
-    store.replaceMessages(session.id, compacted);
+    messages.push(...compacted.messages);
+    store.replaceMessages(session.id, compacted.messages);
     lastReportedPromptTokens = 0;
     lastProviderPromptEstimate = 0;
     postCompactionRequestKind = 'post_compaction';
-    if (needsCompaction(
-      messages,
-      effectiveContextTokens,
-      model,
-      systemOverheadTokens,
-      maxOutputTokens,
-    )) {
-      throw new Error('Semantic context compaction did not restore provider-call headroom');
-    }
+    thinkingOnlyRecoveryCount = 0;
+    skipProactiveCompactUntilGrowth = !compacted.reachedTrigger;
     logger.warn(
-      { turnIndex, phase, effectiveContextTokens, compactedMessages: compacted.length },
+      { turnIndex, phase, effectiveContextTokens, compactedMessages: compacted.messages.length },
       'Applied provider-backed semantic context compaction',
     );
   };
@@ -584,7 +580,12 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
       // One-shot: when compaction/trim rewrote the prompt head, tag the
       // next interactive model call so Cortex attributes its (expected) cold
       // prefill as post_compaction — not the ideally-zero mid-session surface.
-      if (heartbeatOverSoft || needsCompaction(messages, effectiveContextTokens, model, systemOverheadTokens, maxOutputTokens, effectiveReportedTokens)) {
+      const needsProactiveCompact = needsCompaction(
+        messages, effectiveContextTokens, model, systemOverheadTokens, maxOutputTokens, effectiveReportedTokens,
+      );
+      const holdOffProactive = skipProactiveCompactUntilGrowth;
+      if (holdOffProactive) skipProactiveCompactUntilGrowth = false;
+      if (heartbeatOverSoft || (needsProactiveCompact && !holdOffProactive)) {
         preProviderBudgetExceeded = heartbeatOverSoft;
         logger.info({ turnIndex, effectiveContextTokens, servedModel, compactionWindowMode, promptBudget, hbBudget }, 'Pre-turn compaction triggered');
         await applyAutomaticSemanticCompaction('pre-turn');
@@ -635,7 +636,7 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
             systemOverheadTokens,
             maxOutputTokens,
             providerCallReportedTokens,
-          )) {
+          ) && !skipProactiveCompactUntilGrowth) {
             logger.info(
               { turnIndex, retryAttempt, effectiveContextTokens, servedModel, compactionWindowMode },
               'Pre-provider context compaction triggered',
@@ -778,6 +779,7 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
             code,
             retryable: (turnErr as { retryable?: boolean }).retryable,
             status,
+            hadSuccessfulProviderTurn: turnIndex > 0,
           }) || code === 'UND_ERR_SOCKET' || code === 'UND_ERR_REQ_RETRY';
           const isTransient = (status != null && status >= 500) ||
             code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'EPIPE' ||

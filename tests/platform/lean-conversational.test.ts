@@ -42,21 +42,24 @@ describe('lean conversational seats', () => {
     expect(isLeanConversationalEnv({ AGENT_USERNAME: 'ena' } as NodeJS.ProcessEnv)).toBe(true);
   });
 
-  it('defaults talk-minimal prompt and Connect auto-reply on for lean seats', () => {
+  it('defaults full prompt and tools for CEO Office; suppress-tools is opt-in', () => {
     const lean = { AGENT_USERNAME: 'yuna' } as NodeJS.ProcessEnv;
-    expect(talkPromptMode(lean)).toBe('minimal');
+    expect(talkPromptMode(lean)).toBe('full');
+    expect(talkPromptMode({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: '1' })).toBe('minimal');
     expect(talkPromptMode({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: 'none' })).toBe('none');
     expect(talkPromptMode({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: '0' })).toBe('full');
     expect(connectAutoReplyEnabled(lean)).toBe(true);
     expect(connectAutoReplyEnabled({ ...lean, SHIZUHA_CONNECT_AUTOREPLY: '0' })).toBe(false);
     expect(connectAutoReplyEnabled({} as NodeJS.ProcessEnv)).toBe(false);
-    expect(talkSeatSuppressesTools(lean)).toBe(true);
-    expect(talkSeatSuppressesTools({ SHIZUHA_TALK_MINIMAL_PROMPT: '0' } as NodeJS.ProcessEnv)).toBe(false);
-    expect(talkSeatDisablesThinking('cortex/DeepSeek-V4-Flash', lean)).toBe(true);
+    expect(talkSeatSuppressesTools(lean)).toBe(false);
+    expect(talkSeatSuppressesTools({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: '1' } as NodeJS.ProcessEnv)).toBe(false);
+    expect(talkSeatSuppressesTools({ SHIZUHA_TALK_SUPPRESS_TOOLS: '1' } as NodeJS.ProcessEnv)).toBe(true);
+    expect(talkSeatDisablesThinking('cortex/DeepSeek-V4-Flash', lean)).toBe(false);
+    expect(talkSeatDisablesThinking('cortex/DeepSeek-V4-Flash', { ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: '1' })).toBe(true);
     expect(talkSeatDisablesThinking('cortex/grok-4.6', lean)).toBe(false);
-    expect(talkSeatTurnTimeoutMs(lean)).toBe(12_000);
-    expect(talkSeatTurnTimeoutMs({ ...lean, SHIZUHA_TALK_TURN_MS: '8000' })).toBe(8_000);
-    expect(talkSeatTurnTimeoutMs({ SHIZUHA_TALK_MINIMAL_PROMPT: '0' } as NodeJS.ProcessEnv)).toBeUndefined();
+    expect(talkSeatTurnTimeoutMs(lean)).toBeUndefined();
+    expect(talkSeatTurnTimeoutMs({ SHIZUHA_TALK_SUPPRESS_TOOLS: '1' } as NodeJS.ProcessEnv)).toBe(12_000);
+    expect(talkSeatTurnTimeoutMs({ SHIZUHA_TALK_SUPPRESS_TOOLS: '1', SHIZUHA_TALK_TURN_MS: '8000' } as NodeJS.ProcessEnv)).toBe(8_000);
   });
 
   it('keeps the skill catalog to the lean set', () => {
@@ -79,17 +82,19 @@ describe('lean conversational seats', () => {
     expect(catalog).toContain('personal-assistant');
     expect(catalog).toContain('skill-loader');
     expect(catalog).not.toContain('kubernetes');
-    expect(LEAN_CONVERSATIONAL_MCP).toEqual(['pulse', 'connect', 'wiki']);
+    expect(LEAN_CONVERSATIONAL_MCP).toEqual(['pulse', 'connect', 'wiki', 'admin', 'id', 'hive']);
   });
 
-  it('declares a stable Pulse work head so SuperGrok can actually work', () => {
+  it('declares Pulse + Hive + admin work tools so CEO Office can actually work', () => {
     const names = [...LEAN_CONVERSATIONAL_MCP_TOOL_NAMES];
     expect(names).toContain('mcp__shizuha-pulse__pulse_get_my_tasks');
+    expect(names).toContain('mcp__shizuha-pulse__pulse_get_user_tasks');
     expect(names).toContain('mcp__shizuha-pulse__pulse_get_my_alerts');
     expect(names).toContain('mcp__shizuha-pulse__pulse_get_task');
     expect(names).toContain('mcp__shizuha-pulse__pulse_execute_transition');
     expect(names).toContain('mcp__shizuha-connect__message_user');
-    expect(names.some((name) => name.includes('__admin') || name.includes('__id') || name.includes('__scs'))).toBe(false);
+    expect(names).toContain('mcp__shizuha-hive__hive_list_fleet_agents');
+    expect(names).toContain('mcp__shizuha-admin__admin_list_teams');
     expect(names).toEqual([...names].sort());
   });
 

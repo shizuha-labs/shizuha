@@ -1871,6 +1871,7 @@ export class AgentSession extends EventEmitter {
               code,
               retryable: (turnErr as { retryable?: boolean }).retryable,
               status,
+              hadSuccessfulProviderTurn: this._turnCount > 0 || turnIndex > 0,
             }) || code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'EPIPE'
               || code === 'UND_ERR_SOCKET' || code === 'UND_ERR_REQ_RETRY';
 
@@ -1885,7 +1886,10 @@ export class AgentSession extends EventEmitter {
             }
 
             // SCLI-384: invalid provider/model must never enter indefinite backoff.
-            if (isInvalidModelOrProviderFailure({ message: errMsg, code, status })) {
+            if (isInvalidModelOrProviderFailure({
+              message: errMsg, code, status,
+              hadSuccessfulProviderTurn: this._turnCount > 0 || turnIndex > 0,
+            })) {
               throw Object.assign(
                 new Error(formatInvalidModelError(this._model, errMsg)),
                 { status, code, retryable: false },

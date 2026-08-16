@@ -4,6 +4,7 @@ import {
   estimateTokens,
   getSafetyFactor,
   needsCompaction,
+  nextProviderCallFits,
 } from '../../src/prompt/context.js';
 import type { Message } from '../../src/agent/types.js';
 
@@ -503,5 +504,19 @@ describe('paired-baseline exemption — anchored truth beats raw overcount (agen
     expect(
       needsCompaction(messages, WINDOW, 'DeepSeek-V4-Flash', 0, 0, 100_000, 110_000),
     ).toBe(true);
+  });
+});
+
+describe('nextProviderCallFits', () => {
+  it('is independent of the 70% proactive trigger', () => {
+    const messages: Message[] = [{ role: 'user', content: 'short' }];
+    expect(nextProviderCallFits(messages, 100_000, undefined, 0, 16_384)).toBe(true);
+    expect(needsCompaction(messages, 100_000, undefined, 0, 16_384)).toBe(false);
+  });
+
+  it('is false when input plus output budget exceeds the window', () => {
+    const messages: Message[] = [{ role: 'user', content: 'word '.repeat(5000) }];
+    const raw = estimateTokens(messages);
+    expect(nextProviderCallFits(messages, raw + 100, undefined, 0, 16_384)).toBe(false);
   });
 });
