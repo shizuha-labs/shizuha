@@ -1329,6 +1329,64 @@ authCmd
   });
 
 authCmd
+  .command('openai [key]')
+  .description('Save an OpenAI API key and optional OpenAI-compatible base URL (no Shizuha ID)')
+  .option('--url <url>', 'OpenAI-compatible base URL (e.g. http://127.0.0.1:8000/v1)')
+  .option('--model <model>', 'Default model id on that server')
+  .action(async (key?: string, opts?: { url?: string; model?: string }) => {
+    const { setOpenAIEndpoint, normalizeOpenAICompatibleBaseUrl } = await import('./config/credentials.js');
+    const url = opts?.url ? normalizeOpenAICompatibleBaseUrl(opts.url) : undefined;
+    if (!key && !url) {
+      console.error('  Provide a key and/or --url. Example:');
+      console.error('    shizuha auth openai sk-... ');
+      console.error('    shizuha auth endpoint --url http://127.0.0.1:11434/v1 --model llama3.2');
+      process.exitCode = 1;
+      return;
+    }
+    setOpenAIEndpoint({ apiKey: key, baseUrl: url, defaultModel: opts?.model });
+    console.log('\n  Saved. Shizuha ID is not required for this endpoint.');
+    if (url) console.log(`  URL:   ${url}`);
+    if (key) console.log('  Key:   stored in ~/.shizuha/credentials.json');
+    const model = opts?.model || 'MODEL';
+    console.log(`  Try:   shizuha exec -p "hello" --model openai:${model}`);
+    console.log('  Or:    shizuha --model openai:' + model);
+  });
+
+authCmd
+  .command('endpoint')
+  .description('Point Shizuha at any OpenAI-compatible server (Ollama, vLLM, llama.cpp). No Shizuha ID required.')
+  .option('--url <url>', 'Base URL, e.g. http://127.0.0.1:8000/v1 or http://127.0.0.1:11434/v1')
+  .option('--key <key>', 'API key if the server requires one')
+  .option('--model <model>', 'Default model id served at that URL')
+  .action(async (opts: { url?: string; key?: string; model?: string }) => {
+    const { setOpenAIEndpoint, normalizeOpenAICompatibleBaseUrl } = await import('./config/credentials.js');
+    let url = opts.url?.trim();
+    if (!url) {
+      const readline = await import('node:readline');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      url = await new Promise<string>((resolve) => {
+        rl.question('  OpenAI-compatible base URL (e.g. http://127.0.0.1:11434/v1): ', (answer) => {
+          rl.close();
+          resolve(answer.trim());
+        });
+      });
+    }
+    if (!url) {
+      console.error('  No URL provided.');
+      process.exitCode = 1;
+      return;
+    }
+    const normalized = normalizeOpenAICompatibleBaseUrl(url);
+    setOpenAIEndpoint({ apiKey: opts.key, baseUrl: normalized, defaultModel: opts.model });
+    console.log('\n  Endpoint saved. No Shizuha ID login is required.');
+    console.log(`  URL:   ${normalized}`);
+    if (opts.key) console.log('  Key:   stored in ~/.shizuha/credentials.json');
+    const model = opts.model || 'MODEL';
+    console.log(`  Try:   shizuha exec -p "hello" --model openai:${model}`);
+    console.log('  Status: shizuha auth status');
+  });
+
+authCmd
   .command('codex')
   .description('Authenticate with OpenAI Codex via device code flow (free with ChatGPT)')
   .action(async () => {
@@ -1408,11 +1466,16 @@ authCmd
       console.log('  Anthropic: not configured');
     }
 
-    // OpenAI
-    if (creds.openai?.apiKey || process.env['OPENAI_API_KEY']) {
-      console.log('  OpenAI: API key configured');
+    // OpenAI / OpenAI-compatible endpoint
+    const openaiUrl = process.env['OPENAI_BASE_URL'] || creds.openai?.baseUrl;
+    if (creds.openai?.apiKey || process.env['OPENAI_API_KEY'] || openaiUrl) {
+      const bits: string[] = [];
+      if (creds.openai?.apiKey || process.env['OPENAI_API_KEY']) bits.push('API key');
+      if (openaiUrl) bits.push(openaiUrl);
+      if (creds.openai?.defaultModel) bits.push(`model ${creds.openai.defaultModel}`);
+      console.log(`  OpenAI: ${bits.join(' · ')}`);
     } else {
-      console.log('  OpenAI: not configured');
+      console.log('  OpenAI: not configured (shizuha auth endpoint --url http://127.0.0.1:11434/v1)');
     }
 
     // Codex
@@ -2366,46 +2429,47 @@ async function* runAgentWithPrompt(
 
   // Automatic context safety must never depend on another model request. A
   // remote compaction has the same cold-prefill cost as the turn it is meant to
-  // protect and can be serialized behind another session. Keep the automatic
-  // gate synchronous, persist its bounded projection atomically, and fail
-  // locally if that projection somehow cannot restore threshold headroom.
+  // protect and can be serialized behind another session. Persist the projection
+  // atomically. Abort only when the next provider call cannot physically fit —
+  // sitting above the 70% trigger after a successful compact is a hold-off,
+  // not a session kill (Q4 remaining-16, 2026-08-16).
+  let skipProactiveCompactUntilGrowth = false;
   const compactAutomaticallyIfNeeded = async (reportedPromptTokens = 0, force = false): Promise<boolean> => {
-    if (!force && !needsCompaction(
+    const proactive = needsCompaction(
       messages,
       maxContextTokens,
       model,
       systemOverheadTokens,
       maxOutputTokens,
       reportedPromptTokens,
-    )) return false;
+    );
+    if (!force && skipProactiveCompactUntilGrowth && !proactive) {
+      skipProactiveCompactUntilGrowth = false;
+    }
+    if (!force && skipProactiveCompactUntilGrowth) return false;
+    if (!force && !proactive) return false;
 
     // ALWAYS use the LLM-based compaction (operator 2026-08-08): no local-vs-
     // autonomous differentiation — every agent compacts via the LLM so no
     // conversation loses meaning to the lossy extractive projection.
-    const { compactMessagesRequired } = await import('./state/compaction.js');
-    const { messages: compacted } = await compactMessagesRequired(
+    const { applyRequiredCompactionOrThrow } = await import('./state/compaction.js');
+    const compacted = await applyRequiredCompactionOrThrow({
       messages,
       provider,
       model,
-      maxContextTokens,
-      { overheadTokens: systemOverheadTokens, force: true },
-    );
+      maxTokens: maxContextTokens,
+      overheadTokens: systemOverheadTokens,
+      outputBudget: maxOutputTokens,
+    });
     messages.length = 0;
-    messages.push(...compacted);
-    store.replaceMessages(session.id, compacted);
+    messages.push(...compacted.messages);
+    store.replaceMessages(session.id, compacted.messages);
     lastReportedPromptTokens = 0;
     lastProviderPromptEstimate = 0;
     postCompactionRequestKind = 'post_compaction';
-
-    if (needsCompaction(
-      messages,
-      maxContextTokens,
-      model,
-      systemOverheadTokens,
-      maxOutputTokens,
-    )) {
-      throw new Error('Semantic context compaction did not restore provider-call headroom');
-    }
+    thinkingOnlyRecoveryCount = 0;
+    truncationRecoveryCount = 0;
+    skipProactiveCompactUntilGrowth = !compacted.reachedTrigger;
     return true;
   };
 
@@ -2548,6 +2612,7 @@ async function* runAgentWithPrompt(
               code,
               retryable: (turnErr as { retryable?: boolean }).retryable,
               status,
+              hadSuccessfulProviderTurn: turnIndex > 0,
             }) || code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'EPIPE'
               || code === 'UND_ERR_SOCKET' || code === 'UND_ERR_REQ_RETRY';
             if (!isTransient) {

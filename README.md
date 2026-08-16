@@ -1,7 +1,7 @@
-# Shizuha — AI Agent Runtime
+# Shizuha Code
 
 <p align="center">
-  <strong>Run autonomous AI coding agents on your own machine.</strong>
+  <strong>The open source AI coding harness. Point it at any model you already run.</strong>
 </p>
 
 <p align="center">
@@ -9,9 +9,11 @@
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node.js-22+-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node 22+"></a>
 </p>
 
-**Shizuha** is an AI agent runtime and orchestration platform. It runs multiple autonomous agents with built-in tools, multi-channel messaging, and a web dashboard — all on your own hardware.
+**Shizuha Code** is an AI coding agent you run yourself — TUI, `exec`, or a local web dashboard. Bring your own endpoint: Ollama, vLLM, llama.cpp, OpenRouter, OpenAI, Claude, or any OpenAI-compatible server.
 
-Each agent has its own identity, model, and execution method. Chat with them from the dashboard, Telegram, Discord, WhatsApp, or any connected channel.
+**No Shizuha account is required.** Hosted Shizuha Code plans (subscribe for curated models, the same shape as OpenCode Zen) are optional and come later. Today you only need a URL.
+
+See [docs/QUICKSTART.md](docs/QUICKSTART.md) for the 60-second path.
 
 ## Features
 
@@ -44,41 +46,46 @@ curl -fsSL https://shizuha.com/install.sh | bash
 
 The installer auto-detects whether you're in a source tree or downloading a prebuilt binary.
 
-### After installation
+### 60-second first run (no account)
 
 ```bash
-# Start the daemon + dashboard
-shizuha up
+# Point at any OpenAI-compatible server (Ollama example):
+shizuha auth endpoint --url http://127.0.0.1:11434/v1 --model llama3.2
 
-# Dashboard: https://localhost:8015
-# First-run username is `shizuha`. The one-time password is printed
-# in the daemon console (or set SHIZUHA_DASHBOARD_PASSWORD). Change it in Settings.
+# One-shot
+shizuha exec -p "What files are in this repo?" --model openai:llama3.2
+
+# Interactive TUI
+shizuha --model openai:llama3.2
+
+# Optional local dashboard
+shizuha up
+# https://localhost:8015 — first-run username `shizuha`,
+# one-time password is printed in the daemon console.
 ```
+
+Same command works for vLLM, llama.cpp, OpenRouter, or a self-hosted Cortex:
+
+```bash
+shizuha auth endpoint --url http://127.0.0.1:8000/v1 --model Qwen3.6-27B
+# or:  export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+#      export OPENAI_API_KEY=not-needed   # if the server ignores auth
+```
+
+### Optional hosted providers
+
+| How | Command |
+|-----|---------|
+| OpenAI API | `shizuha auth openai sk-...` |
+| Claude API / `claude setup-token` | `shizuha auth claude` |
+| ChatGPT (Codex) | `shizuha auth codex` |
+| Shizuha Cortex (optional account) | `shizuha login` or `shizuha auth cortex` |
+
+`shizuha login` is **only** for hosted Cortex / future Shizuha Code plans. Skip it for local models.
 
 ## Default Agents
 
-Shizuha ships with three pre-configured agents, ready out of the box:
-
-| Agent | Model | Method | Description |
-|-------|-------|--------|-------------|
-| **Claude** | `claude-opus-4-6` | Claude Code bridge | Anthropic Claude with extended thinking (max effort) |
-| **Shizuha** | `gpt-5.5` | Shizuha runtime | OpenAI via Codex — free with any ChatGPT account |
-| **Codex** | `gpt-5.5` | Codex app server | OpenAI Codex CLI bridge |
-
-Agents are enabled and configured from the dashboard. You can add, remove, or reconfigure agents at any time.
-
-## Authentication
-
-Each agent needs credentials for its LLM provider. The dashboard guides you through setup:
-
-| Provider | Setup |
-|----------|-------|
-| **Claude** | Run `claude setup-token` on your machine, paste the token in the dashboard auth card |
-| **Codex / Shizuha** | Sign in with your ChatGPT account (device code flow, shown automatically) |
-| **Anthropic API** | Set `ANTHROPIC_API_KEY` in environment or dashboard Settings |
-| **OpenAI API** | Set `OPENAI_API_KEY` in environment or dashboard Settings |
-| **Google** | Set `GOOGLE_API_KEY` for Gemini models |
-| **Ollama** | Runs locally — no API key needed |
+`shizuha up` can also run long-lived dashboard agents (Claude / Codex / Shizuha). Configure them in the dashboard after you have a provider. They are not required for `shizuha` / `shizuha exec`.
 
 ## Architecture
 
@@ -115,6 +122,8 @@ shizuha up
 | `shizuha status` | Show daemon and agent status |
 | `shizuha exec -p "..."` | Single prompt execution |
 | `shizuha serve` | HTTP API server (SSE/NDJSON streaming) |
+| `shizuha auth endpoint` | Point at any OpenAI-compatible URL (no account) |
+| `shizuha auth openai` | Save an OpenAI API key (optional `--url`) |
 | `shizuha auth codex` | Authenticate Codex (free with ChatGPT) |
 | `shizuha config` | Show current configuration |
 | `shizuha doctor` | Health check and diagnostics |

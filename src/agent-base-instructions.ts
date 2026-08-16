@@ -16,24 +16,26 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { listSkillNames, readSkillByName, type SkillFrontmatter } from './skills/frontmatter.js';
-import { isLeanConversationalEnv } from './platform/lean-conversational.js';
+import { talkPromptMode } from './platform/lean-conversational.js';
 
-/** Slim AGENTS.md for CEO Office talkable seats — catalog pointers only. */
+/** Slim AGENTS.md only when SHIZUHA_TALK_MINIMAL_PROMPT=1 is set. */
 export const LEAN_CONVERSATIONAL_AGENTS_MD = `# Operating Instructions
 
-You are a CEO Office executive assistant. Keep replies short.
+You are a CEO Office executive assistant and a proper fleet agent. You have Pulse, Connect, Wiki, Admin, ID, and Hive.
 
 ## Talking to people
-Your turn text is delivered to the caller automatically. Reply in short spoken sentences. Do not start a tool loop for a greeting or a one-line question. Never write tool_call or ToolSearch tags — that markup is spoken aloud. If you cannot look something up from this seat, say so in one sentence. Use Pulse/wiki tools only when the caller asked for work that needs them.
+Your turn text is delivered to the caller automatically. Reply in short spoken sentences after you have the facts. Greetings can be answered directly. When the caller asks for tasks, alerts, Hive agents, org info, or any live state, CALL the matching tool first. Never narrate that you will look something up. Never write tool_call or ToolSearch tags as visible text.
+
+For "what tasks are assigned to me?" call mcp__shizuha-pulse__pulse_get_user_tasks. For your own heartbeat queue call mcp__shizuha-pulse__pulse_get_my_tasks.
 
 ## Heartbeats
-\`[HEARTBEAT]\` is a long-idle fallback, not a chat. Check Pulse alerts then tasks. If both are empty, produce ZERO output.
+[HEARTBEAT] is a long-idle fallback, not a chat. Check Pulse alerts then tasks. If both are empty, produce ZERO output.
 
 ## Skills
-On demand: \`personal-assistant\`, \`company-os\`, \`operator-request-hygiene\`, \`wiki-lifecycle\`, \`skill-loader\`.
+On demand: personal-assistant, company-os, operator-request-hygiene, wiki-lifecycle, skill-loader.
 
 ## Wiki
-Search the wiki before non-trivial company questions (\`wiki_search_pages\`).
+Search the wiki before non-trivial company questions (wiki_search_pages).
 `;
 
 /** Universal always-on rules for every fleet agent (no shipping / no role pack). */
@@ -165,7 +167,7 @@ function stripHeadingDuplicate(body: string): string {
 
 /** Compose full AGENTS.md text: universal core + selected directive skill bodies. */
 export function composeAgentsMd(opts: ComposeAgentsMdOptions = {}): string {
-  if (isLeanConversationalEnv()) {
+  if (talkPromptMode() === 'minimal') {
     return LEAN_CONVERSATIONAL_AGENTS_MD;
   }
   const parts: string[] = [AGENT_UNIVERSAL_CORE.trimEnd()];

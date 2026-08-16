@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  applyRequiredCompactionOrThrow,
   compactMessages,
   CompactionCapacityError,
   CompactionQualityError,
@@ -521,7 +522,7 @@ describe('compactMessages — hierarchical semantic prefixes (SCLI-18)', () => {
         role: index % 2 === 0 ? 'user' : 'assistant',
         content: `plan-pass-${index}: ${'word '.repeat(800)}`,
       }));
-      for (let pass = 0; pass < 8; pass++) {
+      for (let pass = 0; pass < 40; pass++) {
         provider.queueResponse(ResponseBuilder.textOnly(longSummary(`Plan semantic pass ${pass}.`)));
       }
 
@@ -738,5 +739,35 @@ describe('forced compaction accepts short-but-real summaries (shizuha5 2026-08-1
     expect(envelope).toContain('investigated the compaction pipeline');
     expect(envelope).not.toContain('"tool_use_id"');
     expect(envelope).not.toContain('[{"type"');
+  });
+});
+
+describe('applyRequiredCompactionOrThrow', () => {
+  it('does not abort when the next provider call still fits', async () => {
+    const messages = makeLargeConversation(40);
+    const rawTokens = estimateTokens(messages);
+    const maxTokens = Math.max(32_000, Math.ceil(rawTokens * 1.15));
+    for (let pass = 0; pass < 12; pass++) {
+      provider.queueResponse(ResponseBuilder.textOnly(longSummary(`Fit pass ${pass}.`)));
+    }
+    const result = await applyRequiredCompactionOrThrow({
+      messages,
+      provider,
+      model: 'test-model',
+      maxTokens,
+      outputBudget: 16_384,
+    });
+    expect(result.messages.length).toBeGreaterThan(0);
+    expect(estimateTokens(result.messages) + 16_384).toBeLessThanOrEqual(maxTokens);
+  });
+
+  it('throws the historical headroom error only when the next call cannot fit', async () => {
+    await expect(applyRequiredCompactionOrThrow({
+      messages: [{ role: 'user', content: `oversized ${'word '.repeat(8_000)}` }],
+      provider,
+      model: 'test-model',
+      maxTokens: 1_200,
+      outputBudget: 16_384,
+    })).rejects.toThrow('Semantic context compaction did not restore provider-call headroom');
   });
 });

@@ -182,7 +182,17 @@ function jwtExpMsFromToken(token: string): number | undefined {
 
 /** Check if we have a real OpenAI API key (not OAuth token) */
 function hasOpenAIApiKey(config: ShizuhaConfig): boolean {
-  return !!(config.providers.openai?.apiKey || process.env['OPENAI_API_KEY']);
+  return !!(config.providers.openai?.apiKey || process.env['OPENAI_API_KEY'] || readCredentials().openai?.apiKey);
+}
+
+export function resolveOpenAIBaseUrl(config?: ShizuhaConfig): string | undefined {
+  return nonEmptyEnv('OPENAI_BASE_URL')
+    ?? config?.providers.openai?.baseUrl?.trim()
+    ?? readCredentials().openai?.baseUrl?.trim();
+}
+
+function hasCustomOpenAIEndpoint(config?: ShizuhaConfig): boolean {
+  return !!resolveOpenAIBaseUrl(config);
 }
 
 /**
@@ -355,12 +365,14 @@ export class ProviderRegistry {
       }
     }
 
-    // OpenAI provider: use API key if available
-    if (hasOpenAIApiKey(config)) {
-      this.providers.set('openai', new OpenAIProvider(pc.openai?.apiKey, pc.openai?.baseUrl));
-    } else if (creds.openai?.apiKey) {
-      // Credential store fallback
-      this.providers.set('openai', new OpenAIProvider(creds.openai.apiKey));
+    // OpenAI provider: API key and/or a custom OpenAI-compatible base URL
+    // (Ollama / vLLM / llama.cpp often need no real key).
+    const openaiBaseUrl = resolveOpenAIBaseUrl(config);
+    const openaiKey = pc.openai?.apiKey
+      || nonEmptyEnv('OPENAI_API_KEY')
+      || creds.openai?.apiKey;
+    if (openaiKey || openaiBaseUrl) {
+      this.providers.set('openai', new OpenAIProvider(openaiKey || 'local', openaiBaseUrl));
     }
 
     // Codex provider: ChatGPT OAuth via Responses API (chatgpt.com/backend-api/codex)
@@ -456,6 +468,17 @@ export class ProviderRegistry {
 
   /** Resolve `auto` to the best available model based on configured providers. */
   resolveAutoModel(): string {
+    const creds = readCredentials();
+    const customOpenAI = hasCustomOpenAIEndpoint(this.lastConfig);
+    // A user who pointed us at a local/custom endpoint wins over hosted defaults.
+    if (this.providers.has('vllm')) {
+      return creds.openai?.defaultModel || 'default';
+    }
+    if (customOpenAI && this.providers.has('openai')) {
+      return creds.openai?.defaultModel
+        ? `openai:${creds.openai.defaultModel}`
+        : 'openai:default';
+    }
     // Prefer Codex first (self-contained, auto-refreshable, free with ChatGPT).
     // Claude Code OAuth is fragile (expires, requires Claude Code running).
     if (this.providers.has('codex')) return 'gpt-5.5';
@@ -463,8 +486,8 @@ export class ProviderRegistry {
     if (this.providers.has('claude-code')) return 'claude-sonnet-4-6';
     if (this.providers.has('openai')) return 'gpt-4.1';
     if (this.providers.has('google')) return 'gemini-2.5-pro';
-    // No cloud provider configured — default to Codex (free with ChatGPT account).
-    // This will fail at message time with a helpful setup prompt.
+    // No cloud provider — stay on local Ollama rather than failing into Codex.
+    if (this.providers.has('ollama')) return 'llama3.2';
     return 'gpt-5.5';
   }
 
@@ -618,13 +641,22 @@ export class ProviderRegistry {
     // generic provider prefix routing so a DEEPSEEK_API_KEY cannot steal our
     // hosted DeepSeek deployment, but after explicit Ollama model IDs.
     if (isCortexModelId(model)) {
-      const cortex = this.providers.get('cortex');
-      if (cortex) {
-        // Legacy cortex/ prefix is still accepted; strip for the upstream body.
-        const resolvedModel = model.toLowerCase().startsWith('cortex/')
-          ? model.slice('cortex/'.length)
-          : model;
-        return { provider: cortex, resolvedModel };
+      const wantsCortexPrefix = model.toLowerCase().startsWith('cortex/');
+      const cortexAuth = resolveCortexAuthToken(this.lastConfig);
+      const localCompat = this.providers.has('vllm')
+        ? this.providers.get('vllm')
+        : (hasCustomOpenAIEndpoint(this.lastConfig) ? this.providers.get('openai') : undefined);
+      if ((cortexAuth || wantsCortexPrefix || !localCompat)) {
+        const cortex = this.providers.get('cortex');
+        if (cortex) {
+          const resolvedModel = wantsCortexPrefix
+            ? model.slice('cortex/'.length)
+            : model;
+          return { provider: cortex, resolvedModel };
+        }
+      }
+      if (localCompat && !wantsCortexPrefix) {
+        return { provider: localCompat, resolvedModel: model };
       }
     }
 
