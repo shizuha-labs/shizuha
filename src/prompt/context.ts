@@ -388,3 +388,25 @@ export function needsCompaction(
       && estimated + outputBudget + guardBudget > maxTokens)
     || rawFloorTrigger;
 }
+
+/**
+ * True iff the next provider call can physically fit (input + output + guard
+ * ≤ window). Independent of the 70% proactive trigger. After semantic
+ * compaction, "headroom restored" means this — not "back under the trigger".
+ * Targeting only the trigger after a 16k think suffix used to abort fitable
+ * sessions (Q4 remaining-16 compaction-headroom abort, 2026-08-16).
+ */
+export function nextProviderCallFits(
+  messages: Message[], maxTokens: number, model?: string,
+  overheadTokens = 0, outputBudget = 0, reportedPromptTokens = 0,
+  reportedRawEstimateTokens = 0, guardBudget = 0,
+): boolean {
+  const estimated = effectiveContextTokens(
+    messages,
+    model,
+    overheadTokens,
+    reportedPromptTokens,
+    reportedRawEstimateTokens,
+  );
+  return estimated + outputBudget + guardBudget <= maxTokens;
+}

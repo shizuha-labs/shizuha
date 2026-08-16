@@ -32,6 +32,21 @@ describe('SCLI-384 invalid model fail-fast', () => {
     })).toBe(false);
   });
 
+  it('retries Cortex mid-session "is not available" 404 (drained backend, not a bad --model)', () => {
+    const midSession = {
+      message: 'vLLM error 404: {"error":{"message":"Model Qwen3.8-27B-Q4 is not available","type":"model_not_found"}}',
+      code: 'model_not_found',
+      status: 404 as const,
+      hadSuccessfulProviderTurn: true,
+    };
+    expect(isInvalidModelOrProviderFailure(midSession)).toBe(false);
+    expect(isTransientProviderFailure(midSession)).toBe(true);
+    expect(isInvalidModelOrProviderFailure({
+      ...midSession,
+      hadSuccessfulProviderTurn: false,
+    })).toBe(true);
+  });
+
   it('formatInvalidModelError names the model and points at /model', () => {
     const msg = formatInvalidModelError(
       'definitely-not-a-real-provider/SCLI178-MISSING-MODEL',

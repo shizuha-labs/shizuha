@@ -247,19 +247,12 @@ describe('mcp-access-matrix: PLAT-309 overrides (shizuha / shion) × SHIZUHA_MCP
     );
   });
 
-  it('CEO Office seats drop admin/id/scs to the lean conversational floor', () => {
-    expect(sorted(resolveAllowedServers('General Assistant', 'hina'))).toEqual(
-      sorted(new Set(['pulse', 'connect', 'wiki'])),
-    );
-    expect(sorted(resolveAllowedServers('General Assistant', 'aya'))).toEqual(
-      sorted(new Set(['pulse', 'connect', 'wiki'])),
-    );
-    expect(sorted(resolveAllowedServers('General Assistant', 'yuna'))).toEqual(
-      sorted(new Set(['pulse', 'connect', 'wiki'])),
-    );
-    expect(sorted(resolveAllowedServers('General Assistant', 'ena'))).toEqual(
-      sorted(new Set(['pulse', 'connect', 'wiki'])),
-    );
+  it('CEO Office seats keep the platform base and add Hive', () => {
+    const expected = sorted(new Set([...BASE, 'hive']));
+    expect(sorted(resolveAllowedServers('General Assistant', 'hina'))).toEqual(expected);
+    expect(sorted(resolveAllowedServers('General Assistant', 'aya'))).toEqual(expected);
+    expect(sorted(resolveAllowedServers('General Assistant', 'yuna'))).toEqual(expected);
+    expect(sorted(resolveAllowedServers('General Assistant', 'ena'))).toEqual(expected);
   });
 
   it('General Assistant role without override → base only (fail-closed)', () => {

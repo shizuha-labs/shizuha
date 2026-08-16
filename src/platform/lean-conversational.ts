@@ -1,39 +1,40 @@
 /**
- * Lean conversational seats (CEO Office talkable agents).
+ * CEO Office resident talk seats (Hina/Aya/Yuna/Ena).
  *
- * Operator 2026-08-15: keep the SuperGrok prefix slim and byte-stable so
- * prompt-cache hits stay at 100% on live talk. Heartbeats are a long-idle
- * fallback, not a 5-minute poll.
+ * Operator 2026-08-16: these seats are proper fleet agents — same Pulse /
+ * Connect / Wiki / Admin / ID / Hive class as Shizuha and admin-ops. The
+ * 2026-08-15 SuperGrok-cache contract (empty tools[], no Hive, one-shot
+ * turns) made them narrate lookups they could not perform. Heartbeats stay
+ * a long-idle fallback, not a 5-minute poll.
  */
 
 export const DEFAULT_IDLE_HEARTBEAT_MS = 30 * 60 * 1000;
 export const DEFAULT_HEARTBEAT_DEBOUNCE_MS = 30 * 60 * 1000;
 export const DEFAULT_FIRST_HEARTBEAT_MS = 30 * 60 * 1000;
-/** Silent prefix-cache warm after boot for lean talk seats. Idle stays 30m. */
+/** Silent prefix-cache warm after boot for resident talk seats. Idle stays 30m. */
 export const LEAN_FIRST_HEARTBEAT_MS = 8_000;
 
 export const LEAN_CONVERSATIONAL_TEAMS = new Set(['ceo-office']);
 export const LEAN_CONVERSATIONAL_USERNAMES = new Set(['hina', 'aya', 'yuna', 'ena']);
 
-/** MCP servers that stay connected for a lean conversational seat. */
-export const LEAN_CONVERSATIONAL_MCP = ['pulse', 'connect', 'wiki'] as const;
+/** MCP servers every CEO Office talk seat must keep connected. */
+export const LEAN_CONVERSATIONAL_MCP = [
+  'pulse', 'connect', 'wiki', 'admin', 'id', 'hive',
+] as const;
 
-/** Historical PLAT-1251 extras a lean seat must drop. */
-export const LEAN_TRIMMABLE_PLATFORM_MCP = new Set(['admin', 'id', 'scs']);
+/** Nothing is trimmed off the platform floor for CEO Office anymore. */
+export const LEAN_TRIMMABLE_PLATFORM_MCP = new Set<string>();
 
 /**
- * Declared MCP tool head for lean seats. Hosted SuperGrok only calls tools
- * present in the request `tools` array, so this set is the whole surface.
- *
- * Pulse work tools belong HERE from boot — not added mid-conversation.
- * SuperGrok cache keys the prefix including `tools[]`. Naming
- * pulse_get_my_tasks in a heartbeat is fine once those schemas are already
- * in this list; adding them later is the cache break.
- *
- * Keep this list append-never except as a coordinated prefix bump.
+ * Declared MCP tool head pre-activated at boot so hosted SuperGrok can call
+ * work tools without a ToolSearch round-trip. This is a floor, not a ceiling
+ * — later mentions may still activate more connected MCP tools.
  */
 export const LEAN_CONVERSATIONAL_MCP_TOOL_NAMES = [
+  'mcp__shizuha-admin__admin_list_teams',
   'mcp__shizuha-connect__message_user',
+  'mcp__shizuha-hive__hive_get_agent_roster',
+  'mcp__shizuha-hive__hive_list_fleet_agents',
   'mcp__shizuha-pulse__pulse_add_comment',
   'mcp__shizuha-pulse__pulse_assign_task',
   'mcp__shizuha-pulse__pulse_create_task',
@@ -41,6 +42,7 @@ export const LEAN_CONVERSATIONAL_MCP_TOOL_NAMES = [
   'mcp__shizuha-pulse__pulse_get_my_alerts',
   'mcp__shizuha-pulse__pulse_get_my_tasks',
   'mcp__shizuha-pulse__pulse_get_task',
+  'mcp__shizuha-pulse__pulse_get_user_tasks',
   'mcp__shizuha-pulse__pulse_search_tasks',
   'mcp__shizuha-wiki__wiki_get_page',
   'mcp__shizuha-wiki__wiki_search_pages',
@@ -65,21 +67,23 @@ export function isLeanConversationalEnv(env: NodeJS.ProcessEnv = process.env): b
   return LEAN_CONVERSATIONAL_USERNAMES.has(username);
 }
 
-/** Talk-minimal system prompt: tiny identity, no coding-agent / AGENTS.md / tool list.
- *  Default ON for lean seats. Set SHIZUHA_TALK_MINIMAL_PROMPT=0 to disable,
+/** Talk-minimal system prompt: tiny identity, no coding-agent lecture.
+ *  Default OFF — CEO Office seats use the same AGENTS.md as other agents.
+ *  Set SHIZUHA_TALK_MINIMAL_PROMPT=1 to opt back into the slim prompt,
  *  or =none for an empty/custom-only prompt. */
 export function talkPromptMode(env: NodeJS.ProcessEnv = process.env): 'full' | 'minimal' | 'none' {
   const raw = (env['SHIZUHA_TALK_MINIMAL_PROMPT'] ?? '').trim().toLowerCase();
-  if (raw === '0' || raw === 'false' || raw === 'off') return 'full';
   if (raw === 'none' || raw === 'empty') return 'none';
   if (raw === '1' || raw === 'true' || raw === 'on' || raw === 'minimal') return 'minimal';
-  return isLeanConversationalEnv(env) ? 'minimal' : 'full';
+  return 'full';
 }
 
-/** Talk seats must not start a tool/recovery loop. A queued follow-up DM
- *  otherwise sits behind Pulse/wiki calls and looks like a dead turn. */
+/** Empty tools[] / tool_choice=none. Opt-in only — never the CEO Office default.
+ *  The 2026-08-15 coupling to talk-minimal prompt made Ena narrate Pulse
+ *  lookups she could not execute. */
 export function talkSeatSuppressesTools(env: NodeJS.ProcessEnv = process.env): boolean {
-  return talkPromptMode(env) !== 'full';
+  const raw = (env['SHIZUHA_TALK_SUPPRESS_TOOLS'] ?? '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'on';
 }
 
 /** DeepSeek talk seats can disable thinking (live Cortex 200). grok-4.6/4.5

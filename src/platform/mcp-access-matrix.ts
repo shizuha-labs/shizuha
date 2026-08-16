@@ -91,10 +91,12 @@ export const MCP_ACCESS_MATRIX: McpAccessMatrix = {
     shizuha: { add: ['cron'] },
     // shion: Deputy Chief of Staff — admin/id now base; no standing extras (add cron via override if needed).
     shion: { add: [] },
-    // CEO Office talkable seats: pulse/connect/wiki only. Admin/id/scs bloat
-    // the tool head and break SuperGrok prefix cache (operator 2026-08-15).
-    hina: { remove: ['admin', 'id', 'scs'] },
-    aya: { remove: ['admin', 'id', 'scs'] },
+    // CEO Office talk seats are proper agents (operator 2026-08-16). Keep
+    // the platform base and add Hive so they can list/inspect fleet agents.
+    hina: { add: ['hive'] },
+    aya: { add: ['hive'] },
+    yuna: { add: ['hive'] },
+    ena: { add: ['hive'] },
   },
 };
 

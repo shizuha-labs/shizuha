@@ -751,8 +751,10 @@ describe('runAgent — SCLI-9 thinking-only re-prompt guard (c)', () => {
   it('talk one-shot seats do not re-prompt thinking-only or run a second model call', async () => {
     const savedUser = process.env['AGENT_USERNAME'];
     const savedTalk = process.env['SHIZUHA_TALK_MINIMAL_PROMPT'];
+    const savedSuppress = process.env['SHIZUHA_TALK_SUPPRESS_TOOLS'];
     process.env['AGENT_USERNAME'] = 'yuna';
     process.env['SHIZUHA_TALK_MINIMAL_PROMPT'] = '1';
+    process.env['SHIZUHA_TALK_SUPPRESS_TOOLS'] = '1';
     try {
       mockProvider.queueResponse(ResponseBuilder.textOnly('<think>I should analyze this carefully.</think>'));
       mockProvider.queueResponse(ResponseBuilder.textOnly('should not reach'));
@@ -765,6 +767,8 @@ describe('runAgent — SCLI-9 thinking-only re-prompt guard (c)', () => {
       else process.env['AGENT_USERNAME'] = savedUser;
       if (savedTalk === undefined) delete process.env['SHIZUHA_TALK_MINIMAL_PROMPT'];
       else process.env['SHIZUHA_TALK_MINIMAL_PROMPT'] = savedTalk;
+      if (savedSuppress === undefined) delete process.env['SHIZUHA_TALK_SUPPRESS_TOOLS'];
+      else process.env['SHIZUHA_TALK_SUPPRESS_TOOLS'] = savedSuppress;
     }
   });
 

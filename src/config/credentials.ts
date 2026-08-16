@@ -68,7 +68,7 @@ export interface CopilotCredential {
 
 export interface CredentialStore {
   anthropic?: ProviderTokens;
-  openai?: { apiKey: string };
+  openai?: { apiKey?: string; baseUrl?: string; defaultModel?: string };
   google?: { apiKey: string };
   codex?: { accounts: CodexAccountEntry[] };
   copilot?: CopilotCredential;
@@ -642,9 +642,39 @@ export function setAnthropicApiKey(key: string): void {
 
 // ── OpenAI / Google Key Management ──
 
+/** Ensure an OpenAI-compatible base URL ends in /v1. */
+export function normalizeOpenAICompatibleBaseUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+  const noSlash = trimmed.replace(/\/+$/, '');
+  return /\/v1$/i.test(noSlash) ? noSlash : `${noSlash}/v1`;
+}
+
 export function setOpenAIKey(key: string): void {
+  setOpenAIEndpoint({ apiKey: key });
+}
+
+/** Persist an OpenAI-compatible endpoint. A base URL alone is enough for
+ *  local servers that do not require a real API key. */
+export function setOpenAIEndpoint(opts: {
+  apiKey?: string;
+  baseUrl?: string;
+  defaultModel?: string;
+}): void {
   const store = readCredentials();
-  store.openai = { apiKey: key };
+  const prev = store.openai ?? {};
+  const apiKey = opts.apiKey !== undefined ? opts.apiKey.trim() : prev.apiKey;
+  const baseUrl = opts.baseUrl !== undefined ? opts.baseUrl.trim() : prev.baseUrl;
+  const defaultModel = opts.defaultModel !== undefined ? opts.defaultModel.trim() : prev.defaultModel;
+  const next: NonNullable<CredentialStore['openai']> = {};
+  if (apiKey) next.apiKey = apiKey;
+  if (baseUrl) next.baseUrl = baseUrl;
+  if (defaultModel) next.defaultModel = defaultModel;
+  if (!next.apiKey && !next.baseUrl) {
+    delete store.openai;
+  } else {
+    store.openai = next;
+  }
   writeCredentials(store);
 }
 

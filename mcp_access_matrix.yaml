@@ -83,14 +83,17 @@ overrides:
   shion:
     add: []
 
-  # CEO Office talkable seats — lean MCP so SuperGrok prefix stays cacheable.
+  # CEO Office talk seats are proper agents (operator 2026-08-16).
+  # Keep the platform base and add Hive so they can list/inspect fleet agents.
   hina:
-    remove:
-      - admin
-      - id
-      - scs
+    add:
+      - hive
   aya:
-    remove:
-      - admin
-      - id
-      - scs
+    add:
+      - hive
+  yuna:
+    add:
+      - hive
+  ena:
+    add:
+      - hive
