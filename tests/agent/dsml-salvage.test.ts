@@ -85,6 +85,22 @@ describe('salvageDsmlToolCalls', () => {
     expect(r.cleaned).toBe('Let me complete the ordered heartbeat pair cleanly:');
   });
 
+  it('strips Grok talk-seat ToolSearch storms (Ena 2026-08-16)', () => {
+    const text = 'I\'ll look up Hive agents and the CEO Office roster. '
+      + '<tool_call>mcp__shizuha-connect__ToolSearch</tool_call> '
+      + '<tool_call>ToolSearch</tool_call> '.repeat(8)
+      + '<tool_call>mcp__shizuha-wiki__ToolSearch</tool_call>';
+    const r = salvageDsmlToolCalls(text);
+    expect(r.hadMarkup).toBe(true);
+    expect(r.calls.map((c) => c.name)).toEqual([
+      'mcp__shizuha-connect__ToolSearch',
+      ...Array(8).fill('ToolSearch'),
+      'mcp__shizuha-wiki__ToolSearch',
+    ]);
+    expect(r.cleaned).toBe("I'll look up Hive agents and the CEO Office roster.");
+    expect(r.cleaned).not.toContain('tool_call');
+  });
+
   it('does not treat plain HTML-ish tags without name= as tool markup', () => {
     const text = 'See <div class="x">hello</div> and <span>world</span>.';
     const r = salvageDsmlToolCalls(text);
@@ -115,6 +131,17 @@ describe('stripDsmlMarkup', () => {
       `</${FW}DSML${FW}tool_calls>`,
     ].join('\n');
     expect(stripDsmlMarkup(text)).toBe('Running now.');
+  });
+});
+
+describe('holdDsmlStreamDelta grok tool_call', () => {
+  it('holds a split <tool_call> start and strips completed blocks', () => {
+    const a = holdDsmlStreamDelta("I'll look it up. <tool");
+    expect(a.text).toContain("I'll look it up.");
+    expect(a.carry).toBe('<tool');
+    const b = holdDsmlStreamDelta('_call>ToolSearch</tool_call>', a.carry);
+    expect(b.text).not.toContain('ToolSearch');
+    expect(b.text).not.toContain('tool_call');
   });
 });
 

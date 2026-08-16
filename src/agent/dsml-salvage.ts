@@ -39,6 +39,12 @@ const BARE_PARAM_RE =
   /<parameter\b[^>]*?\bname="([^"]+)"[^>]*>([\s\S]*?)<\/parameter>/g;
 const BARE_MARKER_RE = /<\/?invoke\b|<\/?parameter\b/i;
 
+// Grok / GLM leaked wire form (Ena 2026-08-16): `<tool_call>ToolSearch</tool_call>`
+// or `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`.
+const GROK_TOOL_CALL_RE = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+const GROK_ARG_RE = /<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g;
+const GROK_MARKER_RE = /<\/?tool_call\b/i;
+
 export interface SalvagedDsmlCall {
   name: string;
   input: Record<string, unknown>;
@@ -84,11 +90,24 @@ function collapseWhitespace(text: string): string {
     .trim();
 }
 
+function salvageGrokToolCallInner(inner: string): SalvagedDsmlCall | null {
+  const name = (inner.match(/^\s*([^<\s][^<]*?)\s*(?=<arg_key>|$)/)?.[1] ?? '').trim();
+  if (!name) return null;
+  const input: Record<string, unknown> = {};
+  GROK_ARG_RE.lastIndex = 0;
+  let arg: RegExpExecArray | null;
+  while ((arg = GROK_ARG_RE.exec(inner)) !== null) {
+    input[arg[1]!.trim()] = coerceParamValue(arg[2] ?? '');
+  }
+  return { name, input };
+}
+
 export function salvageDsmlToolCalls(text: string): DsmlSalvageResult {
   const source = text ?? '';
   const hasDsml = MARKER_RE.test(source);
   const hasBare = BARE_MARKER_RE.test(source);
-  if (!hasDsml && !hasBare) {
+  const hasGrok = GROK_MARKER_RE.test(source);
+  if (!hasDsml && !hasBare && !hasGrok) {
     return { hadMarkup: false, calls: [], cleaned: source };
   }
 
@@ -114,6 +133,15 @@ export function salvageDsmlToolCalls(text: string): DsmlSalvageResult {
       .replace(/<\/?parameter\b[^>]{0,200}>/gi, ' ');
   }
 
+  if (hasGrok) {
+    cleaned = cleaned.replace(GROK_TOOL_CALL_RE, (_m, inner: string) => {
+      const call = salvageGrokToolCallInner(inner ?? '');
+      if (call) calls.push(call);
+      return ' ';
+    });
+    cleaned = cleaned.replace(/<\/?tool_call\b[^>]{0,200}>/gi, ' ');
+  }
+
   return { hadMarkup: true, calls, cleaned: collapseWhitespace(cleaned) };
 }
 
@@ -122,14 +150,18 @@ export function salvageDsmlToolCalls(text: string): DsmlSalvageResult {
  *  longer possible. */
 export function stripDsmlMarkup(text: string): string {
   const source = text ?? '';
-  if (!MARKER_RE.test(source) && !BARE_MARKER_RE.test(source)) return source;
+  if (!MARKER_RE.test(source) && !BARE_MARKER_RE.test(source) && !GROK_MARKER_RE.test(source)) {
+    return source;
+  }
   return collapseWhitespace(
     source
       .replace(INVOKE_RE, ' ')
       .replace(ANY_TAG_RE, ' ')
       .replace(BARE_INVOKE_RE, ' ')
+      .replace(GROK_TOOL_CALL_RE, ' ')
       .replace(/<\/?invoke\b[^>]{0,200}>/gi, ' ')
       .replace(/<\/?parameter\b[^>]{0,200}>/gi, ' ')
+      .replace(/<\/?tool_call\b[^>]{0,200}>/gi, ' ')
       .replace(MARKER_RE, ' '),
   );
 }
@@ -154,6 +186,8 @@ const STREAM_HOLD_MARKERS = [
   '</invoke>',
   '<parameter',
   '</parameter>',
+  '<tool_call',
+  '</tool_call>',
 ];
 const STREAM_HOLD_MAX = Math.max(...STREAM_HOLD_MARKERS.map((m) => m.length));
 
@@ -180,7 +214,7 @@ export function holdDsmlStreamDelta(
 ): { text: string; carry: string } {
   let source = (carry || '') + (delta || '');
   if (!source) return { text: '', carry: '' };
-  if (MARKER_RE.test(source) || BARE_MARKER_RE.test(source)) {
+  if (MARKER_RE.test(source) || BARE_MARKER_RE.test(source) || GROK_MARKER_RE.test(source)) {
     source = stripDsmlMarkup(source);
   }
   if (finished) return { text: source, carry: '' };

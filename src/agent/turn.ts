@@ -7,7 +7,8 @@ import type { AgentEventEmitter } from '../events/emitter.js';
 import type { HookEngine } from '../hooks/engine.js';
 import type { BackgroundTaskRegistry } from '../tasks/registry.js';
 import { PerfTimer, formatPerfStatus, ttftWarnThresholdMs } from '../utils/perf-metrics.js';
-import { salvageDsmlToolCalls } from './dsml-salvage.js';
+import { holdDsmlStreamDelta, salvageDsmlToolCalls } from './dsml-salvage.js';
+import { talkSeatSuppressesTools } from '../platform/lean-conversational.js';
 import { countTokens } from '../utils/tokens.js';
 import { getSafetyFactor } from '../prompt/context.js';
 import * as fs from 'node:fs';
@@ -323,6 +324,8 @@ export async function executeTurn(
 
   // Stream LLM response
   let text = '';
+  let markupCarry = '';
+  let leakedToolCallTags = 0;
   let finalText: string | undefined;
   const toolCalls: ToolCall[] = [];
   const reasoningBlocks: Array<{ id: string; encryptedContent?: string | null; rawContent?: string; signature?: string; summary?: Array<{ text: string }> }> = [];
@@ -516,10 +519,32 @@ export async function executeTurn(
       }
 
       switch (chunk.type) {
-        case 'text':
-          text += chunk.text;
-          addOutputDelta(chunk.text);
-          emitter.emit({ type: 'content', text: chunk.text, timestamp: Date.now() });
+        case 'text': {
+          leakedToolCallTags += (chunk.text.match(/<tool_call>/gi) || []).length;
+          if (leakedToolCallTags >= 6) {
+            outputDegeneracyReason = 'repeated_line';
+            outputDegeneracyEvidence = `${leakedToolCallTags} leaked <tool_call> tags`;
+            stopReason = 'degenerate_generation';
+            logger.warn(
+              { model, provider: provider.name, count: leakedToolCallTags },
+              'Stopped leaked Grok/GLM <tool_call> storm before it painted the transcript',
+            );
+            emitter.emit({
+              type: 'provider_status',
+              code: 'degenerate_generation_stopped',
+              level: 'warning',
+              provider: provider.name,
+              message: 'Stopped leaked tool-call markup before it could flood the chat.',
+              timestamp: Date.now(),
+            });
+            break stream_loop;
+          }
+          const held = holdDsmlStreamDelta(chunk.text, markupCarry);
+          markupCarry = held.carry;
+          if (!held.text) break;
+          text += held.text;
+          addOutputDelta(held.text);
+          emitter.emit({ type: 'content', text: held.text, timestamp: Date.now() });
           const soup = detectScriptCollapse(text);
           if (soup.degenerate) {
             outputDegeneracyReason = soup.reason ?? 'script_collapse';
@@ -580,6 +605,7 @@ export async function executeTurn(
             }
           }
           break;
+        }
 
         case 'final_text':
           finalText = chunk.text;
@@ -775,6 +801,16 @@ export async function executeTurn(
     if (fbStallTimer) clearTimeout(fbStallTimer);
   }
 
+  if (markupCarry) {
+    const flushed = holdDsmlStreamDelta('', markupCarry, true);
+    markupCarry = '';
+    if (flushed.text) {
+      text += flushed.text;
+      addOutputDelta(flushed.text);
+      emitter.emit({ type: 'content', text: flushed.text, timestamp: Date.now() });
+    }
+  }
+
   // Breaking the async stream deliberately invokes the provider iterator's
   // return path before its trailing usage chunk arrives. Preserve honest
   // telemetry for the stopped generation instead of recording it as 0/0.
@@ -881,7 +917,12 @@ export async function executeTurn(
         });
         if (finalText !== undefined) finalText = dsml.cleaned;
         else text = dsml.cleaned;
-        if (toolCalls.length === 0 && dsml.calls.length > 0 && !abortSignal?.aborted) {
+        if (
+          toolCalls.length === 0
+          && dsml.calls.length > 0
+          && !abortSignal?.aborted
+          && !talkSeatSuppressesTools()
+        ) {
           for (const call of dsml.calls) {
             const id = `dsml_salvaged_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
             emitter.emit({ type: 'tool_start', toolCallId: id, toolName: call.name, input: call.input, timestamp: Date.now() });
