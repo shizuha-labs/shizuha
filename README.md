@@ -32,7 +32,7 @@ Runtime: **Node.js 22+**.
 
 ```bash
 git clone https://github.com/shizuha-labs/shizuha.git
-cd cli
+cd shizuha
 ./install.sh
 ```
 
@@ -51,7 +51,8 @@ The installer auto-detects whether you're in a source tree or downloading a preb
 shizuha up
 
 # Dashboard: https://localhost:8015
-# Login: shizuha / shizuha (change in Settings)
+# First-run username is `shizuha`. The one-time password is printed
+# in the daemon console (or set SHIZUHA_DASHBOARD_PASSWORD). Change it in Settings.
 ```
 
 ## Default Agents
