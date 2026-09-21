@@ -59,7 +59,7 @@ def render(args: argparse.Namespace) -> dict:
     )
     clone_script = f"""set -eu
 git init /workspace/src
-git -C /workspace/src remote add origin http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git
+git -C /workspace/src remote add origin http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha.git
 AUTH="$(printf 'x-token-auth:%s' "$GIT_PASSWORD" | base64 | tr -d '\n')"
 git -C /workspace/src -c http.extraHeader="Authorization: Basic ${{AUTH}}" fetch --depth=1 origin "$SOURCE_SHA"
 git -C /workspace/src checkout --detach FETCH_HEAD

@@ -152,7 +152,7 @@ jobs:
                         test -n "\${CI_SOURCE_SHA:-}"
                         git init /src
                         cd /src
-                        git remote add origin "http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git"
+                        git remote add origin "http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha.git"
                         git fetch --depth=1 origin "\${CI_SOURCE_SHA}"
                         git checkout --detach FETCH_HEAD
                         test "\$(git rev-parse HEAD)" = "\${CI_SOURCE_SHA}"

@@ -66,7 +66,7 @@ jobs:
           metadata:
             name: ${JOB}
             namespace: build
-            labels: { app: ci-longe2e, service: shizuha-beta, shizuha.io/plat-task: PLAT-4720 }
+            labels: { app: ci-longe2e, service: shizuha, shizuha.io/plat-task: PLAT-4720 }
           spec:
             activeDeadlineSeconds: 2400
             backoffLimit: 0
@@ -91,7 +91,7 @@ jobs:
                         set -e
                         test -n "\${GIT_PASSWORD}"
                         AUTH="Authorization: Basic \$(printf 'x-token-auth:%s' "\${GIT_PASSWORD}" | base64 -w0)"
-                        REPO=http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git
+                        REPO=http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha.git
                         git -c http.extraheader="\${AUTH}" clone --depth=50 "\${REPO}" /workspace/src
                         cd /workspace/src
                         if [ -n "\${EXPECTED_SHA}" ] && [ "\${EXPECTED_SHA}" != "manual" ]; then

@@ -1,9 +1,9 @@
-# PLAT-4720 — full-suite premerge gate for shizuha-beta.
+# PLAT-4720 — full-suite premerge gate for shizuha.
 #
 # Before this existed, NO workflow in this repo ran the test suite. `premerge-parity.yml`
 # runs `unittest tests.ci.test_agent_runtime_workflow_parity` — assertions about the
 # workflow files agreeing with each other — not vitest and not tsc. A green check on a
-# shizuha-beta PR therefore did not mean tests ran (@sara, PLAT-4720 §1 / PLAT-5075).
+# a shizuha PR therefore did not mean tests ran (@sara, PLAT-4720 §1 / PLAT-5075).
 #
 # Shape: the runner DISPATCHES, the Job EXECUTES. That split is load-bearing for
 # security, not stylistic:
@@ -72,7 +72,7 @@ jobs:
           metadata:
             name: ${JOB}
             namespace: build
-            labels: { app: ci-fullsuite, service: shizuha-beta, shizuha.io/plat-task: PLAT-4720 }
+            labels: { app: ci-fullsuite, service: shizuha, shizuha.io/plat-task: PLAT-4720 }
           spec:
             # Healthy full-suite finishes in ~90s (see ALERT-25167 green baselines).
             # 20m is generous for npm cold-cache + contended nodes; the prior 3600s
@@ -129,7 +129,7 @@ jobs:
                         set -e
                         test -n "\${GIT_PASSWORD}"
                         AUTH="Authorization: Basic \$(printf 'x-token-auth:%s' "\${GIT_PASSWORD}" | base64 -w0)"
-                        REPO=http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git
+                        REPO=http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha.git
                         git -c http.extraheader="\${AUTH}" clone --depth=50 "\${REPO}" /workspace/src
                         cd /workspace/src
                         if ! git checkout "\${EXPECTED_SHA}" 2>/dev/null; then
