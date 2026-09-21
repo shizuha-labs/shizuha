@@ -13,7 +13,6 @@
 name: build-agent-runtime
 # PLAT-4740: CI re-fire after YAML-safe smoke renderer (supersedes e669884/ef5e520 failures).
 on:
-  workflow_dispatch:
   # The runtime contains the bundled SCLI itself, not only third-party harnesses.
   # Rebuild on every runtime-source landing so a bridge/daemon fix cannot remain
   # published as a standalone tarball while every fleet pod keeps old code.
