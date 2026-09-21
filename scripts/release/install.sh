@@ -2,7 +2,7 @@
 # SCLI-12: Shizuha standalone installer with SHA256 verification.
 #
 # Usage:
-#   curl -fsSL https://github.com/shizuha-labs/shizuha-beta/releases/latest/download/install.sh | bash
+#   curl -fsSL https://github.com/shizuha-labs/shizuha/releases/latest/download/install.sh | bash
 #   # or with a specific version:
 #   SHIZUHA_VERSION=0.1.0 bash install.sh
 #
@@ -16,7 +16,7 @@ set -euo pipefail
 
 SHIZUHA_DIR="${SHIZUHA_DIR:-$HOME/.shizuha}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-REPO="shizuha-labs/shizuha-beta"
+REPO="shizuha-labs/shizuha"
 SKIP_VERIFY="${SKIP_VERIFY:-0}"
 
 # ── Detect platform ──────────────────────────────────────────────────────────

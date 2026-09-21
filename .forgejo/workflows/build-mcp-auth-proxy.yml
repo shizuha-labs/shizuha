@@ -84,7 +84,7 @@ jobs:
                       - |
                         set -eu
                         git clone --filter=blob:none --no-checkout \
-                          "http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git" \
+                          "http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha.git" \
                           /workspace/src
                         cd /workspace/src
                         git fetch --depth=1 origin "${SOURCE_SHA}"

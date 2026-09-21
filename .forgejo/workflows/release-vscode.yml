@@ -8,7 +8,7 @@ name: release-vscode-extension
 # This lane is GitHub-oriented (upload-artifact@v4+, Marketplace-adjacent evidence).
 # Origin/GHES-compat runners reject @actions/artifact v2+ (GHESNotSupportedError).
 # `shizuha` is pending archival (ADR-0057 / PLAT-5398); real VS Code release is
-# re-homed to shizuha-beta (SCLI-326). Match PLAT-5767/stalwart: no-op green on
+# re-homed to the dev repo (SCLI-326). Match PLAT-5767/stalwart: no-op green on
 # Origin, full job only when github.server_url == https://github.com.
 on:
   push:
@@ -35,7 +35,7 @@ jobs:
           set -euo pipefail
           echo "Skipping release-vscode on ${GITHUB_SERVER_URL:-unknown}."
           echo "Reason: upload-artifact@v4+ / @actions/artifact v2+ unsupported on GHES/Origin (ALERT-25166)."
-          echo "Durable path: ADR-0057 archival of shizuha; VS Code release re-homed to shizuha-beta (SCLI-326)."
+          echo "Durable path: ADR-0057 archival of the old staging repo; VS Code release re-homed to the dev repo (SCLI-326)."
           echo "GitHub.com continues to run the full package-and-test job below."
 
   package-and-test:

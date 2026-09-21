@@ -103,7 +103,7 @@ def verify(run_id, source_sha, source_ref, repository):
         raise ValueError("invalid release run/source")
     if source_ref not in ("refs/heads/main", "refs/heads/master"):
         raise ValueError("runtime release must use the primary ref")
-    if repository != "shizuha-labs/shizuha-beta":
+    if repository != "shizuha-labs/shizuha":
         raise ValueError("unexpected runtime source repository")
     inventory = kubectl(["get", "pods", "-n", "origin", "-l", "app=run-coalescer", "-o", "json"])
     candidates = [identity for pod in inventory["items"] if (identity := pod_identity(pod))]
