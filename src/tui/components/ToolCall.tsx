@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Box, Text } from 'ink';
 import { theme as palette } from '../theme.js';
 import type { ToolCallEntry } from '../state/types.js';
@@ -232,15 +232,30 @@ const RunningToolChrome: React.FC<{
   );
 };
 
-export const ToolCall: React.FC<ToolCallProps> = ({ entry, cwd, verbosity = 'normal' }) => {
+export const ToolCall: React.FC<ToolCallProps> = React.memo(({ entry, cwd, verbosity = 'normal' }) => {
   const isRunning = entry.status === 'running';
   const commandLimits = COMMAND_LIMITS[verbosity] ?? COMMAND_LIMITS.normal;
-  const commandPreview = getCommandPreview(entry);
-  const commandText = entry.name === 'bash' && entry.input.command
-    ? getCommandText(String(entry.input.command), verbosity)
-    : '';
-  const inputLines = entry.name === 'bash' ? [] : previewToolInput(entry.input, 2);
-  const inlineSummary = entry.name !== 'bash' ? getToolInlineSummary(entry.input) : '';
+  // SCLI-562: memoize the derived preview strings keyed on the entry/input
+  // reference (codex mcp.rs borrow-not-clone technique). History cells re-render
+  // on every keystroke/scroll in the live viewport; without memoization each
+  // frame re-runs Object.entries + JSON.stringify over the structured MCP
+  // invocation payload, so per-keystroke cost scales with payload size instead
+  // of the visible tail. Memoizing on the input reference bounds that cost to
+  // cells whose input actually changed.
+  const commandPreview = useMemo(() => getCommandPreview(entry), [entry]);
+  const isBashWithCommand = entry.name === 'bash' && Boolean(entry.input.command);
+  const commandText = useMemo(
+    () => (isBashWithCommand ? getCommandText(String(entry.input.command), verbosity) : ''),
+    [isBashWithCommand, entry.input.command, verbosity],
+  );
+  const inputLines = useMemo(
+    () => (entry.name === 'bash' ? [] : previewToolInput(entry.input, 2)),
+    [entry.name, entry.input],
+  );
+  const inlineSummary = useMemo(
+    () => (entry.name !== 'bash' ? getToolInlineSummary(entry.input) : ''),
+    [entry.name, entry.input],
+  );
   const isHiddenCommand = entry.name === 'bash' && Boolean(entry.input.command) && !commandText && !commandPreview;
   const resultLimits = getResultLimits(Boolean(entry.isError), verbosity);
   const resultText = getResultText(entry, verbosity);
@@ -332,4 +347,5 @@ export const ToolCall: React.FC<ToolCallProps> = ({ entry, cwd, verbosity = 'nor
       )}
     </Box>
   );
-};
+});
+ToolCall.displayName = 'ToolCall';

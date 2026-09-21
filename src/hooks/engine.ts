@@ -12,6 +12,9 @@ import { logger } from '../utils/logger.js';
  *   TOOL_ERROR   — "true" if tool errored (PostToolUse only)
  *   SESSION_ID   — current session ID
  *   CWD          — working directory
+ *   BACKGROUND_TASKS — JSON array of non-terminal background tasks
+ *                      (SessionStop only, SCLI-618)
+ *   ACTIVE_CRONS     — JSON array of enabled cron jobs (SessionStop only, SCLI-618)
  *
  * Exit codes:
  *   0 — hook passed (continue)

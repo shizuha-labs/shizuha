@@ -49,10 +49,11 @@ raise SystemExit(namespace["main"](argv))
 
 def render(args: argparse.Namespace) -> dict:
     job_name = f"ci-overlay-agentrt-{args.candidate_tag}"
-    # The exact qualified runtime base is already the overlay's trust anchor,
-    # contains Git, Python, and the pinned Node 22 toolchain, and is pre-pulled
-    # fleet-wide by every successful runtime release. Reuse it for every viable
-    # execution stage so this authoritative path never depends on Docker Hub.
+    # Host :30500 is the node-local registry mirror kubelet can reach.
+    # Cluster DNS (registry.registry.svc) is not in kubelet's resolver, so
+    # that name ImagePullBackOffs even on gx10. Fleet pre-pull already
+    # warmed this digest on every non-small node; stay off disk-class=small
+    # (i9-ws) where :30500 is absent.
     runtime_image = (
         f"localhost:30500/{args.image_repo}@{args.base_index_digest}"
     )
@@ -107,7 +108,14 @@ test -f dist/shizuha.js
                                             {
                                                 "key": "node-role.kubernetes.io/control-plane",
                                                 "operator": "DoesNotExist",
-                                            }
+                                            },
+                                            {
+                                                # i9-ws / gx10-13: no cluster DNS for
+                                                # registry.svc and no host :30500.
+                                                "key": "shizuha.io/disk-class",
+                                                "operator": "NotIn",
+                                                "values": ["small"],
+                                            },
                                         ]
                                     }
                                 ]

@@ -28,6 +28,8 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import type { TurnTelemetryRecord } from '../telemetry/turn-telemetry.js';
 import { getAutoAndonMetricsSnapshot } from '../daemon/auto-andon.js';
+import { getHeartbeatBudgetSkipCount } from '../shared/heartbeat-budget-skip.js';
+import type { AgentLifecycleState } from '../daemon/agent-state-store.js';
 
 const serversByPort = new Map<number, http.Server>();
 
@@ -44,6 +46,8 @@ export interface AgentHealthInfo {
   running: boolean;
   /** PLAT-962: true when bridge is in PLAT-879 token-pool backoff (capacity-limited, not crashed) */
   capacityUnavailable: boolean;
+  /** Hive lifecycle intent, distinct from observed process residency. */
+  lifecycleState: AgentLifecycleState;
 }
 
 /**
@@ -61,12 +65,15 @@ export function buildAgentHealth(
   runningAgentIds: Set<string>,
   /** PLAT-962: agent IDs currently in PLAT-879 token-pool backoff */
   capacityUnavailableIds: Set<string> = new Set(),
+  lifecycleStates: Map<string, AgentLifecycleState> = new Map(),
 ): AgentHealthInfo[] {
   return agents.map((a) => ({
     username: a.username,
     enabled: enabledAgentIds.has(a.id),
     running: runningAgentIds.has(a.id),
     capacityUnavailable: capacityUnavailableIds.has(a.id),
+    lifecycleState: lifecycleStates.get(a.id)
+      ?? (enabledAgentIds.has(a.id) ? 'enabled' : 'operator_stopped'),
   }));
 }
 
@@ -258,6 +265,13 @@ export function buildMetrics(agents: AgentHealthInfo[]): string {
     '# TYPE shizuha_agent_enabled_snapshot_timestamp_seconds gauge',
     `shizuha_agent_enabled_snapshot_timestamp_seconds ${enabledSnapshotObservedAt}`,
   );
+  lines.push(
+    '# HELP shizuha_agent_lifecycle_state Hive lifecycle intent; hibernated is wakeable while operator_stopped is a hard stop',
+    '# TYPE shizuha_agent_lifecycle_state gauge',
+  );
+  for (const a of agents) {
+    lines.push(`shizuha_agent_lifecycle_state{agent="${a.username}",state="${a.lifecycleState}"} 1`);
+  }
 
   lines.push(
     '# HELP shizuha_agent_last_activity_seconds Unix timestamp (seconds) of the last completed turn',
@@ -271,6 +285,17 @@ export function buildMetrics(agents: AgentHealthInfo[]): string {
   }
 
   appendEfficiencyTelemetryMetrics(lines, agents);
+
+  lines.push(
+    '# HELP shizuha_agent_heartbeat_budget_skips Idle-heartbeat model skips (queue-blind / fail-closed preflight) over the process lifetime (PLAT-6187).',
+    '# TYPE shizuha_agent_heartbeat_budget_skips gauge',
+  );
+  for (const a of agents) {
+    const skips = getHeartbeatBudgetSkipCount(a.username);
+    if (skips > 0) {
+      lines.push(`shizuha_agent_heartbeat_budget_skips{agent="${a.username}"} ${skips}`);
+    }
+  }
 
   lines.push(
     '# HELP shizuha_agent_capacity_unavailable 1 if agent is in PLAT-879 token-pool backoff (PLAT-962)',
@@ -306,20 +331,25 @@ export function buildMetrics(agents: AgentHealthInfo[]): string {
   // PLAT-1113 / PLAT-1073: expose bridge-degradation metric families consumed
   // by ShizuhaAgent* Prometheus alerts. The runtime daemon already knows the
   // capacity/backoff and provider-exhaustion signals; deeper bridge fields that
-  // are not available in this in-process exporter are emitted as explicit zeroes
-  // so alert rules can safely join on stable families instead of missing series.
+  // are not available to this in-process exporter are emitted as JOIN_PAD —
+  // self-identifying padding via the `placeholder="1"` label (PLS-741/PLS-869,
+  // wiki `1c95857d`). Alert rules can still join on stable families, but no
+  // consumer may ever mistake a placeholder series for measurement: the Pulse
+  // reconciler filters `placeholder="1"` out of its streak gates, and the
+  // pad families grant neither deactivation nor recovery. Only series WITHOUT
+  // the placeholder label are real MEASUREMENT.
   lines.push(
-    '# HELP shizuha_agent_bridge_degraded 1 if bridge health reports any degraded provider/auth/capacity/runaway/empty-turn signal.',
+    '# HELP shizuha_agent_bridge_degraded 1 if bridge health reports any degraded provider/auth/capacity/runaway/empty-turn signal (MEASUREMENT).',
     '# TYPE shizuha_agent_bridge_degraded gauge',
-    '# HELP shizuha_agent_bridge_auth_unavailable 1 if bridge health reports auth unavailable.',
+    '# HELP shizuha_agent_bridge_auth_unavailable JOIN_PAD placeholder=1 (bridge auth state not available in-process). Not measurement.',
     '# TYPE shizuha_agent_bridge_auth_unavailable gauge',
-    '# HELP shizuha_agent_bridge_capacity_unavailable 1 if bridge health reports provider capacity/quota unavailable.',
+    '# HELP shizuha_agent_bridge_capacity_unavailable 1 if bridge health reports provider capacity/quota unavailable (MEASUREMENT).',
     '# TYPE shizuha_agent_bridge_capacity_unavailable gauge',
-    '# HELP shizuha_agent_consecutive_error_turns Consecutive provider/error turns from bridge health.',
+    '# HELP shizuha_agent_consecutive_error_turns JOIN_PAD placeholder=1 (bridge error-turn count not available in-process). Not measurement.',
     '# TYPE shizuha_agent_consecutive_error_turns gauge',
-    '# HELP shizuha_agent_empty_turn_streak Consecutive empty turns from bridge health.',
+    '# HELP shizuha_agent_empty_turn_streak JOIN_PAD placeholder=1 (bridge empty-turn streak not available in-process). Not measurement.',
     '# TYPE shizuha_agent_empty_turn_streak gauge',
-    '# HELP shizuha_agent_runaway_queue_depth 1 if bridge health reports busy with runaway queue depth.',
+    '# HELP shizuha_agent_runaway_queue_depth JOIN_PAD placeholder=1 (bridge queue depth not available in-process). Not measurement.',
     '# TYPE shizuha_agent_runaway_queue_depth gauge',
   );
   for (const a of agents) {
@@ -327,11 +357,11 @@ export function buildMetrics(agents: AgentHealthInfo[]): string {
     const capacity = a.capacityUnavailable || exhausted;
     const degraded = a.running && capacity;
     lines.push(`shizuha_agent_bridge_degraded{agent="${a.username}"} ${degraded ? 1 : 0}`);
-    lines.push(`shizuha_agent_bridge_auth_unavailable{agent="${a.username}"} 0`);
+    lines.push(`shizuha_agent_bridge_auth_unavailable{agent="${a.username}",placeholder="1"} 0`);
     lines.push(`shizuha_agent_bridge_capacity_unavailable{agent="${a.username}"} ${capacity ? 1 : 0}`);
-    lines.push(`shizuha_agent_consecutive_error_turns{agent="${a.username}"} 0`);
-    lines.push(`shizuha_agent_empty_turn_streak{agent="${a.username}"} 0`);
-    lines.push(`shizuha_agent_runaway_queue_depth{agent="${a.username}"} 0`);
+    lines.push(`shizuha_agent_consecutive_error_turns{agent="${a.username}",placeholder="1"} 0`);
+    lines.push(`shizuha_agent_empty_turn_streak{agent="${a.username}",placeholder="1"} 0`);
+    lines.push(`shizuha_agent_runaway_queue_depth{agent="${a.username}",placeholder="1"} 0`);
   }
 
   return lines.join('\n') + '\n';

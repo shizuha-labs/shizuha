@@ -3,7 +3,7 @@ import type { Message } from '../../src/agent/types.js';
 import { assistantTranscriptText, messagesToTranscript } from '../../src/tui/hooks/useAgentSession.js';
 
 describe('resumed transcript conversion', () => {
-  it('renders reasoning-only GLM answers from persisted rawContent', () => {
+  it('does not promote persisted reasoning into the visible resumed answer', () => {
     const messages: Message[] = [
       {
         role: 'assistant',
@@ -18,11 +18,33 @@ describe('resumed transcript conversion', () => {
       },
     ];
 
+    expect(messagesToTranscript(messages)).toEqual([]);
+  });
+
+  it('resumes only visible text when a turn also stored a reasoning block', () => {
+    const messages: Message[] = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'reasoning',
+            id: 'vllm_reasoning_1',
+            rawContent: 'The user is asking me what I think about this system.',
+          },
+          {
+            type: 'text',
+            text: 'The skills-over-context design is the part that scales.',
+          },
+        ],
+        timestamp: 123,
+      },
+    ];
+
     expect(messagesToTranscript(messages)).toEqual([
       {
         id: 'resume-0-123',
         role: 'assistant',
-        content: 'This answer was surfaced live from GLM reasoning.',
+        content: 'The skills-over-context design is the part that scales.',
         timestamp: 123,
       },
     ]);

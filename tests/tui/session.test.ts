@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import {
   AgentSession,
   resolveTuiPreflightCeilingTokens,
@@ -10,6 +12,7 @@ import {
 import type { AgentEvent } from '../../src/events/types.js';
 import * as turnModule from '../../src/agent/turn.js';
 import { estimateTokens } from '../../src/prompt/context.js';
+import { VLlmProvider } from '../../src/provider/vllm.js';
 
 describe('AgentSession', () => {
   let session: AgentSession;
@@ -140,6 +143,18 @@ describe('AgentSession', () => {
         session.setModel('gemini-nonexistent');
         expect(events.some((e) => e.type === 'error')).toBe(true);
       }
+    });
+
+    it('rejects whitespace-containing model spec (SCLI-623 prompt-string guard)', async () => {
+      await session.init(process.cwd(), 'test-local-model');
+      const events: AgentEvent[] = [];
+      session.on('agent_event', (e: AgentEvent) => events.push(e));
+
+      const result = session.setModel('cortex/DeepSeek-V4-Flash Reply with exactly: SCLI370_PATIENT_TURN_OK');
+      expect(result).toBe('error');
+      // Model must be unchanged — a prompt string can never be persisted.
+      expect(session.model).toBe('test-local-model');
+      expect(events.some((e) => e.type === 'error' && /whitespace/.test(e.error))).toBe(true);
     });
   });
 
@@ -304,6 +319,99 @@ describe('AgentSession', () => {
       maintenanceSpy.mockRestore();
     });
 
+    it('pre-turn deadline after a successful hierarchical pass does not retry from the original history', async () => {
+      // Production sequence (shizuha1 2026-09-18/19, session 43097d80):
+      // submitPrompt → enforceRequiredCompaction('pre-turn')
+      //   → runCompactionWithHeartbeat (SCLI-389 deadline abort)
+      //   → compactMessages pass 1 ok, pass 2 aborted
+      // Instant helper mocks finish the whole tree before 900s, so they never
+      // saw this. The real caller used to return compacted=false and leave
+      // this.messages untouched, then retry from 1392 originals forever.
+      const previousHome = process.env['HOME'];
+      const previousDeadline = process.env['SHIZUHA_COMPACTION_DEADLINE_MS'];
+      const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'shizuha-session-deadline-keep-'));
+      process.env['HOME'] = tempHome;
+      process.env['SHIZUHA_COMPACTION_DEADLINE_MS'] = '2000';
+      const longSummary = `1. Primary request: keep partial hierarchical progress.\n7. Pending Tasks: continue.\n8. Current Work: compact.\n${'word '.repeat(250)}`;
+      const source = Array.from({ length: 30 }, (_, index) => ({
+        role: (index % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+        content: `sentinel-${index}: ${'word '.repeat(800)}`,
+        timestamp: Date.now() + index,
+      }));
+
+      try {
+        await session.init(process.cwd(), 'test-local-model');
+        const internal = session as unknown as {
+          messages: typeof source;
+          sessionId: string | null;
+          store: { createSession: (model: string, cwd: string) => { id: string } };
+          ensureProvider: () => unknown;
+          enforceRequiredCompaction: (
+            maxContextTokens: number,
+            options: { overheadTokens?: number } | undefined,
+            phase: 'pre-turn',
+            isRequired: () => boolean,
+            forceOnce: boolean,
+          ) => Promise<{ compacted: boolean; attempts: number }>;
+        };
+        const saved = internal.store.createSession(session.model, process.cwd());
+        internal.sessionId = saved.id;
+        internal.messages = structuredClone(source);
+        const originalCount = internal.messages.length;
+        const originalLast = structuredClone(internal.messages.at(-1)!);
+        let compactionCalls = 0;
+        const provider = {
+          name: 'test-vllm',
+          supportsTools: true,
+          maxContextWindow: 12_000,
+          contextWindowFor: () => 12_000,
+          chat: async function* (
+            _messages: unknown,
+            options: { abortSignal?: AbortSignal },
+          ) {
+            compactionCalls++;
+            if (compactionCalls % 2 === 0) {
+              await new Promise<never>((_resolve, reject) => {
+                const signal = options.abortSignal;
+                if (!signal) {
+                  reject(new Error('compaction deadline abort signal missing'));
+                  return;
+                }
+                const onAbort = () => reject(signal.reason ?? new Error('Aborted'));
+                if (signal.aborted) onAbort();
+                else signal.addEventListener('abort', onAbort, { once: true });
+              });
+            }
+            yield { type: 'text' as const, text: longSummary };
+            yield { type: 'stop_reason' as const, reason: 'end_turn' };
+            yield { type: 'done' as const };
+          },
+        };
+        const ensureProviderSpy = vi.spyOn(internal, 'ensureProvider').mockReturnValue(provider);
+
+        const result = await internal.enforceRequiredCompaction(
+          12_000,
+          { overheadTokens: 0 },
+          'pre-turn',
+          () => estimateTokens(internal.messages, session.model) > 12_000 * 0.9,
+          true,
+        );
+
+        expect(result.compacted).toBe(true);
+        expect(internal.messages.length).toBeLessThan(originalCount);
+        expect(String(internal.messages[0]?.content)).toContain('[Conversation Summary]');
+        expect(internal.messages.at(-1)?.content).toBe(originalLast.content);
+        expect(compactionCalls).toBeGreaterThan(1);
+        ensureProviderSpy.mockRestore();
+      } finally {
+        if (previousDeadline == null) delete process.env['SHIZUHA_COMPACTION_DEADLINE_MS'];
+        else process.env['SHIZUHA_COMPACTION_DEADLINE_MS'] = previousDeadline;
+        if (previousHome == null) delete process.env['HOME'];
+        else process.env['HOME'] = previousHome;
+        await fs.rm(tempHome, { recursive: true, force: true });
+      }
+    }, 60_000);
+
     it('still fails loud when compaction hits a permanent provider error', async () => {
       await session.init(process.cwd(), 'test-local-model');
       const compact = vi.fn().mockRejectedValue(Object.assign(
@@ -338,6 +446,65 @@ describe('AgentSession', () => {
         }
         // Should also emit complete
         expect(events.some((e) => e.type === 'complete')).toBe(true);
+      }
+    });
+
+    it('submits after a /v1/models force-refresh timeout when last-known metadata exists', async () => {
+      // Production sequence (shizuha1 2026-09-21, session 43097d80):
+      // submitPrompt → getServedModel(model, {forceRefresh:true})
+      //   → AbortSignal.timeout on /v1/models → undefined
+      //   → "missing from live provider metadata" even though this process
+      //     already discovered cortex/GLM-5.3-Flash at 500k and Cortex still
+      //     listed it. The unit of regression is submitPrompt, not getServedModel
+      //     alone.
+      const originalTimeout = process.env['VLLM_MODEL_DISCOVERY_TIMEOUT_MS'];
+      process.env['VLLM_MODEL_DISCOVERY_TIMEOUT_MS'] = '80';
+      const model = 'cortex/GLM-5.3-Flash';
+      let hang = false;
+      const server = createServer((req, res) => {
+        if (req.url !== '/v1/models') {
+          res.writeHead(404).end();
+          return;
+        }
+        if (hang) return;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({
+          data: [{ id: model, max_model_len: 500_000 }],
+        }));
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const { port } = server.address() as AddressInfo;
+      const provider = new VLlmProvider(`http://127.0.0.1:${port}`, 131_072, undefined, 'cortex');
+      const executeTurnSpy = vi.spyOn(turnModule, 'executeTurn').mockResolvedValue({
+        assistantMessage: { role: 'assistant', content: 'ok', timestamp: Date.now() },
+        messages: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      } as never);
+      const ensureProviderSpy = vi.spyOn(
+        session as unknown as { ensureProvider: () => unknown },
+        'ensureProvider',
+      ).mockReturnValue(provider);
+
+      try {
+        await session.init(process.cwd(), model);
+        expect(await provider.getServedModel(model)).toBe(model);
+        hang = true;
+
+        const events: AgentEvent[] = [];
+        session.on('agent_event', (event: AgentEvent) => events.push(event));
+        await session.submitPrompt('continue');
+
+        expect(events.some((event) => (
+          event.type === 'error'
+          && event.error.includes('missing from live provider metadata')
+        ))).toBe(false);
+        expect(executeTurnSpy).toHaveBeenCalled();
+      } finally {
+        executeTurnSpy.mockRestore();
+        ensureProviderSpy.mockRestore();
+        if (originalTimeout == null) delete process.env['VLLM_MODEL_DISCOVERY_TIMEOUT_MS'];
+        else process.env['VLLM_MODEL_DISCOVERY_TIMEOUT_MS'] = originalTimeout;
+        await new Promise<void>((resolve) => server.close(() => resolve()));
       }
     });
 
@@ -854,7 +1021,7 @@ describe('AgentSession', () => {
               && typeof m.content === 'string'
               && m.content.includes('only a progress update'),
           ),
-        ).toBe(true);
+        ).toBe(false);
 
         const lastAssistant = [...resumedSession!.messages].reverse().find((m) => m.role === 'assistant');
         expect(lastAssistant?.content).toEqual([{ type: 'text', text: 'Found PLAT-999: Deploy best coding model on v4.' }]);
@@ -864,6 +1031,139 @@ describe('AgentSession', () => {
         if (resumed) {
           await resumed.destroy();
         }
+        if (previousHome == null) {
+          delete process.env['HOME'];
+        } else {
+          process.env['HOME'] = previousHome;
+        }
+        await fs.rm(tempHome, { recursive: true, force: true });
+      }
+    });
+
+    it('continues from prefix after GLM observation stop without parsed tool_calls', async () => {
+      const previousHome = process.env['HOME'];
+      const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'shizuha-session-glm-observation-'));
+      process.env['HOME'] = tempHome;
+
+      let ensureProviderSpy:
+        | ReturnType<typeof vi.spyOn<{
+          ensureProvider: () => unknown;
+        }, 'ensureProvider'>>
+        | null = null;
+
+      const executeTurnSpy = vi.spyOn(turnModule, 'executeTurn')
+        .mockImplementationOnce((async () => ({
+          assistantMessage: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'The MCP client has no cache.' }],
+            timestamp: Date.now(),
+          },
+          toolCalls: [],
+          toolResults: [],
+          inputTokens: 50,
+          outputTokens: 60,
+          stopReason: 'glm_observation',
+        })) as typeof turnModule.executeTurn)
+        .mockImplementationOnce((async () => ({
+          assistantMessage: {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Listing fleet agents.' },
+              {
+                type: 'tool_use',
+                id: 'fleet-list',
+                name: 'mcp__shizuha-hive__hive_list_fleet_agents',
+                input: {},
+              },
+            ],
+            timestamp: Date.now(),
+          },
+          toolCalls: [
+            { id: 'fleet-list', name: 'mcp__shizuha-hive__hive_list_fleet_agents', input: {} },
+          ],
+          toolResults: [
+            { toolUseId: 'fleet-list', content: '71 agents', isError: false },
+          ],
+          inputTokens: 60,
+          outputTokens: 8,
+          stopReason: 'tool_use',
+        })) as typeof turnModule.executeTurn)
+        .mockImplementationOnce((async () => ({
+          assistantMessage: {
+            role: 'assistant',
+            content: [{ type: 'text', text: '71 agents in Hive.' }],
+            timestamp: Date.now(),
+          },
+          toolCalls: [],
+          toolResults: [],
+          inputTokens: 70,
+          outputTokens: 6,
+          stopReason: 'end_turn',
+        })) as typeof turnModule.executeTurn);
+
+      try {
+        await session.init(process.cwd(), 'test-local-model', 'autonomous');
+        ensureProviderSpy = vi.spyOn(
+          session as unknown as { ensureProvider: () => unknown },
+          'ensureProvider',
+        ).mockReturnValue({});
+
+        await session.submitPrompt('list the fleet');
+        expect(executeTurnSpy).toHaveBeenCalledTimes(3);
+      } finally {
+        ensureProviderSpy?.mockRestore();
+        executeTurnSpy.mockRestore();
+        if (previousHome == null) {
+          delete process.env['HOME'];
+        } else {
+          process.env['HOME'] = previousHome;
+        }
+        await fs.rm(tempHome, { recursive: true, force: true });
+      }
+    });
+
+    it('does not burn thinking-only retries or emit empty-after-3 on empty GLM observation stop', async () => {
+      const previousHome = process.env['HOME'];
+      const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'shizuha-session-glm-obs-empty-'));
+      process.env['HOME'] = tempHome;
+
+      let ensureProviderSpy:
+        | ReturnType<typeof vi.spyOn<{
+          ensureProvider: () => unknown;
+        }, 'ensureProvider'>>
+        | null = null;
+      const errors: string[] = [];
+
+      const executeTurnSpy = vi.spyOn(turnModule, 'executeTurn')
+        .mockImplementation((async () => ({
+          assistantMessage: {
+            role: 'assistant',
+            content: [],
+            timestamp: Date.now(),
+          },
+          toolCalls: [],
+          toolResults: [],
+          inputTokens: 16949,
+          outputTokens: 18,
+          stopReason: 'glm_observation',
+        })) as typeof turnModule.executeTurn);
+
+      try {
+        await session.init(process.cwd(), 'test-local-model', 'autonomous');
+        ensureProviderSpy = vi.spyOn(
+          session as unknown as { ensureProvider: () => unknown },
+          'ensureProvider',
+        ).mockReturnValue({});
+        session.on('agent_event', (ev: { type?: string; error?: string }) => {
+          if (ev?.type === 'error' && ev.error) errors.push(ev.error);
+        });
+
+        await session.submitPrompt('check hive agents');
+        expect(executeTurnSpy).toHaveBeenCalledTimes(1);
+        expect(errors.some((e) => e.includes('empty response after'))).toBe(false);
+      } finally {
+        ensureProviderSpy?.mockRestore();
+        executeTurnSpy.mockRestore();
         if (previousHome == null) {
           delete process.env['HOME'];
         } else {
@@ -1106,6 +1406,43 @@ describe('AgentSession', () => {
         await fs.rm(tempHome, { recursive: true, force: true });
       }
     });
+
+    it('does not continue generation after a GLM repetition_detected think-loop', async () => {
+      const previousHome = process.env['HOME'];
+      const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'shizuha-session-repetition-'));
+      process.env['HOME'] = tempHome;
+      const executeTurnSpy = vi.spyOn(turnModule, 'executeTurn')
+        .mockImplementation((async () => ({
+          assistantMessage: {
+            role: 'assistant',
+            content: [{
+              type: 'reasoning',
+              id: 'r-rep',
+              rawContent: 'REAL paths:\n- /home/gcloud/gcp/gcp/g/g/g/g — NO. /home/gcloud/gcloud/g — NO.',
+            }],
+            timestamp: Date.now(),
+          },
+          toolCalls: [],
+          toolResults: [],
+          inputTokens: 100,
+          outputTokens: 883,
+          stopReason: 'repetition',
+        })) as typeof turnModule.executeTurn);
+      try {
+        await session.init(process.cwd(), 'GLM-5.3-Flash');
+        vi.spyOn(
+          session as unknown as { ensureProvider: () => unknown },
+          'ensureProvider',
+        ).mockReturnValue({});
+        await session.submitPrompt('move main-gdrive');
+        expect(executeTurnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        executeTurnSpy.mockRestore();
+        if (previousHome == null) delete process.env['HOME'];
+        else process.env['HOME'] = previousHome;
+        await fs.rm(tempHome, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('resumeSession', () => {
@@ -1319,10 +1656,10 @@ describe('AgentSession', () => {
           method: 'provider_semantic',
           beforeMessages: originalMessages.length,
           afterMessages: payload!.messages.length,
-          thresholdTokens: 285_696,
+          thresholdTokens: 228_557,
         });
-        expect(payload!.resumeCompaction!.beforeTokens).toBeGreaterThan(285_696);
-        expect(payload!.resumeCompaction!.afterTokens).toBeLessThan(285_696);
+        expect(payload!.resumeCompaction!.beforeTokens).toBeGreaterThan(228_557);
+        expect(payload!.resumeCompaction!.afterTokens).toBeLessThan(228_557);
         expect(payload!.messages.length).toBeLessThan(originalMessages.length);
         expect(store.loadSession(saved.id)?.messages).toHaveLength(payload!.messages.length);
         expect(String(payload!.messages[0]?.content)).toContain('[Conversation Summary]');
@@ -1517,7 +1854,11 @@ describe('AgentSession', () => {
           };
         }).store;
         const saved = store.createSessionWithId('resume-restores-token-anchor', 'test-local-model', process.cwd());
-        const largeText = 'cold estimation would falsely exceed the backend fit after process resume '.repeat(130);
+        // PLAT-9194: T_high is now 0.60 (380,928 x 0.60 = 228,557). The
+        // anchored provider truth below is what the resume estimator trusts —
+        // keep it BELOW the new trigger so this calibration test does not
+        // compact (the message text only needs to be plausibly long).
+        const largeText = 'cold estimation would falsely exceed the backend fit after process resume '.repeat(50);
         const originalMessages = Array.from({ length: 160 }, (_, index) => ({
           role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
           content: `${index}: ${largeText}`,
@@ -1526,7 +1867,10 @@ describe('AgentSession', () => {
         store.replaceMessages(saved.id, originalMessages);
         store.saveContextTokenAnchor(saved.id, {
           model: 'test-local-model',
-          providerInputTokens: 277_282,
+          // Anchored truth below the PLAT-9194 T_high (228,557): the resume
+          // must NOT compact, and beforeTokens must read THIS value (not the
+          // 1.45x cold fallback of the raw estimate, ~154K).
+          providerInputTokens: 190_000,
           providerPromptEstimate: 0,
           rawPromptTokens: estimateTokens(originalMessages, 'test-local-model'),
         }, originalMessages);
@@ -1570,7 +1914,10 @@ describe('AgentSession', () => {
 
         expect(ok).toBe(true);
         expect(payload!.resumeTrimmedDropped).toBe(0);
-        expect(payload!.resumeTrim?.beforeTokens).toBe(277_282);
+        // The anchored provider truth — NOT the 1.45x cold fallback of the
+        // raw estimate (~154K, below the range) and NOT a compaction-shrunk
+        // working set.
+        expect(payload!.resumeTrim?.beforeTokens).toBe(190_000);
         expect(payload!.resumeTrim?.hardBudgetExceeded).toBe(false);
         expect(payload!.messages).toHaveLength(originalMessages.length);
         expect(store.loadSession(saved.id)?.messages).toHaveLength(originalMessages.length);
@@ -1620,8 +1967,10 @@ describe('AgentSession', () => {
           }));
           rawTokens = estimateTokens(workingMessages, model);
           repeatCount += 10;
-        } while (rawTokens < 295_000);
-        expect(rawTokens).toBeLessThan(330_000);
+        } while (rawTokens < 240_000);
+        // PLAT-9194: must stay BELOW the new T_high (524,288 x 0.60 = 314,573)
+        // so the calibration resume does not compact.
+        expect(rawTokens).toBeLessThan(260_000);
 
         // This persisted recovery nudge is removed on resume, invalidating the
         // absolute message-prefix anchor exactly as in shizuha1. The tokenizer
@@ -1690,6 +2039,163 @@ describe('AgentSession', () => {
         expect(compactionCalls).not.toHaveBeenCalled();
       } finally {
         for (const resumed of resumedSessions) await resumed.destroy();
+        if (previousHome == null) delete process.env['HOME'];
+        else process.env['HOME'] = previousHome;
+        await fs.rm(tempHome, { recursive: true, force: true });
+      }
+    });
+
+    it('resumes when semantic compaction continuation stalls instead of failing init', async () => {
+      // shizuha1 2026-09-18: GLM max_tokens=2048, continuation empty/repeated,
+      // TUI init threw "Semantic compaction continuation made no progress".
+      const previousHome = process.env['HOME'];
+      const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'shizuha-session-resume-stall-'));
+      process.env['HOME'] = tempHome;
+      let resumed: AgentSession | null = null;
+
+      try {
+        await session.init(process.cwd(), 'test-local-model');
+        const store = (session as unknown as {
+          store: {
+            createSessionWithId: (id: string, model: string, cwd: string) => { id: string };
+            replaceMessages: (id: string, messages: Array<{ role: string; content: string; timestamp: number }>) => void;
+            loadSession: (id: string) => { messages: Array<{ role: string; content: string }> } | null;
+            loadTranscriptMessages: (id: string) => Array<{ role: string; content: string }>;
+          };
+        }).store;
+        const saved = store.createSessionWithId('resume-continuation-stall', 'test-local-model', process.cwd());
+        const largeText = 'long context that fits 380928 but not the generic provider floor '.repeat(105);
+        const originalMessages = Array.from({ length: 160 }, (_, index) => ({
+          role: index % 2 === 0 ? 'user' : 'assistant',
+          content: `${index}: ${largeText}`,
+          timestamp: Date.now() + index,
+        }));
+        store.replaceMessages(saved.id, originalMessages);
+        const transcriptBefore = store.loadTranscriptMessages(saved.id).length;
+
+        resumed = new AgentSession();
+        await resumed.init(process.cwd(), 'test-local-model');
+        let compactionCalls = 0;
+        const summary = 'Test compaction summary of the resumed conversation. '.repeat(80);
+        const provider = {
+          name: 'vllm',
+          supportsTools: true,
+          maxContextWindow: 131_072,
+          contextWindowFor() {
+            return this.maxContextWindow;
+          },
+          getServedModel: vi.fn(async function (this: { maxContextWindow: number }) {
+            this.maxContextWindow = 380_928;
+            return 'test-local-model';
+          }),
+          chat: async function* () {
+            compactionCalls++;
+            if (compactionCalls === 1) {
+              yield { type: 'text' as const, text: summary };
+              yield { type: 'stop_reason' as const, reason: 'max_tokens' };
+              yield { type: 'done' as const };
+              return;
+            }
+            if (compactionCalls === 2) {
+              yield { type: 'text' as const, text: '' };
+              yield { type: 'stop_reason' as const, reason: 'stop' };
+              yield { type: 'done' as const };
+              return;
+            }
+            yield { type: 'text' as const, text: summary };
+            yield { type: 'stop_reason' as const, reason: 'end_turn' };
+            yield { type: 'done' as const };
+          },
+        };
+        (resumed as unknown as { provider: typeof provider }).provider = provider;
+
+        let payload: {
+          messages: Array<{ role: string; content: unknown }>;
+          resumeTrimmedDropped?: number;
+          resumeCompaction?: { compacted?: boolean; beforeMessages?: number };
+        } | null = null;
+        resumed.on('session_resumed', (eventPayload) => {
+          payload = eventPayload as typeof payload;
+        });
+
+        await expect(resumed.resumeSession(saved.id)).resolves.toBe(true);
+        expect(payload).toBeTruthy();
+        expect(payload!.messages.length).toBeLessThan(originalMessages.length);
+        expect(String(payload!.messages[0]?.content ?? '')).toContain('[Conversation Summary]');
+        expect(store.loadTranscriptMessages(saved.id).length).toBeGreaterThanOrEqual(transcriptBefore);
+      } finally {
+        if (resumed) await resumed.destroy();
+        if (previousHome == null) delete process.env['HOME'];
+        else process.env['HOME'] = previousHome;
+        await fs.rm(tempHome, { recursive: true, force: true });
+      }
+    });
+
+    it('resumes with a bounded working set when resume compaction cannot produce a summary', async () => {
+      const previousHome = process.env['HOME'];
+      const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'shizuha-session-resume-empty-compact-'));
+      process.env['HOME'] = tempHome;
+      let resumed: AgentSession | null = null;
+
+      try {
+        await session.init(process.cwd(), 'test-local-model');
+        const store = (session as unknown as {
+          store: {
+            createSessionWithId: (id: string, model: string, cwd: string) => { id: string };
+            replaceMessages: (id: string, messages: Array<{ role: string; content: string; timestamp: number }>) => void;
+            loadSession: (id: string) => { messages: Array<{ role: string; content: string }> } | null;
+            loadTranscriptMessages: (id: string) => Array<{ role: string; content: string }>;
+          };
+        }).store;
+        const saved = store.createSessionWithId('resume-empty-compaction', 'test-local-model', process.cwd());
+        const largeText = 'long context that fits 380928 but not the generic provider floor '.repeat(105);
+        const originalMessages = Array.from({ length: 160 }, (_, index) => ({
+          role: index % 2 === 0 ? 'user' : 'assistant',
+          content: `${index}: ${largeText}`,
+          timestamp: Date.now() + index,
+        }));
+        store.replaceMessages(saved.id, originalMessages);
+        const transcriptBefore = store.loadTranscriptMessages(saved.id).length;
+
+        resumed = new AgentSession();
+        await resumed.init(process.cwd(), 'test-local-model');
+        const provider = {
+          name: 'vllm',
+          supportsTools: true,
+          maxContextWindow: 131_072,
+          contextWindowFor() {
+            return this.maxContextWindow;
+          },
+          getServedModel: vi.fn(async function (this: { maxContextWindow: number }) {
+            // Keep the 131K window so failed compaction still exceeds hard fit
+            // and last-resort bounding must run (380K would still admit the fixture).
+            return 'test-local-model';
+          }),
+          chat: async function* () {
+            yield { type: 'text' as const, text: '' };
+            yield { type: 'stop_reason' as const, reason: 'max_tokens' };
+            yield { type: 'done' as const };
+          },
+        };
+        (resumed as unknown as { provider: typeof provider }).provider = provider;
+
+        let payload: {
+          messages: Array<{ role: string; content: unknown }>;
+          resumeTrimmedDropped?: number;
+          resumeTrim?: { afterMessages: number; hardBudgetExceeded: boolean };
+        } | null = null;
+        resumed.on('session_resumed', (eventPayload) => {
+          payload = eventPayload as typeof payload;
+        });
+
+        await expect(resumed.resumeSession(saved.id)).resolves.toBe(true);
+        expect(payload).toBeTruthy();
+        expect(payload!.resumeTrimmedDropped).toBeGreaterThan(0);
+        expect(payload!.messages.length).toBeLessThan(originalMessages.length);
+        expect(payload!.messages.at(-1)?.content).toBe(originalMessages.at(-1)?.content);
+        expect(store.loadTranscriptMessages(saved.id).length).toBeGreaterThanOrEqual(transcriptBefore);
+      } finally {
+        if (resumed) await resumed.destroy();
         if (previousHome == null) delete process.env['HOME'];
         else process.env['HOME'] = previousHome;
         await fs.rm(tempHome, { recursive: true, force: true });

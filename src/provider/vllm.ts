@@ -21,9 +21,9 @@ import { randomUUID } from 'node:crypto';
 import { Agent } from 'undici';
 import { logger } from '../utils/logger.js';
 import { getModelProfile, resolveReasoningEffortForRequest, shouldEnableThinkingForRequest } from './model-profile.js';
-import { shouldPassBackReasoning } from './deepseek-wire.js';
+import { isDeepSeekV4Model, officialThinkingWire, shouldPassBackReasoning } from './deepseek-wire.js';
 import { countTokens } from '../utils/tokens.js';
-import { getSafetyFactor } from '../prompt/context.js';
+import { getSafetyFactor, IMAGE_TOKEN_ESTIMATE } from '../prompt/context.js';
 import { resolveModelContextWindow } from './context-window.js';
 import { isTransientProviderFailure } from './transient-errors.js';
 import { providerTimeouts, recordScliInferenceTelemetry, recordPromptPrefixDivergence } from '../metrics/registry.js';
@@ -35,6 +35,7 @@ import {
   cortexAdvertisedStreamTimeoutMs,
   requestAwareToolStreamTimeoutMs,
 } from './stream-timeout.js';
+import { shouldDiscardSalvagedInboxListing } from '../shared/heartbeat-outcome.js';
 
 // Custom undici dispatcher for vLLM streams: disable the default 5-minute
 // bodyTimeout that kills long-running thinking responses (MiniMax M2.7
@@ -65,6 +66,15 @@ const vllmDispatcher = new Agent({
 // PLAT-4189 follow-up: one guard shared across provider instances — sessions
 // are keyed by baseUrl + sessionId, so multi-provider processes can't collide.
 const vllmPromptPrefixGuard = new PromptPrefixGuard();
+
+/**
+ * SCLI-522: interactive TUI provider no-header soft-stall threshold. SCLI-388
+ * established a bounded 30s recovery (budget + Esc + /model); 1ad759e83
+ * ("quiet normal provider cold waits") pushed it to 300s, silently regressing
+ * the recovery UI to a 5-minute wait. Kept as a named constant so the
+ * regression is unit-testable. Non-interactive floor stays 60s.
+ */
+export const DEFAULT_INTERACTIVE_SOFT_STALL_MS = 30_000;
 
 
 function firstHeader(headers: Headers | undefined, names: string[]): string | undefined {
@@ -121,6 +131,65 @@ export function isModelLeasedBody(body: unknown, bodyText = ''): boolean {
   })();
   if (type === 'model_leased') return true;
   return /model_leased_to_other|model_leased|not_hive_eligible|"type"\s*:\s*"model_leased"|leased to another agent|not marked them eligible/i.test(bodyText);
+}
+
+export function isResidencyFullBody(parsed: unknown, bodyText: string): boolean {
+  const type = (() => {
+    if (!parsed || typeof parsed !== 'object') return '';
+    const err = (parsed as { error?: { type?: unknown } }).error;
+    const t = err && typeof err === 'object' ? (err as { type?: unknown }).type : (parsed as { type?: unknown }).type;
+    return typeof t === 'string' ? t.toLowerCase() : '';
+  })();
+  if (type === 'residency_full') return true;
+  return /residency_full|residency_ttl_protected|cache_control TTL/i.test(bodyText);
+}
+
+/** Claude-style cache_control for Cortex KV residency homes. */
+export function resolveCortexCacheControl(
+  requestKind?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { type: 'ephemeral'; ttl?: string } {
+  const hive = Boolean(
+    env['SHIZUHA_AGENT_ID']
+    || env['SHIZUHA_AGENT_USERNAME']
+    || env['HIVE_AGENT_ID']
+    // Live fleet pods historically only set AGENT_ID / AGENT_USERNAME
+    // (registry.ts). Treat those as Hive so we send 30m, not 5m.
+    || env['AGENT_ID']
+    || env['AGENT_USERNAME']
+    || env['SHIZUHA_K8S_PRIMARY_MODEL'],
+  );
+  // Hive agents must never send bare {type: ephemeral}: Cortex treats that
+  // as immediately yieldable and other sessions can steal the home
+  // (operator 2026-08-22). Ignore benchmark / CACHE_CONTROL=ephemeral
+  // overrides for fleet principals.
+  if (hive) {
+    const rawTtl = (env['SHIZUHA_CACHE_TTL'] || env['CORTEX_CACHE_TTL'] || '30m').trim();
+    const ttl = (!rawTtl || rawTtl === '0' || rawTtl === 'ephemeral' || rawTtl === 'off')
+      ? '30m'
+      : rawTtl;
+    return { type: 'ephemeral', ttl };
+  }
+  const raw = (env['SHIZUHA_CACHE_CONTROL'] || env['CORTEX_CACHE_CONTROL'] || '').trim();
+  if (raw === '0' || raw === 'off' || raw === 'ephemeral') {
+    return { type: 'ephemeral' };
+  }
+  if (raw.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw) as { type?: string; ttl?: string };
+      if (parsed && typeof parsed === 'object') {
+        return {
+          type: 'ephemeral',
+          ...(parsed.ttl ? { ttl: String(parsed.ttl) } : {}),
+        };
+      }
+    } catch { /* fall through */ }
+  }
+  if (raw) return { type: 'ephemeral', ttl: raw };
+  if ((requestKind || '').toLowerCase() === 'benchmark') return { type: 'ephemeral' };
+  const ttl = (env['SHIZUHA_CACHE_TTL'] || env['CORTEX_CACHE_TTL'] || '5m').trim();
+  if (!ttl || ttl === '0' || ttl === 'ephemeral') return { type: 'ephemeral' };
+  return { type: 'ephemeral', ttl };
 }
 
 /** Delay for a leased-out model: honor Retry-After, floor 60s, cap 15min.
@@ -220,9 +289,13 @@ function providerPoolDryRetryMs(body: unknown, headers: Headers): number {
   return 60_000;
 }
 
+type VLlmContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
 interface VLlmMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | Array<{type: string; text: string}>;
+  content: string | VLlmContentPart[];
   reasoning_content?: string;
   tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
   tool_call_id?: string;
@@ -244,6 +317,8 @@ interface SSEChoice {
     }>;
   };
   finish_reason: string | null;
+  /** GLM: 154829 = <|observation|> (tool-result sentinel, also an eos_token_id). */
+  stop_reason?: number | string | null;
 }
 
 interface SSEChunk {
@@ -367,7 +442,58 @@ function sanitizeOpenAiPayloadForUtf8<T>(value: T): T {
   return value;
 }
 
-function toVLlmMessages(messages: ChatMessage[], systemPrompt?: string, profile?: ModelProfile): VLlmMessage[] {
+function visionImageUrlPart(mediaType: string, base64: string): VLlmContentPart {
+  return { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } };
+}
+
+/** Count data-URI image parts without treating base64 as text tokens. */
+export function countVisionImageParts(messages: VLlmMessage[]): number {
+  let n = 0;
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (
+        part && typeof part === 'object'
+        && (part as { type?: string }).type === 'image_url'
+        && String((part as { image_url?: { url?: string } }).image_url?.url ?? '').startsWith('data:')
+      ) n++;
+    }
+  }
+  return n;
+}
+
+/**
+ * JSON.stringify of the real vLLM payload includes screenshot data-URIs.
+ * Counting that as prompt tokens inflates the preflight (shizuha2 e81682dd:
+ * prompt≈523191 vs 500000 window) while compaction's estimateTokens uses
+ * IMAGE_TOKEN_ESTIMATE per image. Redact data-URIs before counting.
+ */
+export function payloadForPromptTokenEstimate(messages: VLlmMessage[]): VLlmMessage[] {
+  return JSON.parse(JSON.stringify(messages), (key, value) => {
+    if (key === 'url' && typeof value === 'string' && value.startsWith('data:image/')) {
+      return 'data:image/png;base64,AA==';
+    }
+    return value;
+  }) as VLlmMessage[];
+}
+
+function visionOmittedNote(profile: ModelProfile | undefined, mediaType: string): string {
+  return `\n\n[Image not sent: the served model (${profile?.displayName ?? 'this model'}) is text-only and cannot accept images. A ${mediaType} screenshot was captured but omitted. Rely on the textual tool output above; inspect content with non-visual tools (read the DOM/HTML, file contents, or logs).]`;
+}
+
+function chatImageSource(block: ChatContentBlock): { base64: string; mediaType: string } | undefined {
+  if (block.type !== 'image') return undefined;
+  const src = block.source;
+  if (!src?.data || !src.media_type) return undefined;
+  return { base64: src.data, mediaType: src.media_type };
+}
+
+// SCLI-696 (re-land of SCLI-584): exported for the deepseek-wire contract tests —
+// the passback pins assert on the exact serialized assistant messages.
+export function toVLlmMessages(messages: ChatMessage[], systemPrompt?: string, profile?: ModelProfile, toolsPresent = false): VLlmMessage[] {
+  const reasoningPassback = toolsPresent && isDeepSeekV4Model(profile?.displayName)
+    ? 'always'
+    : profile?.reasoningPassback;
   const useArrayFormat = profile?.userMessageFormat === 'array';
   const formatContent = (text: string): string | Array<{type: string; text: string}> =>
     useArrayFormat ? [{ type: 'text', text }] : text;
@@ -407,12 +533,9 @@ function toVLlmMessages(messages: ChatMessage[], systemPrompt?: string, profile?
         role: 'assistant',
         content: textParts.join('\n') || '',
       };
-      // Official DeepSeek rule (dsh-llm-deepseek serialize.ts): pass CoT
-      // back only on tool-call turns. Plain turns drop it — hosted API
-      // ignores it; self-hosted templates may render it and prime "Let me…".
       if (
         reasoningParts.length > 0
-        && shouldPassBackReasoning(profile?.reasoningPassback, toolUses.length > 0)
+        && shouldPassBackReasoning(reasoningPassback, toolUses.length > 0)
       ) {
         vMsg.reasoning_content = reasoningParts.join('');
       }
@@ -431,61 +554,19 @@ function toVLlmMessages(messages: ChatMessage[], systemPrompt?: string, profile?
     } else if (msg.role === 'user') {
       const toolResults = blocks.filter((b) => b.type === 'tool_result');
       const textParts = blocks.filter((b) => b.type === 'text');
+      const imageParts = blocks.filter((b) => b.type === 'image');
 
       for (const tr of toolResults) {
         const r = tr as { toolUseId: string; content: string; isError?: boolean; image?: { base64: string; mediaType: string } };
         if (r.image && profile?.supportsVision) {
-          // Vision: auto-downscale images for local VL models.
-          // Anthropic handles this server-side, but for vLLM/local models we must do it ourselves.
-          // A 1920x1080 PNG = ~1.5MB base64 = ~92K tokens. After JPEG q50 downscale = ~100KB = ~6K tokens.
-          let imageB64 = r.image.base64;
-          let imageMime = r.image.mediaType;
-          const rawSizeKB = Math.round(imageB64.length * 0.75 / 1024); // base64 → raw bytes → KB
-
-          if (rawSizeKB > 100) {
-            // Image > 100KB — downscale via CDP re-capture as JPEG
-            // This is a scaffold-level optimization: tools send full-quality images,
-            // the provider layer automatically downscales for models with limited context.
-            try {
-              const { execSync } = require('node:child_process');
-              // Use CDP to re-capture at lower quality (if Chrome is running)
-              const targetsRaw = execSync('curl -sf http://127.0.0.1:9222/json 2>/dev/null', { encoding: 'utf-8', timeout: 2000 });
-              const targets = JSON.parse(targetsRaw) as Array<{ type: string; webSocketDebuggerUrl: string }>;
-              const page = targets.find((t) => t.type === 'page');
-              if (page?.webSocketDebuggerUrl) {
-                // Re-capture as JPEG quality 50 via CDP
-                const cdpResult = execSync(
-                  `python3 -c "
-import asyncio, websockets, json, base64
-async def cap():
-    async with websockets.connect('${page.webSocketDebuggerUrl}') as ws:
-        await ws.send(json.dumps({'id':1,'method':'Page.captureScreenshot','params':{'format':'jpeg','quality':50}}))
-        resp = json.loads(await ws.recv())
-        if 'result' in resp and 'data' in resp['result']:
-            print(resp['result']['data'])
-asyncio.run(cap())
-" 2>/dev/null`,
-                  { encoding: 'utf-8', timeout: 5000, maxBuffer: 10 * 1024 * 1024 },
-                ).trim();
-                if (cdpResult.length > 100) {
-                  imageB64 = cdpResult;
-                  imageMime = 'image/jpeg';
-                  const newSizeKB = Math.round(cdpResult.length * 0.75 / 1024);
-                  logger.info({ originalKB: rawSizeKB, downscaledKB: newSizeKB }, 'vLLM: auto-downscaled screenshot for vision');
-                }
-              }
-            } catch {
-              // CDP re-capture failed — use original image (may cause context overflow)
-              logger.warn({ sizeKB: rawSizeKB }, 'vLLM: could not downscale image — using original');
-            }
-          }
-
+          // Send the captured bytes. Do NOT recapture via CDP :9222 — that
+          // replaces this screenshot with whatever page happens to be open.
           result.push({
             role: 'tool',
             content: [
               { type: 'text', text: r.content },
-              { type: 'image_url', image_url: { url: `data:${imageMime};base64,${imageB64}` } },
-            ] as unknown as string,
+              visionImageUrlPart(r.image.mediaType, r.image.base64),
+            ],
             tool_call_id: r.toolUseId,
           });
         } else if (r.image) {
@@ -493,17 +574,33 @@ asyncio.run(cap())
           // with a textual placeholder so the turn doesn't fail with vLLM 400
           // ("not a multimodal model"). Keep the tool result's own text (often the
           // screenshot path/description) and tell the model to use non-visual tools.
-          const note = `\n\n[Image not sent: the served model (${profile?.displayName ?? 'this model'}) is text-only and cannot accept images. A ${r.image.mediaType} screenshot was captured but omitted. Rely on the textual tool output above; inspect content with non-visual tools (read the DOM/HTML, file contents, or logs).]`;
-          result.push({ role: 'tool', content: `${(r.content || '').trim()}${note}`, tool_call_id: r.toolUseId });
+          result.push({
+            role: 'tool',
+            content: `${(r.content || '').trim()}${visionOmittedNote(profile, r.image.mediaType)}`,
+            tool_call_id: r.toolUseId,
+          });
         } else {
           result.push({ role: 'tool', content: r.content, tool_call_id: r.toolUseId });
         }
       }
-      if (textParts.length > 0) {
-        result.push({
-          role: 'user',
-          content: textParts.map((b) => (b as { text: string }).text).join('\n'),
-        });
+
+      const userText = textParts.map((b) => (b as { text: string }).text).join('\n');
+      if (imageParts.length > 0 && profile?.supportsVision) {
+        const content: VLlmContentPart[] = [];
+        for (const img of imageParts) {
+          const src = chatImageSource(img);
+          if (src) content.push(visionImageUrlPart(src.mediaType, src.base64));
+        }
+        if (userText) content.push({ type: 'text', text: userText });
+        if (content.length > 0) result.push({ role: 'user', content });
+      } else if (imageParts.length > 0) {
+        const notes = imageParts.map((img) => {
+          const src = chatImageSource(img);
+          return visionOmittedNote(profile, src?.mediaType ?? 'image');
+        }).join('');
+        result.push({ role: 'user', content: `${userText.trim()}${notes}` });
+      } else if (textParts.length > 0) {
+        result.push({ role: 'user', content: userText });
       }
     } else {
       const text = blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');
@@ -519,27 +616,235 @@ asyncio.run(cap())
  *   <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>
  * Returns the text with the tokens stripped + the extracted calls.
  */
+function parseGlmToolCallInner(inner: string): { name: string; args: Record<string, unknown> } | null {
+  const name = (inner.match(/^\s*([^<\s][^<]*?)\s*(?=<arg_key>|<|$)/)?.[1] ?? '').trim()
+    .replace(/<\|observation\|>|<\|user\|>|<\|endoftext\|>/g, '')
+    .trim();
+  if (!name) return null;
+  const args: Record<string, unknown> = {};
+  const argRe = /<arg_key>([^<>]*?)<\/arg_key>\s*(?:<arg_value>)?((?:(?!<arg_key>)[\s\S])*?)<\/arg_value>/g;
+  let aa: RegExpExecArray | null;
+  while ((aa = argRe.exec(inner)) !== null) {
+    const k = (aa[1] ?? '').trim();
+    const vRaw = aa[2] ?? '';
+    let v: unknown = vRaw;
+    try { v = JSON.parse(vRaw); } catch { v = vRaw; }
+    args[k] = v;
+  }
+  return { name, args };
+}
+
 export function extractGlmToolCalls(text: string): { clean: string; calls: Array<{ name: string; args: Record<string, unknown> }> } {
   const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
   if (!text || !text.includes('<tool_call>')) return { clean: text, calls };
   const tcRe = /<tool_call>([\s\S]*?)<\/tool_call>/g;
   let mm: RegExpExecArray | null;
   while ((mm = tcRe.exec(text)) !== null) {
-    const inner = mm[1] ?? '';
-    const name = (inner.match(/^\s*([^<\s][^<]*?)\s*(?=<arg_key>|$)/)?.[1] ?? '').trim();
-    const args: Record<string, unknown> = {};
-    const argRe = /<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g;
-    let aa: RegExpExecArray | null;
-    while ((aa = argRe.exec(inner)) !== null) {
-      const k = (aa[1] ?? '').trim();
-      const vRaw = aa[2] ?? '';
-      let v: unknown = vRaw;
-      try { v = JSON.parse(vRaw); } catch { v = vRaw; }
-      args[k] = v;
-    }
-    if (name) calls.push({ name, args });
+    const parsed = parseGlmToolCallInner(mm[1] ?? '');
+    if (parsed) calls.push(parsed);
   }
-  return { clean: text.replace(tcRe, '').trim(), calls };
+  const last = text.lastIndexOf('<tool_call>');
+  const rest = text.slice(last + '<tool_call>'.length);
+  if (!rest.includes('</tool_call>')) {
+    const parsed = parseGlmToolCallInner(rest);
+    if (parsed && !calls.some((c) => c.name === parsed.name)) calls.push(parsed);
+  }
+  return { clean: text.replace(tcRe, '').replace(/<tool_call>[\s\S]*$/, '').trim(), calls };
+}
+
+/** Drop salvaged pulse inbox listing tools when prefetch already put the snapshot in the turn. */
+export function filterSalvagedGlmToolCalls<T extends { name: string }>(
+  calls: T[],
+  inboxAlreadyInTurn: boolean,
+): { kept: T[]; discarded: string[] } {
+  const kept: T[] = [];
+  const discarded: string[] = [];
+  for (const call of calls) {
+    if (shouldDiscardSalvagedInboxListing(call.name, inboxAlreadyInTurn)) {
+      discarded.push(call.name);
+      continue;
+    }
+    kept.push(call);
+  }
+  return { kept, discarded };
+}
+
+/**
+ * vLLM #44104 / #44326: streaming chunks often carry `delta.tool_calls: []`
+ * (empty) next to content, or glm47 swallows inline zero-arg
+ * `<tool_call>name</tool_call>` and never emits a real delta. Treating a
+ * truthy empty array as "the server already parsed tools" skips XML recovery
+ * and the turn ends finish_reason=stop with no tool_use (shizuha1 2026-09-10,
+ * hive_list_fleet_agents has zero required args).
+ */
+export function glmStreamedToolCallDeltasAreReal(
+  toolCalls: Array<{
+    id?: string;
+    function?: { name?: string; arguments?: string };
+  }> | null | undefined,
+): boolean {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return false;
+  return toolCalls.some((tc) => Boolean(
+    (tc.id && tc.id.length > 0)
+    || (tc.function?.name && tc.function.name.trim().length > 0)
+    || (tc.function?.arguments && tc.function.arguments.length > 0),
+  ));
+}
+
+/**
+ * GLM chat-template sentinel: the assistant finished a tool call and is
+ * waiting for the tool result. Listed in GLM-5.3 generation_config
+ * eos_token_id with <|endoftext|> and <|user|>. vLLM-ascend #8327 shows
+ * a successful parse remaps this to finish_reason=tool_calls; a dropped
+ * parse leaves finish_reason=stop + stop_reason=154829 (shizuha1 2026-09-11).
+ */
+export const GLM_OBSERVATION_TOKEN_ID = 154829;
+/** GLM `<|user|>` — trained wrap-up EOS, not a dropped tool. */
+export const GLM_USER_EOS_TOKEN_ID = 154827;
+
+export function isGlmObservationStopToken(stopReason: unknown): boolean {
+  if (stopReason == null || stopReason === '') return false;
+  const n = typeof stopReason === 'number' ? stopReason : Number(stopReason);
+  return Number.isFinite(n) && n === GLM_OBSERVATION_TOKEN_ID;
+}
+
+export function isGlmUserEosStopToken(stopReason: unknown): boolean {
+  if (stopReason == null || stopReason === '') return false;
+  const n = typeof stopReason === 'number' ? stopReason : Number(stopReason);
+  return Number.isFinite(n) && n === GLM_USER_EOS_TOKEN_ID;
+}
+
+/** Why a tools-offered GLM turn produced no parsed tool_calls. */
+export type GlmToolsOfferedMissKind =
+  | 'observation_drop'
+  | 'user_eos'
+  | 'repetition'
+  | 'length'
+  | 'empty_tool_turn';
+
+export function classifyGlmToolsOfferedMiss(opts: {
+  finishReason?: string | null;
+  stopReasonTokenId?: unknown;
+  eatenTokens?: number;
+}): GlmToolsOfferedMissKind {
+  const fr = (opts.finishReason ?? '').toLowerCase();
+  if (fr === 'repetition') return 'repetition';
+  if (fr === 'length') return 'length';
+  if (isGlmUserEosStopToken(opts.stopReasonTokenId)) return 'user_eos';
+  if (isGlmObservationStopToken(opts.stopReasonTokenId)) return 'observation_drop';
+  if ((opts.eatenTokens ?? 0) >= 8) return 'observation_drop';
+  return 'empty_tool_turn';
+}
+
+/**
+ * Streamed GLM turn that ended as OpenAI `stop` but was actually a dropped
+ * tool call. Community: vLLM #44326 (inline zero-arg works non-stream, drops
+ * in stream); vLLM #45915 claimed to fix streaming zero-arg and is in the
+ * live glm47 engine, but observation-without-tools still arrives as `stop`.
+ * Do not disable streaming; the loop continues from prefix instead.
+ */
+/**
+ * Parse a non-stream chat.completions JSON body for GLM tool calls.
+ * Used after an <|observation|> stream drop (vLLM #44326: non-stream extracts
+ * inline zero-arg calls that streaming drops). Recovers both OpenAI
+ * `message.tool_calls` and leaked `<tool_call>` XML in content/reasoning.
+ */
+export function collectGlmNonStreamToolCalls(data: {
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+      reasoning?: string | null;
+      reasoning_content?: string | null;
+      tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>;
+    };
+  }>;
+}): Array<{ id: string; name: string; args: Record<string, unknown> }> {
+  const m = data.choices?.[0]?.message;
+  if (!m) return [];
+  const recovered: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const fromContent = extractGlmToolCalls(m.content ?? '');
+  recovered.push(...fromContent.calls);
+  const fromReasoning = extractGlmToolCalls(m.reasoning_content ?? m.reasoning ?? '');
+  recovered.push(...fromReasoning.calls);
+  const out: Array<{ id: string; name: string; args: Record<string, unknown> }> = [];
+  const usedXml = new Set<number>();
+  for (const tc of m.tool_calls ?? []) {
+    const rawName = (tc.function?.name ?? '').replace(/<\/?[a-z0-9_]+>/gi, '').trim();
+    if (!rawName) continue;
+    let args: Record<string, unknown> = {};
+    const argText = tc.function?.arguments ?? '';
+    if (argText && argText !== '{}' && argText !== 'null') {
+      try { args = JSON.parse(argText) as Record<string, unknown>; } catch { args = {}; }
+    }
+    if (Object.keys(args).length === 0) {
+      const fill = recovered.findIndex((c, i) => !usedXml.has(i) && (c.name === rawName || c.name.endsWith(rawName) || rawName.endsWith(c.name)));
+      if (fill >= 0) {
+        usedXml.add(fill);
+        args = recovered[fill]!.args;
+      }
+    }
+    out.push({
+      id: tc.id || `vllm_obs_${Date.now()}_${out.length}`,
+      name: rawName,
+      args,
+    });
+  }
+  for (let i = 0; i < recovered.length; i++) {
+    if (usedXml.has(i)) continue;
+    const c = recovered[i]!;
+    out.push({
+      id: `vllm_obs_xml_${Date.now()}_${i}`,
+      name: c.name,
+      args: c.args,
+    });
+  }
+  return out;
+}
+
+export function shouldTreatGlmStopAsDroppedToolCall(opts: {
+  finishReason?: string | null;
+  stopReasonTokenId?: unknown;
+  eatenTokens?: number;
+  hasParsedTools: boolean;
+  toolsOffered: boolean;
+  isGlm: boolean;
+}): boolean {
+  if (!opts.isGlm || !opts.toolsOffered || opts.hasParsedTools) return false;
+  if (opts.finishReason && opts.finishReason !== 'stop') return false;
+  if (isGlmObservationStopToken(opts.stopReasonTokenId)) return true;
+  return (opts.eatenTokens ?? 0) >= 8;
+}
+
+/** Cap for the non-stream observation salvage POST. Uncapped salvage is a
+ * second full generation that can run to 32768 and hold a GLM seq slot ~13m. */
+export const GLM_OBSERVATION_SALVAGE_MAX_TOKENS = 256;
+
+/**
+ * Second-generation salvage is only for a dropped tool (eaten specials /
+ * XML). English-only 154829 with no specials is the model not calling a
+ * tool — a full salvage would 32k-dump and stall the fleet.
+ */
+export function shouldSalvageGlmObservationNonStream(opts: {
+  droppedObservation: boolean;
+  accContentLen?: number;
+  accReasoningLen?: number;
+  eatenTokens?: number;
+  hasToolMarkup?: boolean;
+}): boolean {
+  if (!opts.droppedObservation) return false;
+  if (opts.hasToolMarkup) return true;
+  const eaten = opts.eatenTokens ?? 0;
+  const visible = (opts.accContentLen ?? 0) + (opts.accReasoningLen ?? 0);
+  // English announcement then 154829: overlay already decoded this
+  // generation's token ids. A second stream=false POST cannot re-parse
+  // XML that was never generated (Saki 2026-09-13: eaten=24, salvage 0).
+  if (visible > 200) return false;
+  return eaten >= 8;
+}
+
+export function capGlmObservationSalvageMaxTokens(current: unknown): number {
+  const n = typeof current === 'number' && Number.isFinite(current) ? current : GLM_OBSERVATION_SALVAGE_MAX_TOKENS;
+  return Math.max(1, Math.min(n, GLM_OBSERVATION_SALVAGE_MAX_TOKENS));
 }
 
 /**
@@ -881,6 +1186,27 @@ export class VLlmProvider implements LLMProvider {
       if (cached.maxContextWindow) this.maxContextWindow = cached.maxContextWindow;
       return cached.id;
     }
+    // shizuha1 2026-09-21: submitPrompt force-refreshes /v1/models with a 3s
+    // timeout. A blip (TimeoutError) used to return undefined and the TUI
+    // treated GLM-5.3-Flash as "missing from live provider metadata" even
+    // though this process had already discovered it at 500k and Cortex still
+    // listed it (0.4s). Last-known metadata is safe for timeout/5xx; a live
+    // 200 that omits the model is a real retirement and must not use cache.
+    const adoptLastKnown = (reason: string): string | undefined => {
+      if (!cached) return undefined;
+      logger.warn(
+        {
+          model: preferredModel,
+          reason,
+          cachedId: cached.id,
+          ageMs: Date.now() - cached.fetchedAt,
+        },
+        `${this.logLabel}: /v1/models ${reason} — using last-known metadata`,
+      );
+      this._servedModel = cached.id;
+      if (cached.maxContextWindow) this.maxContextWindow = cached.maxContextWindow;
+      return cached.id;
+    };
     try {
       const headers: Record<string, string> = {};
       const apiKey = this.resolveApiKey();
@@ -898,7 +1224,7 @@ export class VLlmProvider implements LLMProvider {
       if (!res.ok) {
         logger.warn({ status: res.status, model: preferredModel },
           `${this.logLabel}: /v1/models discovery failed`);
-        return undefined;
+        return adoptLastKnown(`HTTP ${res.status}`);
       }
       const json = (await res.json()) as { data: VLlmModelEntry[] };
       if (json.data?.length) {
@@ -937,6 +1263,7 @@ export class VLlmProvider implements LLMProvider {
             requestedModel: preferredModel,
             advertisedModels: json.data.map((m) => m.id),
           }, `${this.logLabel}: requested model missing from /v1/models`);
+          this._servedModelCache.delete(cacheKey);
           return undefined;
         }
         this._servedModel = entry.id;
@@ -969,10 +1296,15 @@ export class VLlmProvider implements LLMProvider {
         logger.debug(`${this.logLabel}: discovered model=${this._servedModel}, maxContextWindow=${this.maxContextWindow}`);
         return entry.id;
       }
+      return adoptLastKnown('empty catalog');
     } catch (err) {
       logger.debug({ err, model: preferredModel }, `${this.logLabel}: /v1/models discovery unavailable`);
+      return adoptLastKnown('unavailable');
     }
-    return undefined;
+  }
+
+  discoveredContextWindowFor(model: string): number | undefined {
+    return this._windowByModelId.get(normalizeModelId(model));
   }
 
   /**
@@ -982,7 +1314,7 @@ export class VLlmProvider implements LLMProvider {
    * maxContextWindow discovery behavior.
    */
   contextWindowFor(model: string): number {
-    const discovered = this._windowByModelId.get(normalizeModelId(model));
+    const discovered = this.discoveredContextWindowFor(model);
     if (discovered && discovered > 0) return discovered;
     // Before /v1/models discovery (or when Cortex omits context_window), do NOT
     // force the generic 131072 constructor floor onto known large-window models
@@ -1024,34 +1356,6 @@ export class VLlmProvider implements LLMProvider {
       ...Object.keys(reverseAliases),
     ].filter(Boolean);
 
-    let vMessages = toVLlmMessages(messages, options.systemPrompt, profile);
-
-    // Apply user message format (array vs string) per model profile
-    if (profile.userMessageFormat === 'array') {
-      vMessages = vMessages.map((m) => {
-        if (m.role === 'user' && typeof m.content === 'string') {
-          return { ...m, content: [{ type: 'text', text: m.content }] };
-        }
-        return m;
-      });
-    }
-
-    // Conversation priming — inject context + assistant ack before first user message
-    if (profile.conversationPriming && vMessages.length >= 2) {
-      const sysIdx = vMessages.findIndex((m) => m.role === 'system');
-      const userIdx = vMessages.findIndex((m) => m.role === 'user');
-      if (sysIdx >= 0 && userIdx > sysIdx) {
-        const contextMsg: VLlmMessage = {
-          role: 'user',
-          content: profile.userMessageFormat === 'array'
-            ? [{ type: 'text', text: `Working directory: ${process.cwd()}\nOS: ${process.platform}` }]
-            : `Working directory: ${process.cwd()}\nOS: ${process.platform}`,
-        };
-        const ackMsg: VLlmMessage = { role: 'assistant', content: 'Understood.' };
-        vMessages.splice(userIdx, 0, contextMsg, ackMsg);
-      }
-    }
-
     // Load exact tool definitions from file if model was trained on specific schemas
     let tools: Array<Record<string, unknown>> | undefined;
     if (profile.toolDefinitionsFile) {
@@ -1087,15 +1391,48 @@ export class VLlmProvider implements LLMProvider {
           description: t.description,
           parameters: t.inputSchema,
         },
+        ...(t.deferLoading ? { defer_loading: true } : {}),
       }));
+    }
+
+    const hasTools = Boolean(tools?.length);
+    const toolsEnabled = hasTools && options.toolChoice !== 'none';
+    let vMessages = toVLlmMessages(messages, options.systemPrompt, profile, hasTools);
+
+    // Apply user message format (array vs string) per model profile
+    if (profile.userMessageFormat === 'array') {
+      vMessages = vMessages.map((m) => {
+        if (m.role === 'user' && typeof m.content === 'string') {
+          return { ...m, content: [{ type: 'text', text: m.content }] };
+        }
+        return m;
+      });
+    }
+
+    // Conversation priming — inject context + assistant ack before first user message
+    if (profile.conversationPriming && vMessages.length >= 2) {
+      const sysIdx = vMessages.findIndex((m) => m.role === 'system');
+      const userIdx = vMessages.findIndex((m) => m.role === 'user');
+      if (sysIdx >= 0 && userIdx > sysIdx) {
+        const contextMsg: VLlmMessage = {
+          role: 'user',
+          content: profile.userMessageFormat === 'array'
+            ? [{ type: 'text', text: `Working directory: ${process.cwd()}\nOS: ${process.platform}` }]
+            : `Working directory: ${process.cwd()}\nOS: ${process.platform}`,
+        };
+        const ackMsg: VLlmMessage = { role: 'assistant', content: 'Understood.' };
+        vMessages.splice(userIdx, 0, contextMsg, ackMsg);
+      }
     }
 
     // Also cap max_tokens to match what the model expects.
     const maxTokensCap = profile.recommendedMaxOutputTokens;
     const requestedMaxTokens = options.maxTokens ?? profile.recommendedMaxOutputTokens;
+    const engineTools = tools?.filter((tool) => tool['defer_loading'] !== true);
     const rawPromptEstimate =
-      countTokens(JSON.stringify(vMessages), model)
-      + (tools?.length ? countTokens(JSON.stringify(tools), model) : 0);
+      countTokens(JSON.stringify(payloadForPromptTokenEstimate(vMessages)), model)
+      + (engineTools?.length ? countTokens(JSON.stringify(engineTools), model) : 0)
+      + countVisionImageParts(vMessages) * IMAGE_TOKEN_ESTIMATE;
     this._rawPromptEstimateLast = rawPromptEstimate;
     const promptTokenEstimate = Math.ceil(rawPromptEstimate * this._calibratedSafetyFactor(model));
     const CONTEXT_GUARD_TOKENS = 256;
@@ -1173,7 +1510,6 @@ export class VLlmProvider implements LLMProvider {
     // DeepSeek/Qwen/OpenAI-compatible tool calls must keep streaming so the TUI
     // receives first-token progress instead of buffering the whole tool turn.
     const streamWithToolsEnv = process.env['VLLM_STREAM_WITH_TOOLS'];
-    const hasTools = Boolean(tools && tools.length);
     const isGlmModel = model.toLowerCase().includes('glm');
     // GLM glm47 tool parser historically corrupted streamed args (esp. thinking OFF).
     // With thinking ON (SCLI-54 / defaultThinkingOn) structured tool_calls are reliable;
@@ -1212,10 +1548,16 @@ export class VLlmProvider implements LLMProvider {
     // for the entire 8K interactive output budget in multiple 300K+ sessions.
     // Ending after four repeated 3-20-token n-grams limits the bad turn before
     // it can pollute the transcript or consume another full generation.
+    const modelIdLower = normalizeModelId(model).toLowerCase();
     const useManagedDeepSeekRepetitionDetection =
       this.name === 'cortex'
       && !isDeterministicMaintenanceRequest
-      && normalizeModelId(model).toLowerCase().includes('deepseek-v4-flash');
+      && (
+        modelIdLower.includes('deepseek-v4-flash')
+        || modelIdLower.includes('glm-5.3')
+        || modelIdLower.includes('glm-5.2')
+        || modelIdLower.includes('glm-4.7')
+      );
     const thinkingEnabledForRequest = isCompactionRequest
       ? false
       : shouldEnableThinkingForRequest(model, options.thinkingLevel);
@@ -1310,9 +1652,32 @@ export class VLlmProvider implements LLMProvider {
       if (resolvedEffort && (modelId.includes('grok') || modelId.includes('xai/'))) {
         body['reasoning_effort'] = resolvedEffort;
       }
-      // Do not send official-API top-level thinking:{type:enabled} to vLLM.
-      // chat_template_kwargs.thinking/reasoning_effort is the vLLM spelling;
-      // the extra object coincided with garbled 19k first turns (2026-08-14).
+      // SCLI-696 (re-land of SCLI-584): DeepSeek official harness serialize rules —
+      // api.deepseek.com and DeepSeek-V4 chat templates expect TOP-LEVEL thinking +
+      // reasoning_effort (not just chat_template_kwargs, which is a vLLM convention
+      // the hosted API ignores). SCOPED to DeepSeek model ids: the 2026-08-14 garble
+      // was this official object sent to vLLM *generally* (GLM/Qwen templates render
+      // it as text); DeepSeek backends require the official spelling. The wire shape
+      // comes from officialThinkingWire (deepseek-wire.ts, ported from the official
+      // harness): never sends reasoning_effort:'off', and DeepSeek only knows
+      // high|max — resolveReasoningEffortForRequest (CTX-389 precedence) output maps
+      // low/medium/xhigh up to high. Deterministic maintenance mirrors the
+      // chat_template_kwargs block: thinking state is still declared, effort is not.
+      if (modelId.includes('deepseek') || modelId.includes('dsh-llm')) {
+        const resolved = isDeterministicMaintenanceRequest
+          ? undefined
+          : resolveReasoningEffortForRequest(model, {
+              reasoningEffort: options.reasoningEffort,
+              thinkingLevel: options.thinkingLevel,
+            });
+        const effort = resolved ? (resolved === 'max' ? 'max' : 'high') : undefined;
+        const wire = officialThinkingWire({
+          thinkingEnabled: thinkingEnabledForRequest,
+          effort,
+        });
+        body['thinking'] = wire.thinking;
+        if (wire.reasoning_effort) body['reasoning_effort'] = wire.reasoning_effort;
+      }
     }
     if (tools?.length) {
       body['tools'] = tools;
@@ -1357,6 +1722,14 @@ export class VLlmProvider implements LLMProvider {
     if (routedRequestKind) {
       body['metadata'] = { ...((body['metadata'] as Record<string, unknown>) ?? {}), request_kind: routedRequestKind };
     }
+    // Cortex KV residency TTL (Claude cache_control). Hive agents default
+    // 30m sliding; generic SCLI 5m; benchmark cells are immediately yieldable.
+    const cacheControl = resolveCortexCacheControl(routedRequestKind);
+    body['cache_control'] = cacheControl;
+    body['metadata'] = {
+      ...((body['metadata'] as Record<string, unknown>) ?? {}),
+      cache_control: cacheControl,
+    };
     if (options.cortexRehome) {
       body['metadata'] = {
         ...((body['metadata'] as Record<string, unknown>) ?? {}),
@@ -1375,7 +1748,7 @@ export class VLlmProvider implements LLMProvider {
       try {
         const parts: PromptPrefixPart[] = [
           { label: 'model', partClass: 'model', content: model },
-          { label: 'tools', partClass: 'tools', content: tools?.length ? JSON.stringify(tools) : '' },
+          { label: 'tools', partClass: 'tools', content: engineTools?.length ? JSON.stringify(engineTools) : '' },
           ...vMessages.map((m, i): PromptPrefixPart => ({
             label: `message[${i}] role=${m.role}`,
             partClass: m.role === 'system' ? 'system' : 'message',
@@ -1596,6 +1969,15 @@ export class VLlmProvider implements LLMProvider {
     const BASE_5XX_DELAY_MS = 2_000;
     const MAX_5XX_DELAY_MS = 30_000;
     let serverErrAttempt = 0;
+    // Cortex historically 404s "Model X is not available" when the listing
+    // exists but every replica is briefly gone (deployer WS drop). SCLI-384
+    // fail-fasts first-turn 404 as a bad --model, so a reconnect blip scores a
+    // 10s FAIL. Wait a bit before treating that specific 404 as permanent.
+    const UNAVAILABLE_404_GRACE_MS = parseTimeoutMs(
+      'VLLM_UNAVAILABLE_404_GRACE_MS',
+      interactiveTui ? 30_000 : 180_000,
+    );
+    let unavailable404StartedAt = 0;
     // model_leased (another agent holds the exclusivity sprint): NOT a sick
     // backend — hammering 5xx backoff (2–30s × 40) just storms Cortex. Long
     // waits (60s floor / Retry-After / up to 15min) until the lease free or we
@@ -1720,6 +2102,7 @@ export class VLlmProvider implements LLMProvider {
     // Cap signature-expiry auth refresh to one attempt per chat() call so a
     // permanently broken refresh path cannot spin forever.
     let authRefreshAttempted = false;
+    let salvageHeaders: Record<string, string> | undefined;
     // eslint-disable-next-line no-constant-condition
     rateRetry: while (true) {
     // Re-build headers each rateRetry so force-refresh / API-key fallback is
@@ -1740,6 +2123,7 @@ export class VLlmProvider implements LLMProvider {
       const hostOverride = process.env['VLLM_HOST_HEADER'];
       if (hostOverride) headers['Host'] = hostOverride;
     }
+    salvageHeaders = headers;
     connAttempt = 0;
     errBodyText = undefined;
     // eslint-disable-next-line no-constant-condition
@@ -1785,7 +2169,12 @@ export class VLlmProvider implements LLMProvider {
             : Math.max(NONSTREAM_RESPONSE_TIMEOUT_MS, firstTokenBudgetMs);
           const softStallMs = parseTimeoutMs(
             'VLLM_SOFT_STALL_MS',
-            interactiveTui ? 300_000 : 60_000,
+            // SCLI-522: 1ad759e83 ("quiet normal provider cold waits") pushed the
+            // interactive soft-stall threshold 30s -> 300s, regressing SCLI-388's
+            // bounded no-header recovery (budget + Esc + /model) to a 5-minute
+            // silent wait. Restore the bounded 30s interactive threshold; the
+            // non-interactive 60s floor is unchanged.
+            interactiveTui ? DEFAULT_INTERACTIVE_SOFT_STALL_MS : 60_000,
           );
           const pastSoft = elapsedMs >= softStallMs;
           const budgetLabel = `${Math.round(elapsedMs / 1000)}s / ${Math.round(headerBudgetMs / 1000)}s budget`;
@@ -1990,6 +2379,27 @@ export class VLlmProvider implements LLMProvider {
         // Agent→model exclusivity lease: another principal holds this model.
         // Long backoff (not 5xx storm). After MAX_LEASE_RETRIES, end the turn
         // so heartbeat re-enters when the sprint may have flipped.
+        if (isResidencyFullBody(parsedBody, bodyText)) {
+          const detail = providerErrorMessage(parsedBody)
+            || `model ${options.model} residency is full (TTL-protected homes)`;
+          const retryInMs = retryAfterHeaderMs(response.headers) ?? 30_000;
+          logger.warn(
+            { model: options.model, retryInMs, detail },
+            'vLLM residency full — honoring Retry-After then ending turn',
+          );
+          yield {
+            type: 'status',
+            level: 'warning',
+            provider: providerLabel,
+            code: 'residency_full',
+            retryInMs,
+            message: `${detail} — retry after ${Math.ceil(retryInMs / 1000)}s`,
+          };
+          throw Object.assign(
+            new Error(`residency_full: ${detail}; retry_after_seconds=${Math.ceil(retryInMs / 1000)}`),
+            { status: 503, residencyFull: true, retryInMs },
+          );
+        }
         if (isModelLeasedBody(parsedBody, bodyText)) {
           const detail = providerErrorMessage(parsedBody)
             || `model ${options.model} is leased to another agent`;
@@ -2167,6 +2577,20 @@ export class VLlmProvider implements LLMProvider {
             { status: response.status, ...(serverRetryAfterMs ? { retryAfterMs: serverRetryAfterMs } : {}) },
           );
         }
+        // A 27-minute residency_full Retry-After used to be clamped to 30s and
+        // retried 40× (enaqa-scli410-qa 2026-08-22). If the server says wait
+        // longer than our in-turn 5xx cap, end the turn — heartbeat/inbox
+        // re-enters later. Do not storm leased DeepSeek/Qwen homes.
+        if (serverRetryAfterMs != null && serverRetryAfterMs > MAX_5XX_DELAY_MS) {
+          logger.warn(
+            { status: response.status, serverRetryAfterMs, detail },
+            'vLLM 5xx Retry-After exceeds in-turn cap — ending turn',
+          );
+          throw Object.assign(
+            new Error(`vLLM error ${response.status}: ${detail}`),
+            { status: response.status, retryAfterMs: serverRetryAfterMs },
+          );
+        }
         const expDelayMs5 = Math.min(BASE_5XX_DELAY_MS * Math.pow(2, serverErrAttempt), MAX_5XX_DELAY_MS)
           * (0.75 + Math.random() * 0.5); // ±25% jitter
         // Honor the server hint, but never below the in-provider base delay and
@@ -2198,9 +2622,49 @@ export class VLlmProvider implements LLMProvider {
         continue rateRetry;
       }
       {
+        const detail404 = errBodyText ?? await response.text().catch(() => '');
+        errBodyText = detail404;
+        const looksCatalogUnavailable = (
+          response.status === 404
+          && /is not available/i.test(detail404)
+        );
+        if (looksCatalogUnavailable) {
+          if (!unavailable404StartedAt) unavailable404StartedAt = Date.now();
+          const elapsed = Date.now() - unavailable404StartedAt;
+          if (elapsed < UNAVAILABLE_404_GRACE_MS) {
+            const serverRetryAfterMs = retryAfterHeaderMs(response.headers) ?? null;
+            const expDelayMs404 = Math.min(
+              BASE_5XX_DELAY_MS * Math.pow(2, serverErrAttempt),
+              MAX_5XX_DELAY_MS,
+            ) * (0.75 + Math.random() * 0.5);
+            const delayMs404 = serverRetryAfterMs
+              ? Math.min(Math.max(serverRetryAfterMs, BASE_5XX_DELAY_MS), MAX_5XX_DELAY_MS)
+              : expDelayMs404;
+            serverErrAttempt++;
+            logger.warn(
+              {
+                status: response.status, serverErrAttempt,
+                delayMs: Math.round(delayMs404), elapsedMs: elapsed,
+                graceMs: UNAVAILABLE_404_GRACE_MS,
+              },
+              'vLLM 404 model-unavailable — waiting for backend reconnect',
+            );
+            yield {
+              type: 'status',
+              level: 'warning',
+              provider: providerLabel,
+              code: 'model_unavailable_retry',
+              attempt: serverErrAttempt,
+              retryInMs: Math.round(delayMs404),
+              message: `${providerLabel} model briefly unavailable (${endpointLabel}). Retry in ${Math.round(delayMs404 / 1000)}s...`,
+            };
+            await new Promise((r) => setTimeout(r, delayMs404));
+            continue rateRetry;
+          }
+        }
         const tailRetryAfterMs = retryAfterHeaderMs(response.headers) ?? null;
         throw Object.assign(
-          new Error(`vLLM error ${response.status}: ${await response.text()}`),
+          new Error(`vLLM error ${response.status}: ${detail404}`),
           { status: response.status, ...(tailRetryAfterMs ? { retryAfterMs: tailRetryAfterMs } : {}) },
         );
       }
@@ -2242,6 +2706,7 @@ export class VLlmProvider implements LLMProvider {
             tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>;
           };
           finish_reason?: string | null;
+          stop_reason?: number | string | null;
         }>;
         usage?: {
           prompt_tokens?: number;
@@ -2267,6 +2732,11 @@ export class VLlmProvider implements LLMProvider {
       const choice = data.choices?.[0];
       const m = choice?.message;
       const serverToolCalls = m?.tool_calls ?? [];
+      if (!toolsEnabled && serverToolCalls.length > 0) {
+        throw Object.assign(new Error(`${this.logLabel} returned tool calls while tools are disabled`), {
+          code: 'TOOL_CALLS_DISABLED',
+        });
+      }
       let textOut = m?.content ?? '';
       let reasoningOut = m?.reasoning_content ?? m?.reasoning ?? '';
       if (textOut || reasoningOut || serverToolCalls.length > 0) noteFirstToken();
@@ -2278,7 +2748,7 @@ export class VLlmProvider implements LLMProvider {
       // We use the recovered calls to (a) fill empty-args server tool_calls by name, and
       // (b) emit any calls the server missed entirely.
       const recovered: Array<{ name: string; args: Record<string, unknown> }> = [];
-      {
+      if (toolsEnabled) {
         const c = extractGlmToolCalls(textOut); textOut = c.clean; recovered.push(...c.calls);
         const r = extractGlmToolCalls(reasoningOut); reasoningOut = r.clean; recovered.push(...r.calls);
       }
@@ -2338,7 +2808,17 @@ export class VLlmProvider implements LLMProvider {
       // recovered only to FILL empty server-tool-call args don't need this (the server
       // already signalled tool_calls).
       const unconsumedRecovered = recovered.length - usedRecovered.size;
-      const effReason = unconsumedRecovered > 0 ? 'tool_calls' : (fr === 'length' ? 'max_tokens' : (fr ?? 'stop'));
+      const droppedObservation = shouldTreatGlmStopAsDroppedToolCall({
+        finishReason: fr,
+        stopReasonTokenId: choice?.stop_reason,
+        eatenTokens: 0,
+        hasParsedTools: unconsumedRecovered > 0 || (choice?.message?.tool_calls?.length ?? 0) > 0,
+        toolsOffered: toolsEnabled,
+        isGlm: isGlmModel,
+      });
+      const effReason = unconsumedRecovered > 0 ? 'tool_calls'
+        : droppedObservation ? 'glm_observation'
+        : (fr === 'length' ? 'max_tokens' : (fr ?? 'stop'));
       yield { type: 'stop_reason', reason: effReason };
       const finalInputTokens = data.usage?.prompt_tokens ?? promptTokenEstimate;
       this._recordPromptUsage(data.usage?.prompt_tokens);
@@ -2372,6 +2852,11 @@ export class VLlmProvider implements LLMProvider {
     let buffer = '';
     let promptTokens = 0;
     let completionTokens = 0;
+    // Last usage.completion_tokens on a chunk that also carried visible
+    // reasoning/content/tool_call deltas. The finish frame often bills extra
+    // tokens with an empty delta (shizuha1 2026-09-11: 45→60 then
+    // finish_reason=stop) — that gap is glm47/glm45 eating the tool call.
+    let lastVisibleCompletionTokens = 0;
     let cacheReadInputTokens: number | undefined;
     let reasoningContent = ''; // SCLI-24: accumulate reasoning_content across chunks
     let inThinkBlock = false;
@@ -2381,6 +2866,20 @@ export class VLlmProvider implements LLMProvider {
 
     // Track streaming tool calls (may arrive across multiple SSE chunks)
     const toolCallBuilders = new Map<number, { id: string; name: string; args: string }>();
+    // SCLI-6xx atomic evidence: capture every streamed tool_calls delta shape
+    // so the no-parsed-tokens drop can be diagnosed at the atomic level. The
+    // warning previously logged only deltaKeys of the FINAL choice — useless
+    // for pinpointing WHY glmStreamedToolCallDeltasAreReal rejected the
+    // stream (index-only skeletons? empty fields? content-eaten specials?).
+    // Bounded: first 8 deltas verbatim + running shape tally.
+    const toolCallDeltaEvidence: Array<Record<string, unknown>> = [];
+    let toolCallDeltaCount = 0;
+    // True once ANY builder was created this response. The skeleton-delta
+    // salvage must fire only when NO builder ever existed: after an
+    // argument-recovery lap the re-streamed duplicate is deliberately
+    // suppressed by the consumed-once registry (builders cleared) — salvaging
+    // there would fight the dedup and loop the request.
+    let everBuiltToolCall = false;
 
     // Bulletproof tool-call recovery for the STREAMING path. GLM-4.7 sometimes
     // emits a tool call as raw `<tool_call>…<arg_key>…` markup INSIDE its thinking
@@ -2395,7 +2894,23 @@ export class VLlmProvider implements LLMProvider {
     let sawStreamedToolCall = false;
     let toolCallsFinalized = false;
     let recoveredLeakedToolCall = false;
+    let reasoningBlockEmitted = false;
+    // GLM/vLLM often ends the HTTP body on finish_reason without [DONE]
+    // (PLAT-507 drain). The reasoning block used to emit only on [DONE], so
+    // CoT that streamed as reasoning_text never landed on the persisted
+    // assistant message and the next request sent an empty assistant prefix
+    // (shizuha1 2026-09-10: 39 completion tokens vanished between ToolSearch
+    // and the continue lecture). Emit from accReasoning OR reasoning_content
+    // on every terminal path.
+    const emitReasoningBlock = (): StreamChunk[] => {
+      if (reasoningBlockEmitted) return [];
+      const raw = (accReasoning || reasoningContent).trim();
+      if (!raw) return [];
+      reasoningBlockEmitted = true;
+      return [{ type: 'reasoning', id: `r1_${Date.now()}`, rawContent: raw }];
+    };
     const buildRecoveredToolEvents = (): StreamChunk[] => {
+      if (!toolsEnabled) return [];
       if (toolCallsFinalized) return [];
       toolCallsFinalized = true;
       if (sawStreamedToolCall) return []; // server gave real tool calls — trust them
@@ -2403,10 +2918,21 @@ export class VLlmProvider implements LLMProvider {
       if (!combined.includes('<tool_call>')) return [];
       const { calls } = extractGlmToolCalls(combined);
       if (calls.length === 0) return [];
+      const { kept, discarded } = filterSalvagedGlmToolCalls(
+        calls,
+        Boolean(options.heartbeatInboxSatisfied),
+      );
+      if (discarded.length > 0) {
+        logger.warn(
+          { discarded },
+          'vLLM streaming: discarded leaked pulse inbox listing after prefetch',
+        );
+      }
+      if (kept.length === 0) return [];
       recoveredLeakedToolCall = true;
-      logger.warn({ recovered: calls.length }, 'vLLM streaming: recovered tool call(s) leaked into reasoning/content markup');
+      logger.warn({ recovered: kept.length }, 'vLLM streaming: recovered tool call(s) leaked into reasoning/content markup');
       const events: StreamChunk[] = [];
-      for (const gc of calls) {
+      for (const gc of kept) {
         const id = `vllm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const name = reverseAliases[gc.name] ?? gc.name;
         events.push({ type: 'tool_use_start', id, name });
@@ -2420,6 +2946,84 @@ export class VLlmProvider implements LLMProvider {
       || accContent.length > 0
       || toolCallBuilders.size > 0
       || completionTokens > 0;
+    const sseRing: string[] = [];
+    const pushSseRing = (payload: string) => {
+      sseRing.push(payload.length > 4000 ? `${payload.slice(0, 4000)}…` : payload);
+      if (sseRing.length > 48) sseRing.shift();
+    };
+    let glmToolMissDumped = false;
+    let lastStopReason: unknown = undefined;
+    const dumpGlmToolMiss = (
+      finishReason: string | null | undefined,
+      stopReasonTokenId?: unknown,
+    ) => {
+      if (glmToolMissDumped) return;
+      if (!toolsEnabled || !isGlmModel) return;
+      if (sawStreamedToolCall || toolCallBuilders.size > 0 || recoveredLeakedToolCall) return;
+      glmToolMissDumped = true;
+      const eatenTokens = Math.max(0, completionTokens - lastVisibleCompletionTokens);
+      const kind = classifyGlmToolsOfferedMiss({
+        finishReason,
+        stopReasonTokenId: stopReasonTokenId ?? lastStopReason,
+        eatenTokens,
+      });
+      const fields = {
+        kind,
+        finishReason,
+        stopReasonTokenId: stopReasonTokenId ?? lastStopReason,
+        completionTokens,
+        lastVisibleCompletionTokens,
+        eatenTokens,
+        accContentLen: accContent.length,
+        accReasoningLen: accReasoning.length,
+        sseFrames: sseRing.length,
+      };
+      if (kind !== 'observation_drop') {
+        logger.warn(
+          fields,
+          kind === 'repetition'
+            ? 'vLLM GLM tools-offered turn ended on repetition_detected (think-loop, not a dropped tool)'
+            : kind === 'user_eos'
+              ? 'vLLM GLM tools-offered turn ended on <|user|> (wrap-up, not a dropped tool)'
+              : kind === 'length'
+                ? 'vLLM GLM tools-offered turn hit max tokens without tool_calls (not an observation drop)'
+                : 'vLLM GLM tools-offered turn ended with no parsed tool_calls (not an observation drop)',
+        );
+        return;
+      }
+      logger.warn(
+        fields,
+        'vLLM GLM tool turn ended with no parsed tool_calls — dumping SSE ring (glm47 zero-arg stream drop / empty tool_calls:[])',
+      );
+      try {
+        const fs = require('node:fs') as typeof import('node:fs');
+        const dir = '/tmp';
+        const existing = fs.readdirSync(dir).filter((f) => f.startsWith('vllm-sse-tool-miss-'));
+        if (existing.length >= 5) {
+          existing.sort();
+          for (const stale of existing.slice(0, existing.length - 4)) {
+            try { fs.unlinkSync(`${dir}/${stale}`); } catch { /* ignore */ }
+          }
+        }
+        fs.writeFileSync(
+          `${dir}/vllm-sse-tool-miss-${Date.now()}.json`,
+          JSON.stringify({
+            kind,
+            finishReason,
+            stopReasonTokenId: stopReasonTokenId ?? lastStopReason,
+            completionTokens,
+            lastVisibleCompletionTokens,
+            eatenTokens,
+            accContent,
+            accReasoning,
+            sseRing,
+            model,
+          }, null, 2),
+        );
+      } catch (e) {
+        logger.warn({ err: (e as Error).message }, 'vLLM SSE tool-miss dump failed');
+      }
+    };
     let stallRecovered = false;
     streamReadLoop: while (true) {
       let readResult: Awaited<ReturnType<typeof reader.read>>;
@@ -2543,6 +3147,7 @@ export class VLlmProvider implements LLMProvider {
         // SSE format: "data: {...}" or "data: [DONE]"
         if (!trimmed.startsWith('data:')) continue;
         const payload = trimmed.slice(5).trim();
+        if (payload !== '[DONE]') pushSseRing(payload);
         if (payload === '[DONE]') {
           gotFirstChunk = true;
           resetStallTimer();
@@ -2559,16 +3164,9 @@ export class VLlmProvider implements LLMProvider {
             yield* recovered;
             yield { type: 'stop_reason', reason: 'tool_calls' };
           }
+          dumpGlmToolMiss('done', lastStopReason);
 
-          // SCLI-24: emit a reasoning block if the model produced reasoning_content.
-          // This lets the loop surface the reasoning if there was no text output.
-          if (reasoningContent.trim()) {
-            yield {
-              type: 'reasoning',
-              id: `r1_${Date.now()}`,
-              rawContent: reasoningContent.trim(),
-            };
-          }
+          yield* emitReasoningBlock();
 
           const finalInputTokens = promptTokens || promptTokenEstimate;
           if (finalInputTokens || completionTokens) {
@@ -2629,7 +3227,10 @@ export class VLlmProvider implements LLMProvider {
             /context_length|context window|maximum context|input exceeds|prompt is too long|too many tokens/i.test(
               `${errMsg} ${errType} ${rawCode}`,
             );
-          const looksTransient = isTransientProviderFailure({
+          // An SSE error object with no message/code is a cut stream (gateway
+          // reconnect, nginx hop), not a model-quality or auth failure.
+          const opaqueSseError = !String(chunk.error.message ?? '').trim() && !rawCode;
+          const looksTransient = opaqueSseError || isTransientProviderFailure({
             message: errMsg,
             code: rawCode,
             type: errType,
@@ -2707,6 +3308,7 @@ export class VLlmProvider implements LLMProvider {
           if (reasoning) {
             noteFirstToken();
             accReasoning += reasoning;
+            lastVisibleCompletionTokens = completionTokens;
             yield { type: 'reasoning_text', text: reasoning };
           }
           if (choice.delta.reasoning_content) {
@@ -2719,7 +3321,10 @@ export class VLlmProvider implements LLMProvider {
           if (choice.delta.content) {
             noteFirstToken();
             accContent += choice.delta.content;
-            const held = holdDsmlStreamDelta(choice.delta.content, dsmlCarry);
+            lastVisibleCompletionTokens = completionTokens;
+            const held = toolsEnabled
+              ? holdDsmlStreamDelta(choice.delta.content, dsmlCarry)
+              : { text: choice.delta.content, carry: '' };
             dsmlCarry = held.carry;
             const parsed = consumeThinkStreamDelta(held.text, inThinkBlock, thinkCarry);
             inThinkBlock = parsed.inThinkBlock;
@@ -2733,10 +3338,35 @@ export class VLlmProvider implements LLMProvider {
           }
 
           // Tool calls (streamed incrementally)
-          if (choice.delta.tool_calls) {
+          const incomingToolCalls = choice.delta.tool_calls;
+          if (incomingToolCalls) {
+            toolCallDeltaCount += incomingToolCalls.length;
+            if (toolCallDeltaEvidence.length < 8) {
+              for (const tc of incomingToolCalls) {
+                if (toolCallDeltaEvidence.length >= 8) break;
+                toolCallDeltaEvidence.push({
+                  index: tc.index,
+                  hasId: Boolean(tc.id), idLen: tc.id?.length ?? 0,
+                  hasName: Boolean(tc.function?.name), name: tc.function?.name ?? '',
+                  argsLen: tc.function?.arguments?.length ?? 0,
+                  argsHead: (tc.function?.arguments ?? '').slice(0, 60),
+                  keys: Object.keys(tc),
+                });
+              }
+            }
+          }
+          if (glmStreamedToolCallDeltasAreReal(incomingToolCalls)) {
+            if (!toolsEnabled) {
+              clearStallTimer();
+              try { await reader.cancel(); } catch {}
+              throw Object.assign(new Error(`${this.logLabel} returned tool calls while tools are disabled`), {
+                code: 'TOOL_CALLS_DISABLED',
+              });
+            }
             noteFirstToken();
             sawStreamedToolCall = true;
-            for (const tc of choice.delta.tool_calls) {
+            lastVisibleCompletionTokens = completionTokens;
+            for (const tc of choice.delta.tool_calls!) {
               const idx = tc.index;
               if (!toolCallBuilders.has(idx)) {
                 const id = tc.id ?? `vllm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -2746,6 +3376,7 @@ export class VLlmProvider implements LLMProvider {
                 // Reverse-alias: map model's tool name back to shizuha's registry name
                 const name = reverseAliases[rawName] ?? rawName;
                 toolCallBuilders.set(idx, { id, name, args: '' });
+                everBuiltToolCall = true;
                 if (name) {
                   yield { type: 'tool_use_start', id, name };
                 }
@@ -2770,6 +3401,7 @@ export class VLlmProvider implements LLMProvider {
 
           // Stop reason
           if (choice.finish_reason) {
+            lastStopReason = choice.stop_reason;
             if (dsmlCarry) {
               const flushedDsml = holdDsmlStreamDelta('', dsmlCarry, true);
               dsmlCarry = '';
@@ -2799,17 +3431,31 @@ export class VLlmProvider implements LLMProvider {
               }
             }
             if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'stop') {
+              const shellRecovery = [
+                ...extractGlmToolCalls(accContent).calls,
+                ...extractGlmToolCalls(accReasoning).calls,
+              ];
+              const consumedShellRecovery = new Set<number>();
               for (const [, tc] of toolCallBuilders) {
                 let parsedInput: Record<string, unknown> = {};
                 let parseOk = true;
                 try { parsedInput = JSON.parse(tc.args || '{}'); } catch { parseOk = false; }
+                const recoveryIndex = shellRecovery.findIndex((call, index) =>
+                  !consumedShellRecovery.has(index) && (reverseAliases[call.name] ?? call.name) === tc.name);
+                if (recoveryIndex >= 0) {
+                  consumedShellRecovery.add(recoveryIndex);
+                  if (!parseOk || !parsedInput || Object.keys(parsedInput).length === 0) {
+                    parsedInput = shellRecovery[recoveryIndex]!.args;
+                    parseOk = true;
+                  }
+                }
                 // SCLI-57: when a tool call's args fail to parse (the corruption that loops
                 // GLM agents), FREEZE the exact reproducible case — the full request body that
                 // produced it + the corrupt args + accumulated content/reasoning — to a repro
                 // file. Replaying request.json against vLLM reproduces it deterministically.
                 if (!parseOk && (tc.args || '').trim()) {
                   // SCLI-57b (PLAT-4186 fallout, ni 2026-07-12): under FORCED named
-                  // tool_choice (Cortex heartbeats force pulse_get_my_alerts first), vLLM does
+                  // tool_choice (Cortex heartbeats force pulse_get_my_work first), vLLM does
                   // not grammar-constrain the args — whatever text the model emits is
                   // served verbatim as `arguments`. DSV4 on long sessions then emits
                   // either (a) its native DSML markup re-invoking the SAME forced tool
@@ -2871,10 +3517,203 @@ export class VLlmProvider implements LLMProvider {
 
             // If we recovered a leaked tool call, the turn must be treated as a
             // tool-call turn so the agent loop runs it (not a final text answer).
+            yield* emitReasoningBlock();
+            dumpGlmToolMiss(choice.finish_reason, choice.stop_reason);
+            const eatenTokens = Math.max(0, completionTokens - lastVisibleCompletionTokens);
+            const droppedObservation = shouldTreatGlmStopAsDroppedToolCall({
+              finishReason: choice.finish_reason,
+              stopReasonTokenId: choice.stop_reason,
+              eatenTokens,
+              hasParsedTools: recoveredLeakedToolCall
+                || sawStreamedToolCall
+                || toolCallBuilders.size > 0,
+              toolsOffered: toolsEnabled,
+              isGlm: isGlmModel,
+            });
+            if (droppedObservation) {
+              logger.warn(
+                {
+                  finishReason: choice.finish_reason,
+                  stopReasonTokenId: choice.stop_reason,
+                  eatenTokens,
+                  completionTokens,
+                  lastVisibleCompletionTokens,
+                },
+                'vLLM: GLM <|observation|> / eaten-token stop with no parsed tool_calls — treating as dropped tool turn',
+              );
+              // vLLM #44326: non-stream glm47 extracts the inline zero-arg call
+              // that streaming dropped. One salvage of the SAME request (prefix
+              // cache). Continue-from-prefix cannot recover — the model just
+              // re-emits the 18 swallowed tokens (shizuha1 2026-09-11 07:40Z).
+              if (salvageHeaders && shouldSalvageGlmObservationNonStream({
+                droppedObservation: true,
+                accContentLen: accContent.length,
+                accReasoningLen: accReasoning.length,
+                eatenTokens,
+                hasToolMarkup: accContent.includes('<tool_call>') || accReasoning.includes('<tool_call>'),
+              })) {
+                try {
+                  const salvageBody = JSON.parse(requestBody) as Record<string, unknown>;
+                  salvageBody.stream = false;
+                  delete salvageBody.stream_options;
+                  salvageBody.max_tokens = capGlmObservationSalvageMaxTokens(salvageBody.max_tokens);
+                  const salvageRes = await fetch(`${activeBaseUrl}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: salvageHeaders,
+                    body: JSON.stringify(salvageBody),
+                    signal: combinedSignal,
+                    // @ts-expect-error — node fetch supports undici dispatcher
+                    dispatcher: vllmDispatcher,
+                  });
+                  if (salvageRes.ok) {
+                    const salvageData = await salvageRes.json() as Parameters<typeof collectGlmNonStreamToolCalls>[0];
+                    const salvaged = collectGlmNonStreamToolCalls(salvageData);
+                    const { kept, discarded } = filterSalvagedGlmToolCalls(
+                      salvaged,
+                      Boolean(options.heartbeatInboxSatisfied),
+                    );
+                    if (discarded.length > 0) {
+                      logger.warn(
+                        { discarded },
+                        'vLLM: discarded salvaged pulse inbox listing after prefetch — not dispatching',
+                      );
+                    }
+                    if (kept.length > 0) {
+                      for (const tc of kept) {
+                        const name = reverseAliases[tc.name] ?? tc.name;
+                        yield { type: 'tool_use_start', id: tc.id, name };
+                        yield { type: 'tool_use_end', id: tc.id, input: tc.args };
+                      }
+                      recoveredLeakedToolCall = true;
+                      logger.warn(
+                        { n: kept.length, names: kept.map((s) => s.name) },
+                        'vLLM: non-stream salvage recovered GLM tool_calls after <|observation|> drop',
+                      );
+                    } else {
+                      logger.warn(
+                        { recovered: salvaged.length, discarded: discarded.length },
+                        'vLLM: non-stream observation salvage recovered 0 dispatchable tool_calls',
+                      );
+                    }
+                  } else {
+                    logger.warn(
+                      { status: salvageRes.status },
+                      'vLLM: non-stream observation salvage HTTP error',
+                    );
+                  }
+                } catch (err) {
+                  logger.warn(
+                    { err: (err as Error).message },
+                    'vLLM: non-stream observation salvage failed',
+                  );
+                }
+              } else if (salvageHeaders) {
+                logger.warn(
+                  {
+                    eatenTokens,
+                    accContentLen: accContent.length,
+                    accReasoningLen: accReasoning.length,
+                  },
+                  'vLLM: skipping non-stream observation salvage (English-only 154829, no eaten specials)',
+                );
+              }
+            }
+            // SCLI-6xx (operator 2026-09-18): skeleton-delta salvage. The
+            // server claimed a tool call (finish_reason=tool_calls — its own
+            // parser parsed one) but every streamed delta was an empty
+            // skeleton (no id/name/arguments — glmStreamedToolCallDeltasAreReal
+            // correctly rejected them; there was nothing to build). The
+            // observation salvage above is gated on the eaten-specials
+            // signature and does NOT cover this shape, so the turn used to die
+            // with an unfulfilled tool_calls claim → model retry loop (the
+            // recurring drops). finish_reason is authoritative: ALWAYS attempt
+            // the non-stream salvage of the SAME request (prefix-cached, cheap,
+            // vLLM #44326 — non-stream glm47 extracts the call streaming
+            // dropped) whenever the server claimed a tool call the client
+            // could not build.
+            if (
+              choice.finish_reason === 'tool_calls'
+              && toolCallBuilders.size === 0
+              && !everBuiltToolCall
+              && !recoveredLeakedToolCall
+              && !droppedObservation
+              && salvageHeaders
+            ) {
+              try {
+                const salvageBody = JSON.parse(requestBody) as Record<string, unknown>;
+                salvageBody.stream = false;
+                delete salvageBody.stream_options;
+                const salvageRes = await fetch(`${activeBaseUrl}/v1/chat/completions`, {
+                  method: 'POST',
+                  headers: salvageHeaders,
+                  body: JSON.stringify(salvageBody),
+                  signal: combinedSignal,
+                  // @ts-expect-error — node fetch supports undici dispatcher
+                  dispatcher: vllmDispatcher,
+                });
+                if (salvageRes.ok) {
+                  const salvageData = await salvageRes.json() as Parameters<typeof collectGlmNonStreamToolCalls>[0];
+                  const salvaged = collectGlmNonStreamToolCalls(salvageData);
+                  const { kept } = filterSalvagedGlmToolCalls(
+                    salvaged,
+                    Boolean(options.heartbeatInboxSatisfied),
+                  );
+                  if (kept.length > 0) {
+                    for (const tc of kept) {
+                      const name = reverseAliases[tc.name] ?? tc.name;
+                      yield { type: 'tool_use_start', id: tc.id, name };
+                      yield { type: 'tool_use_end', id: tc.id, input: tc.args };
+                    }
+                    recoveredLeakedToolCall = true;
+                    logger.warn(
+                      { n: kept.length, names: kept.map((s) => s.name) },
+                      'vLLM: skeleton-delta salvage recovered server-claimed tool_calls',
+                    );
+                  } else {
+                    logger.warn(
+                      { recovered: salvaged.length },
+                      'vLLM: skeleton-delta salvage recovered 0 tool_calls',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { status: salvageRes.status },
+                    'vLLM: skeleton-delta salvage HTTP error',
+                  );
+                }
+              } catch (err) {
+                logger.warn(
+                  { err: (err as Error).message },
+                  'vLLM: skeleton-delta salvage failed',
+                );
+              }
+            }
             const reason = recoveredLeakedToolCall
               ? 'tool_calls'
+              : droppedObservation ? 'glm_observation'
               : choice.finish_reason === 'length' ? 'max_tokens' : choice.finish_reason;
             yield { type: 'stop_reason', reason };
+            if (
+              completionTokens > 0
+              && !accReasoning.trim()
+              && !accContent.trim()
+              && toolCallBuilders.size === 0
+              && !recoveredLeakedToolCall
+            ) {
+              logger.warn(
+                {
+                  completionTokens,
+                  finishReason: choice.finish_reason,
+                  deltaKeys: Object.keys(choice.delta ?? {}),
+                  // SCLI-6xx atomic evidence: the exact delta shapes the stream
+                  // carried, so the drop is diagnosable without guessing which
+                  // layer diverged (model format vs vLLM parse vs this gate).
+                  toolCallDeltaCount,
+                  toolCallDeltaEvidence,
+                },
+                'vLLM: completion tokens arrived with no parsed reasoning/content/tool_calls — tokens were dropped',
+              );
+            }
             // PLAT-507: arm short drain window. Some vLLM/GLM deployments keep the
             // HTTP body open indefinitely after finish_reason without sending [DONE].
             // resetStallTimer() will now use FINISH_DRAIN_MS instead of STREAM_STALL_MS.
@@ -2891,6 +3730,7 @@ export class VLlmProvider implements LLMProvider {
       try { parsedInput = JSON.parse(tc.args || '{}'); } catch { /* empty */ }
       yield { type: 'tool_use_end', id: tc.id, input: parsedInput };
     }
+    yield* emitReasoningBlock();
     // Last-chance leaked-markup recovery (no [DONE]/finish_reason seen).
     if (!stallRecovered) {
       const recovered = buildRecoveredToolEvents();

@@ -1,4 +1,5 @@
 import { logger } from '../utils/logger.js';
+import { isPulseGetMyWorkToolName } from '../shared/heartbeat-outcome.js';
 
 export interface LoopDetectorConfig {
   /** Number of consecutive identical tool calls before warning (default: 3) */
@@ -40,6 +41,20 @@ const WRITE_TOOL_NAMES = new Set([
   'write', 'edit', 'notebook_edit', 'apply_patch', 'multi_edit',
 ]);
 
+/** Valid catalog names; anything else is wrap-up / parser junk. */
+const VALID_TOOL_NAME = /^(mcp__)?[A-Za-z][A-Za-z0-9_-]*(__[A-Za-z0-9_-]+)*$/;
+
+export function canonicalToolName(toolName: string): string {
+  const n = (toolName || '').trim();
+  if (!n || n.includes('()') || n.includes('{') || n.includes('=') || /\s/.test(n)) {
+    return 'garbled_tool';
+  }
+  if (!VALID_TOOL_NAME.test(n)) return 'garbled_tool';
+  // audit_audit_audit_audit / message_message_user wrap-up
+  if (/^([A-Za-z0-9]+)(_\1){2,}/.test(n)) return 'garbled_tool';
+  return n;
+}
+
 function classifyCall(toolName: string, input: Record<string, unknown>): { isProbe: boolean; isWrite: boolean } {
   const isWrite = WRITE_TOOL_NAMES.has(toolName);
   let isProbe = false;
@@ -55,7 +70,10 @@ function classifyCall(toolName: string, input: Record<string, unknown>): { isPro
  *
  * Detection patterns:
  * 1. **Exact repeat**: Same tool + same input N times in a row
- * 2. **Ping-pong**: Alternating between two tools (A→B→A→B)
+ * 2. **Ping-pong**: Alternating between two (tool, input) signatures
+ *    (read→write, or same tool with two args: get_task A→get_task B→A→B).
+ *    Same-tool two-arg ABAB was invisible when ping-pong required different
+ *    tool *names* (revi 2026-08-22: pulse_get_task HIVE-1953 / PLS-986).
  * 3. **Probe loop**: N consecutive `bash` calls running `python3 -c "..."` (or
  *    similar inline probes) with no intervening file write/edit. Observed in
  *    M2.5 fail logs — model spelunks via bash probes for 13+ turns instead of
@@ -64,6 +82,13 @@ function classifyCall(toolName: string, input: Record<string, unknown>): { isPro
 export class LoopDetector {
   private history: CallRecord[] = [];
   private config: LoopDetectorConfig;
+  // SCLI-6xx (mio 2026-09-19, live): probe/text oscillation defeats the
+  // trailing-probe streak — each nudge produces a mixed turn that resets the
+  // streak below probeLoopBreak, so the detector nudges forever while the
+  // context grows ~1K tokens per cycle and long-context degradation deepens
+  // (the very regime that causes the probing). Track consecutive nudges
+  // without an intervening write; escalate to break after 3.
+  private probeNudgeStreak = 0;
 
   constructor(config?: Partial<LoopDetectorConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -74,9 +99,19 @@ export class LoopDetector {
    * Returns 'ok', 'warning', 'probe-warning', or 'break'.
    */
   record(toolName: string, input: Record<string, unknown>): 'ok' | 'warning' | 'probe-warning' | 'break' {
-    const inputHash = simpleHash(JSON.stringify(input));
-    const { isProbe, isWrite } = classifyCall(toolName, input);
-    this.history.push({ toolName, inputHash, isProbe, isWrite });
+    // Ryo 2026-09-11 gen35: after prefetch, GLM still ping-ponged
+    // pulse_get_my_work `{}` vs `{limit:40}`. Those are the same listing.
+    // Hash them as one signature so exact-repeat break fires at 5, not
+    // ping-pong at 10. get_task / transition args stay distinct.
+    // GLM wrap-up emits a new garbled name every turn
+    // (`message_user()()={"content":"pong"}audit_user…`). Those must
+    // count as the SAME tool or exact-repeat never fires (Shion 2026-09-15).
+    const canonicalName = canonicalToolName(toolName);
+    const hashedInput = isPulseGetMyWorkToolName(canonicalName) ? {} : input;
+    const inputHash = simpleHash(JSON.stringify(hashedInput));
+    const { isProbe, isWrite } = classifyCall(canonicalName, input);
+    if (isWrite) this.probeNudgeStreak = 0;
+    this.history.push({ toolName: canonicalName, inputHash, isProbe, isWrite });
 
     // Keep only last 20 calls
     if (this.history.length > 20) {
@@ -112,15 +147,49 @@ export class LoopDetector {
       return 'break';
     }
     if (probeStreak >= this.config.probeLoopWarning) {
-      logger.info({ probeStreak }, 'Probe loop detected: nudging');
+      this.probeNudgeStreak += 1;
+      if (this.probeNudgeStreak >= 3) {
+        logger.warn(
+          { probeStreak, probeNudgeStreak: this.probeNudgeStreak },
+          'Probe loop: 3 nudges without a write — breaking (nudge-forever guard, SCLI-6xx)',
+        );
+        return 'break';
+      }
+      logger.info({ probeStreak, probeNudgeStreak: this.probeNudgeStreak }, 'Probe loop detected: nudging');
       return 'probe-warning';
     }
+    this.probeNudgeStreak = 0;
 
     return 'ok';
   }
 
   /** Reset the history (e.g., on new user message) */
   reset(): void {
+    this.probeNudgeStreak = 0;
+    this.history = [];
+  }
+
+  /**
+   * PLAT-8991: reset the history when a turn made no write-class calls.
+   *
+   * The process-lifetime detector deliberately persists across heartbeat turns
+   * so ABAB fetch loops accumulate — but that design assumed hours-scale beat
+   * cadence. At the 90s fleet idle cadence, contract-correct drained beats
+   * accumulate identical `pulse_get_my_work` probes (~40/hour) and
+   * false-positive the probe-streak. A heartbeat turn with no write-class
+   * calls is a clean boundary: only within-turn runaways (the ABAB class this
+   * persistence exists for) still accumulate, because any such loop re-manifests
+   * inside the next turn and re-crosses the threshold there.
+   */
+  resetIfNoWrites(toolCalls: ReadonlyArray<{ name?: string; input?: unknown }>): void {
+    for (const call of toolCalls) {
+      if (!call?.name) continue;
+      const input = call.input && typeof call.input === 'object' && !Array.isArray(call.input)
+        ? (call.input as Record<string, unknown>)
+        : {};
+      const { isWrite } = classifyCall(canonicalToolName(call.name), input);
+      if (isWrite) return; // dirty beat — keep the streak
+    }
     this.history = [];
   }
 
@@ -156,8 +225,9 @@ export class LoopDetector {
     const a = this.history[len - 2]!;
     const b = this.history[len - 1]!;
 
-    // Check if last two are different
-    if (a.toolName === b.toolName) return 0;
+    // Last two must differ in tool *or* input. Identical signatures are
+    // exact-repeat. Same tool + two alternating inputs is ping-pong.
+    if (a.toolName === b.toolName && a.inputHash === b.inputHash) return 0;
 
     let count = 0;
     for (let i = len - 1; i >= 1; i -= 2) {

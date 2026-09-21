@@ -22,7 +22,6 @@ import {
 } from './devices/pairing.js';
 import { checkRateLimit, recordFailure, resetFailures } from './devices/rateLimit.js';
 import {
-  AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
   incompleteTurnError,
   MAX_THINKING_ONLY_RECOVERY,
   shouldContinueAutonomousMaxTokens,
@@ -435,13 +434,6 @@ export async function startServer(port = 8015, host = '0.0.0.0'): Promise<void> 
             outputTokens: result.outputTokens,
           })) {
             thinkingOnlyRecoveryCount++;
-            const continueMsg = {
-              role: 'user' as const,
-              content: AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
-              timestamp: Date.now(),
-            };
-            messages.push(continueMsg);
-            store.appendMessage(activeSession.id, continueMsg);
             continue;
           }
           const incompleteError = incompleteTurnError(result.stopReason);
@@ -854,7 +846,20 @@ export async function startServer(port = 8015, host = '0.0.0.0'): Promise<void> 
     return { token };
   });
 
-  await app.listen({ port, host });
+  try {
+    await app.listen({ port, host });
+  } catch (err) {
+    // SCLI-566: a syntactically valid but unresolvable host (or a bind
+    // failure) must surface as ONE bounded diagnostic — never a raw
+    // `node:dns` getaddrinfo stack or an ERR_ code dump. The server never
+    // starts listening on failure.
+    const code = (err as NodeJS.ErrnoException)?.code;
+    const detail = code === 'ENOTFOUND' || code === 'EAI_AGAIN'
+      ? `host does not resolve`
+      : `cannot bind listener`;
+    console.error(`Error: Invalid --host ${JSON.stringify(host)}; ${detail} (${code ?? 'EADDRNOTAVAIL'})`);
+    process.exit(1);
+  }
   logger.info({ port, host }, 'Shizuha server started');
   console.log(`Shizuha server listening on ${host}:${port}`);
 }

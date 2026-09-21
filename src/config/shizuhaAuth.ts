@@ -253,6 +253,12 @@ function inferBaseUrlFromOAuthTokenEndpoint(endpoint: string): string {
 }
 
 export function readShizuhaAuth(): ShizuhaAuthState | null {
+  // SCLI-439: reject non-regular / symlink / FIFO / unreadable stores BEFORE
+  // any blocking read. fs.readFileSync on a FIFO blocks indefinitely, and a
+  // symlink would follow to an outside target. Non-following lstat keeps the
+  // probe bounded and side-effect-free.
+  const probe = probeShizuhaAuthStore();
+  if (probe.kind !== 'ok') return null;
   try {
     const raw = fs.readFileSync(shizuhaAuthPath(), 'utf-8');
     const parsed = JSON.parse(raw) as Partial<ShizuhaAuthState>;
@@ -280,6 +286,74 @@ export function readShizuhaAuth(): ShizuhaAuthState | null {
   } catch {
     return null;
   }
+}
+
+export type ShizuhaAuthStoreStatus =
+  | { kind: 'missing' }
+  | { kind: 'invalid'; reason: string }
+  | { kind: 'ok' };
+
+/**
+ * SCLI-439: non-following metadata probe of the persisted auth store.
+ *
+ * Distinguishes a genuinely absent store from a present-but-invalid one
+ * (FIFO, symlink, directory, socket, unreadable, or not owner-controlled)
+ * WITHOUT reading file contents or following links. This is the guard that
+ * keeps `auth whoami` from hanging on a FIFO and from reporting "not logged
+ * in" when a corrupt/hostile store object actually exists.
+ */
+export function probeShizuhaAuthStore(): ShizuhaAuthStoreStatus {
+  const filePath = shizuhaAuthPath();
+
+  // Parent ~/.shizuha must be a real directory (not a symlink to elsewhere).
+  const dirPath = authDir();
+  let dirSt: fs.Stats | undefined;
+  try {
+    dirSt = fs.lstatSync(dirPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return { kind: 'missing' };
+    return { kind: 'invalid', reason: `cannot stat ~/.shizuha: ${code ?? 'unknown error'}` };
+  }
+  if (dirSt.isSymbolicLink()) return { kind: 'invalid', reason: '~/.shizuha is a symlink' };
+  if (!dirSt.isDirectory()) return { kind: 'invalid', reason: '~/.shizuha is not a directory' };
+
+  let st: fs.Stats | undefined;
+  try {
+    st = fs.lstatSync(filePath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return { kind: 'missing' };
+    return { kind: 'invalid', reason: `cannot stat persisted auth store: ${code ?? 'unknown error'}` };
+  }
+  if (st.isDirectory()) return { kind: 'invalid', reason: 'persisted auth store is a directory' };
+  if (st.isSymbolicLink()) return { kind: 'invalid', reason: 'persisted auth store is a symlink' };
+  if (!st.isFile()) return { kind: 'invalid', reason: 'persisted auth store is not a regular file' };
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+    return { kind: 'invalid', reason: 'persisted auth store is not owned by the current user' };
+  }
+  return { kind: 'ok' };
+}
+
+export type ShizuhaAuthSafeRead =
+  | { kind: 'missing' }
+  | { kind: 'invalid'; reason: string }
+  | { kind: 'ok'; state: ShizuhaAuthState };
+
+/**
+ * SCLI-439: bounded, non-following read for `auth whoami`.
+ *
+ * Returns a discriminated result so callers can distinguish a genuinely
+ * absent store from a present-but-corrupt/non-regular one, instead of
+ * collapsing both to "not logged in". Never blocks on a FIFO and never
+ * follows a symlink.
+ */
+export function readShizuhaAuthSafe(): ShizuhaAuthSafeRead {
+  const probe = probeShizuhaAuthStore();
+  if (probe.kind !== 'ok') return probe;
+  const state = readShizuhaAuth();
+  if (state) return { kind: 'ok', state };
+  return { kind: 'invalid', reason: 'persisted auth store is corrupt or incomplete' };
 }
 
 function extractUserIdFromJwt(token: string): number | undefined {
@@ -327,15 +401,48 @@ export function getShizuhaAuthStatus(): {
   username?: string;
   accessTokenExpiresAt?: string;
   refreshTokenExpiresAt?: string;
+  source?: 'interactive' | 'fleet-runtime';
 } {
   const state = readShizuhaAuth();
-  if (!state) return { loggedIn: false };
+  if (!state) {
+    // SCLI-393: a fleet runtime is authenticated via the injected agent
+    // identity (env), not an interactive auth.json. Report it as logged in so
+    // `auth status` / `auth whoami` do not falsely claim the platform user is
+    // logged out.
+    const runtime = resolveRuntimeIdentity();
+    if (runtime) {
+      return {
+        loggedIn: true,
+        username: runtime.username,
+        source: 'fleet-runtime',
+      };
+    }
+    return { loggedIn: false };
+  }
   return {
     loggedIn: true,
     username: state.username,
     accessTokenExpiresAt: state.accessTokenExpiresAt,
     refreshTokenExpiresAt: state.refreshTokenExpiresAt,
+    source: 'interactive',
   };
+}
+
+/** SCLI-393: the fleet-runtime injected Shizuha identity (env), if any.
+ *
+ * Native k3s agents and the daemon-spawned gateway run with the agent's
+ * identity injected via env (SHIZUHA_AGENT_USERNAME / AGENT_USERNAME and
+ * SHIZUHA_AGENT_ID / AGENT_ID). There is no interactive auth.json on those
+ * hosts — the identity is the sanctioned runtime credential. This resolver
+ * surfaces it so auth introspection does not report a logged-out user.
+ */
+export function resolveRuntimeIdentity(): { username?: string; userId?: string } | null {
+  const username = process.env['SHIZUHA_AGENT_USERNAME']?.trim()
+    || process.env['AGENT_USERNAME']?.trim();
+  const userId = process.env['SHIZUHA_AGENT_ID']?.trim()
+    || process.env['AGENT_ID']?.trim();
+  if (!username && !userId) return null;
+  return { username: username || undefined, userId: userId || undefined };
 }
 
 export async function loginToShizuhaId(username: string, password: string, platformUrl?: string): Promise<{ username: string; userId?: number }> {
@@ -532,9 +639,57 @@ async function refreshOAuthAccessToken(state: ShizuhaAuthState): Promise<Shizuha
   throw new Error(lastError);
 }
 
+/** SCLI-393 (A2 leg): the fleet seat's own Shizuha ID bearer, read from the
+ * runtime-maintained token file (`~/.shizuha/auth/token-<username>.json`,
+ * legacy `token-agent.json` / `token.json`) — the same source and precedence
+ * the REST client uses (`readAgentOwnToken` in provider/registry.ts). Fleet
+ * seats have no interactive `auth.json`; without this fallback the `--live`
+ * verification leg fails "Not logged in." even though a valid, runtime-
+ * refreshed credential is on disk. Read-only by design: the runtime owns the
+ * file's lifecycle (refresh/rotation), so we never write or refresh it here,
+ * and a token expiring within 60s is treated as expired (the runtime will
+ * refresh it; a stale read must not mint a doomed Authorization header). */
+function readFleetRuntimeAccessToken(): string | null {
+  try {
+    const tokenDir = path.join(process.env['HOME'] ?? '/root', '.shizuha', 'auth');
+    const username = process.env['SHIZUHA_AGENT_USERNAME']?.trim() || 'agent';
+    const candidates = [
+      path.join(tokenDir, `token-${username}.json`),
+      path.join(tokenDir, 'token-agent.json'),
+      path.join(tokenDir, 'token.json'),
+    ];
+    for (const file of candidates) {
+      try {
+        if (!fs.statSync(file).isFile()) continue;
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        const token = typeof parsed?.accessToken === 'string' ? parsed.accessToken : '';
+        if (!token) continue;
+        const expiresAt = typeof parsed?.expiresAt === 'string'
+          ? Date.parse(parsed.expiresAt)
+          : NaN;
+        if (Number.isFinite(expiresAt) && expiresAt <= Date.now() + 60_000) {
+          continue;
+        }
+        return token;
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
 export async function getValidShizuhaAccessToken(): Promise<string | null> {
   const state = readShizuhaAuth();
-  if (!state) return null;
+  if (!state) {
+    // SCLI-393: fleet runtime — no interactive auth.json. The agent's own
+    // runtime-maintained Shizuha ID token file is the sanctioned credential
+    // source (same precedence as the REST client); `--live` verification and
+    // any other token consumer must resolve it instead of reporting logged out.
+    return readFleetRuntimeAccessToken();
+  }
 
   if (!expiresSoon(state.accessTokenExpiresAt) && !knownExpiresSoon(state.refreshTokenExpiresAt, REFRESH_EXPIRY_RENEW_WINDOW_MS)) {
     return state.accessToken;

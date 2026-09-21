@@ -57,4 +57,38 @@ describe('MessageBlock live event ordering', () => {
     expect(frame).not.toContain('kubectl get pods -A');
     expect(frame).not.toContain('pod/example Running');
   });
+
+  it('shows a short reasoning preview only while streaming, not in the settled answer', () => {
+    const thinking = 'The user is asking me what I think about this system — presumably the framework.';
+    const answer = 'Keep CLAUDE.md lean and load skills on demand.';
+    const streaming: TranscriptEntry = {
+      id: 'assistant-live-think',
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+      isStreaming: true,
+      reasoningSummaries: [thinking],
+    };
+    const settled: TranscriptEntry = {
+      id: 'assistant-done',
+      role: 'assistant',
+      content: answer,
+      timestamp: Date.now(),
+      isStreaming: false,
+      reasoningSummaries: [thinking],
+    };
+
+    const liveFrame = renderToString(
+      <MessageBlock entry={streaming} verbosity="normal" />,
+      { columns: 100 },
+    );
+    const doneFrame = renderToString(
+      <MessageBlock entry={settled} verbosity="normal" />,
+      { columns: 100 },
+    );
+
+    expect(liveFrame).toContain('what I think about this system');
+    expect(doneFrame).toContain(answer);
+    expect(doneFrame).not.toContain('what I think about this system');
+  });
 });

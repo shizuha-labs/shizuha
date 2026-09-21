@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { VLlmProvider } from '../../src/provider/vllm.js';
+import { DEFAULT_INTERACTIVE_SOFT_STALL_MS, VLlmProvider } from '../../src/provider/vllm.js';
 import { renderMetrics } from '../../src/metrics/registry.js';
 import type { StreamChunk } from '../../src/provider/types.js';
 
@@ -143,6 +143,15 @@ describe('vLLM interactive timeout behavior', () => {
     expect(soft!.message).toMatch(/budget/i);
     expect(soft!.message).toMatch(/Esc to cancel/i);
     expect(soft!.message).toMatch(/\/model/i);
+  });
+
+  it('SCLI-522: default interactive no-header soft-stall threshold is bounded at 30s (regression: 1ad759e83 pushed it to 300s)', async () => {
+    // 1ad759e83 ("quiet normal provider cold waits") changed the interactive
+    // soft-stall default 30_000 -> 300_000, so the budget + Esc + /model
+    // recovery UI did not appear until 5 minutes — SCLI-522 reproduced the
+    // silent wait at 2m26s. The default must stay bounded at 30s.
+    expect(DEFAULT_INTERACTIVE_SOFT_STALL_MS).toBe(30_000);
+    expect(DEFAULT_INTERACTIVE_SOFT_STALL_MS).toBeLessThan(300_000);
   });
 
   it('emits structured telemetry and Prometheus metrics for no-first-chunk timeouts', async () => {

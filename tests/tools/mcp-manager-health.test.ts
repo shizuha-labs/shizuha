@@ -37,4 +37,17 @@ describe('MCPManager health probe', () => {
     expect(ping).toHaveBeenCalledTimes(1);
     expect(listTools).not.toHaveBeenCalled();
   });
+
+  it('skips user-disabled servers in listServers and setServerEnabled', async () => {
+    const manager = new MCPManager();
+    manager.applyDisabledServers(['shizuha-scs']);
+    expect(manager.listServers().find((s) => s.name === 'shizuha-scs')).toMatchObject({
+      name: 'shizuha-scs',
+      disabled: true,
+      connected: false,
+    });
+    const off = await manager.setServerEnabled('shizuha-scs', false);
+    expect(off.ok).toBe(true);
+    expect(off.message).toContain('disabled');
+  });
 });

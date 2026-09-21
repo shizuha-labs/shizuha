@@ -77,13 +77,18 @@ export class PerfTimer {
     let cacheHitRate: number | null = null;
     if (info.cacheReadTokens != null || info.cacheCreationTokens != null) {
       const read = info.cacheReadTokens ?? 0;
-      // P2: include cache WRITES in the denominator. Providers forward
-      // cacheCreationTokens separately from inputTokens, so on a turn that both
-      // reads from and writes to the prompt cache the newly-created tokens are
-      // neither hits nor counted as misses — omitting them overstates the rate.
-      // Denominator = total prompt tokens = reads + creates + regular input.
       const creation = info.cacheCreationTokens ?? 0;
-      const denominator = read + creation + Math.max(info.inputTokens, 0);
+      const input = Math.max(info.inputTokens, 0);
+      // Two provider shapes:
+      // - OpenAI/Cortex: inputTokens is the FULL prompt (cached + uncached).
+      //   Adding cacheReadTokens again reported "cache 50%" on 99.6% hits
+      //   (DeepSeek 2026-08-22: 329k cached / 330k prompt).
+      // - Anthropic: inputTokens is the uncached portion and cacheRead can
+      //   exceed it — denominator is read + create + input.
+      // Cache WRITES still belong in the denominator (they are not hits).
+      const denominator = input >= read
+        ? input + creation
+        : read + creation + input;
       cacheHitRate = denominator > 0 ? Math.round((read / denominator) * 1000) / 1000 : null;
     }
     return {

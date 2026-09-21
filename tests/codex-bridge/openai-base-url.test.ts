@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CODEX_HEARTBEAT_OBSERVATION_RETRY_TRIGGER, CODEX_HEARTBEAT_TRIGGER, CODEX_PLATFORM_MCP_TOKEN_ENV, buildCodexPlatformMcpToml, buildConnectDmTurnPrompt, buildEmptyConnectDmReplay, buildHeartbeatToolObservationFromCodexMcpItem, classifyPulseHeartbeatPreflight, connectReplyTrackedSenderUsername, enqueueBridgeMessage, isConnectSystemSenderUsername, isExplicitConnectReplyRequest, isHeartbeatTurnContent, isLowPriorityConnectSystemMessage, isMessageUserToolCall, isPriorityConnectControlMessage, isSilentSystemUpdateTurn, normalizeOpenAiBaseUrl, parseConnectSenderUsername, parsePulseHeartbeatPreflightResponse, selectBridgeQueueAction } from '../../src/codex-bridge/index.js';
+import { CODEX_HEARTBEAT_OBSERVATION_RETRY_TRIGGER, CODEX_HEARTBEAT_TRIGGER, CODEX_PLATFORM_MCP_TOKEN_ENV, CodexBridge, buildCodexPlatformMcpToml, buildConnectDmTurnPrompt, buildEmptyConnectDmReplay, buildHeartbeatToolObservationFromCodexMcpItem, buildPulseQueueCapabilityManifest, capabilityDigest, classifyPulseHeartbeatPreflight, connectReplyTrackedSenderUsername, enqueueBridgeMessage, isConnectSystemSenderUsername, isExplicitConnectReplyRequest, isHeartbeatTurnContent, isLowPriorityConnectSystemMessage, isMessageUserToolCall, isPriorityConnectControlMessage, isSilentSystemUpdateTurn, mcpToolCallResponseText, normalizeOpenAiBaseUrl, parseConnectSenderUsername, parsePulseHeartbeatPreflightResponse, selectBridgeQueueAction } from '../../src/codex-bridge/index.js';
 import { clearHeartbeatQueueDrainOutcomesForTests, formatHeartbeatQueueDrainOutcomeLogLine, getHeartbeatQueueDrainOutcome, ingestHeartbeatQueueDrainOutcomeLogLine, recordHeartbeatQueueDrainTurn } from '../../src/daemon/heartbeat-outcome.js';
 
 describe('normalizeOpenAiBaseUrl', () => {
@@ -196,6 +196,51 @@ describe('bridge queue priority', () => {
     ]);
   });
 
+  it('SCLI-462: recognizes natural reply-with-this-exact-nonce phrasing without broadening routine traffic', () => {
+    const zenWording =
+      '[zen] Please call pulse_get_my_alerts, then pulse_get_my_tasks, and reply with this exact nonce plus whether both calls completed: ZEN-SORA-SCLI462-PREFIX';
+    const positives = [
+      zenWording,
+      'reply with this exact nonce: ABC123',
+      'Please reply with this exact nonce FOO',
+      'reply with the exact token TOK-1',
+      'Please reply exactly: ZEN-RUI-HIVE1695-20260801T1708Z',
+      'Reply with the text ZEN-RUI-HIVE1695-20260801T1708Z',
+    ];
+    for (const content of positives) {
+      expect(isExplicitConnectReplyRequest({ clientId: 'connect:ce120ec4-859e-449a-acfe-6d5f8f4947f6', content })).toBe(true);
+    }
+
+    const negatives: Array<{ clientId: string; content: string }> = [
+      { clientId: 'connect:x', content: 'Thanks, noted.' },
+      { clientId: 'connect:x', content: '[system] [Task Update] SCLI-462 moved to in_progress' },
+      { clientId: 'connect:x', content: 'The nonce was rotated last week for security.' },
+      { clientId: 'connect:x', content: 'Please review the exact diff when you can.' },
+      { clientId: 'connect:x', content: 'I will reply later today.' },
+      { clientId: 'connect:x', content: 'exact match required in tests' },
+      { clientId: 'connect:x', content: 'token bucket rate limit' },
+      { clientId: 'connect:x', content: 'heartbeat completed successfully' },
+      // non-Connect client must never enter interrupt class even with probe wording
+      { clientId: 'telegram:1', content: 'reply with this exact nonce: X' },
+    ];
+    for (const msg of negatives) {
+      expect(isExplicitConnectReplyRequest(msg)).toBe(false);
+    }
+
+    // Natural nonce probe still jumps ahead of older agent chatter + system wakes.
+    const queue = [
+      { clientId: 'connect:agent-1', content: '[sora] regular inter-agent update' },
+      { clientId: 'connect:sys-1', content: '[system] [Task Update] queued system notification' },
+    ];
+    const position = enqueueBridgeMessage(queue, {
+      clientId: 'connect:zen-1',
+      content: zenWording,
+    });
+    expect(position).toBe(0);
+    expect(queue[0]?.content).toBe(zenWording);
+    expect(queue).toHaveLength(3);
+  });
+
   it('preserves FIFO among non-system Connect DMs', () => {
     const queue = [
       { clientId: 'connect:user-1', content: '[kei] first' },
@@ -271,12 +316,104 @@ describe('bridge queue priority', () => {
 
 
 describe('Codex heartbeat outcome instrumentation', () => {
+  const pulseInventory = {
+    data: [{
+      name: 'shizuha-pulse',
+      tools: {
+        pulse_get_my_tasks: {
+          name: 'pulse_get_my_tasks',
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        },
+      },
+    }],
+  };
+
+  it('composes an immutable scoped capability only from the exact callable Pulse tool', () => {
+    const manifest = buildPulseQueueCapabilityManifest(
+      pulseInventory,
+      { agent_username: 'jun', effective_mcp_services: 'pulse,connect,wiki' },
+      '7:1234',
+    );
+
+    expect(manifest).toEqual({
+      capability_id: 'pulse.queue.read',
+      canonical_tool: 'mcp__shizuha_pulse__pulse_get_my_tasks',
+      model_alias: 'mcp__shizuha-pulse__pulse_get_my_tasks',
+      schema_digest: capabilityDigest({ type: 'object', properties: {}, additionalProperties: false }),
+      scope_digest: capabilityDigest({ agent_username: 'jun', effective_mcp_services: 'pulse,connect,wiki' }),
+      generation: '7:1234',
+    });
+    expect(() => buildPulseQueueCapabilityManifest(
+      { data: [{ name: 'generic-resource-list', tools: {} }] },
+      { agent_username: 'jun' },
+      '7:1234',
+    )).toThrow(/pulse\.queue\.read is absent/);
+  });
+
+  it('runtime-primes a fresh heartbeat with a real scoped queue snapshot before sampling', async () => {
+    const bridge = new CodexBridge({ model: 'gpt-5.6-sol', cwd: '/tmp/scli-348-test', agentUsername: 'jun' }) as any;
+    bridge.codexThreadId = 'thread-fresh';
+    bridge.serverProcess = { pid: 4321 };
+    bridge.activeTurnIsHeartbeat = true;
+    bridge.heartbeatToolCalls = [];
+    bridge.heartbeatToolResults = [];
+    const queueSnapshot = `Tasks for jun@agents.shizuha.io:\nFound 1 task(s) — 1 actionable.\n- **SCLI-348** runtime gate\n  Status: in_progress | Priority: urgent`;
+    const requests: Array<{ method: string; params: unknown }> = [];
+    bridge.rpcRequest = async (method: string, params: unknown) => {
+      requests.push({ method, params });
+      if (method === 'mcpServerStatus/list') return pulseInventory;
+      if (method === 'mcpServer/tool/call') return { content: [{ type: 'text', text: queueSnapshot }], isError: false };
+      throw new Error(`unexpected ${method}`);
+    };
+
+    const prompt = await bridge.primeHeartbeatQueueObservation();
+
+    expect(requests.map((entry) => entry.method)).toEqual([
+      'mcpServerStatus/list',
+      'mcpServer/tool/call',
+    ]);
+    expect(requests[1]?.params).toMatchObject({
+      threadId: 'thread-fresh', server: 'shizuha-pulse', tool: 'pulse_get_my_tasks', arguments: {},
+    });
+    expect(prompt).toContain('[RUNTIME-VERIFIED PULSE QUEUE]');
+    expect(prompt).toContain('SCLI-348');
+    expect(bridge.heartbeatAdmissionState).toBe('queue_observed');
+    expect(bridge.heartbeatToolCalls).toEqual([{ name: 'mcp__shizuha_pulse__pulse_get_my_tasks' }]);
+
+    const outcome = recordHeartbeatQueueDrainTurn('jun-fresh-pod', {
+      toolCalls: [...bridge.heartbeatToolCalls, { name: 'mcp__shizuha_pulse__pulse_add_comment' }],
+      toolResults: [...bridge.heartbeatToolResults, { content: 'Comment added', isError: false }],
+    });
+    expect(outcome).toMatchObject({ outcome: 'worked_task', readyTaskCount: 1, progressEventCount: 1 });
+  });
+
+  it('fails closed after one bounded recompose when scoped Pulse inventory is absent', async () => {
+    const bridge = new CodexBridge({ model: 'gpt-5.6-sol', cwd: '/tmp/scli-348-missing-test', agentUsername: 'jun' }) as any;
+    bridge.codexThreadId = 'thread-missing';
+    bridge.serverProcess = { pid: 4322 };
+    const methods: string[] = [];
+    bridge.rpcRequest = async (method: string) => {
+      methods.push(method);
+      if (method === 'config/mcpServer/reload') return {};
+      return { data: [{ name: 'generic-resource-list', tools: {} }] };
+    };
+    bridge.markAgentAvailability = async () => undefined;
+
+    await expect(bridge.primeHeartbeatQueueObservation())
+      .rejects.toThrow(/admission failed after bounded recovery/);
+    expect(methods).toEqual(['mcpServerStatus/list', 'config/mcpServer/reload', 'mcpServerStatus/list']);
+    expect(bridge.heartbeatAdmissionState).toBe('needs_help');
+    expect(bridge.pulseQueueCapabilityManifest).toBeNull();
+  });
+
+  it('normalizes app-server MCP content blocks without accepting metadata as queue evidence', () => {
+    expect(mcpToolCallResponseText({ content: [{ type: 'text', text: 'Found 0 task(s)' }] })).toBe('Found 0 task(s)');
+    expect(mcpToolCallResponseText({ structuredContent: { generic: true } })).toBe('');
+  });
+
   it('gives app-server the native Pulse tool name instead of a coordinator-only wrapper', () => {
     expect(CODEX_HEARTBEAT_TRIGGER).toContain(
-      'mcp__shizuha-pulse__pulse_get_my_alerts',
-    );
-    expect(CODEX_HEARTBEAT_TRIGGER).toContain(
-      'mcp__shizuha-pulse__pulse_get_my_tasks',
+      'mcp__shizuha-pulse__pulse_get_my_work',
     );
     expect(CODEX_HEARTBEAT_TRIGGER).toContain('do NOT invoke it through shell/Node/`functions.exec`');
     expect(CODEX_HEARTBEAT_TRIGGER).not.toContain('tools.mcp__');
@@ -284,10 +421,11 @@ describe('Codex heartbeat outcome instrumentation', () => {
     expect(CODEX_HEARTBEAT_TRIGGER).toContain('inspect files/env');
     expect(CODEX_HEARTBEAT_TRIGGER).toContain('BOUNDED scheduler turn');
     expect(CODEX_HEARTBEAT_TRIGGER).toContain('STOP without fetching a second item');
-    expect(CODEX_HEARTBEAT_TRIGGER).toContain('ordered alert-then-task pair is MANDATORY');
+    expect(CODEX_HEARTBEAT_TRIGGER).toContain('You choose what to advance');
     expect(CODEX_HEARTBEAT_TRIGGER).toContain('ZERO output is forbidden until');
-    expect(CODEX_HEARTBEAT_OBSERVATION_RETRY_TRIGGER).toContain('Call `mcp__shizuha-pulse__pulse_get_my_alerts` as your FIRST action');
-    expect(CODEX_HEARTBEAT_OBSERVATION_RETRY_TRIGGER).toContain('then call `mcp__shizuha-pulse__pulse_get_my_tasks`');
+    expect(CODEX_HEARTBEAT_TRIGGER).not.toContain('ordered alert-then-task pair is MANDATORY');
+    expect(CODEX_HEARTBEAT_OBSERVATION_RETRY_TRIGGER).toContain('Call `mcp__shizuha-pulse__pulse_get_my_work` as your FIRST action');
+    expect(CODEX_HEARTBEAT_OBSERVATION_RETRY_TRIGGER).toContain('That one snapshot is alerts + tasks');
     expect(CODEX_HEARTBEAT_OBSERVATION_RETRY_TRIGGER).toContain('preceding scheduler turn failed');
   });
 
@@ -330,7 +468,7 @@ Found 1 task(s) — 1 actionable.
     expect(getHeartbeatQueueDrainOutcome('daemon-agent-id')).toMatchObject({
       outcome: 'ready_no_progress',
       readyTaskCount: 1,
-      pulseGetMyTasksOnly: false,
+      pulseGetMyTasksOnly: true,
       pulseGetMyAlertsObserved: true,
       pulseAlertTaskOrderValid: true,
     });

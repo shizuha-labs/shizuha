@@ -3,7 +3,9 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  applyOpenAIProviderFromDashboard,
   normalizeOpenAICompatibleBaseUrl,
+  openaiProviderSettingsView,
   readCredentials,
   setOpenAIEndpoint,
 } from '../../src/config/credentials.js';
@@ -44,5 +46,47 @@ describe('OpenAI-compatible endpoint store', () => {
     const stored = readCredentials().openai;
     expect(stored?.apiKey).toBe('sk-test-not-real');
     expect(stored?.baseUrl).toBe('http://127.0.0.1:8000/v1');
+  });
+
+  it('treats a URL-only store as configured for the dashboard (no Shizuha login)', () => {
+    setOpenAIEndpoint({ baseUrl: 'http://127.0.0.1:11434/v1', defaultModel: 'llama3.2' });
+    expect(openaiProviderSettingsView(readCredentials().openai)).toEqual({
+      configured: true,
+      keyPrefix: null,
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      defaultModel: 'llama3.2',
+    });
+  });
+
+  it('accepts a dashboard PUT with only a local URL', () => {
+    const result = applyOpenAIProviderFromDashboard({
+      baseUrl: 'http://127.0.0.1:11434',
+      defaultModel: 'llama3.2',
+    });
+    expect(result).toEqual({ ok: true });
+    const stored = readCredentials().openai;
+    expect(stored?.baseUrl).toBe('http://127.0.0.1:11434/v1');
+    expect(stored?.defaultModel).toBe('llama3.2');
+    expect(stored?.apiKey).toBeUndefined();
+  });
+
+  it('rejects a dashboard PUT with neither URL nor key', () => {
+    expect(applyOpenAIProviderFromDashboard({})).toEqual({
+      ok: false,
+      error: 'Provide a base URL and/or an API key',
+    });
+    expect(applyOpenAIProviderFromDashboard({ baseUrl: 'not-a-url' })).toEqual({
+      ok: false,
+      error: 'Base URL must start with http:// or https://',
+    });
+  });
+
+  it('lets a later dashboard PUT change only the model on an existing URL', () => {
+    applyOpenAIProviderFromDashboard({ baseUrl: 'http://127.0.0.1:8000/v1' });
+    const result = applyOpenAIProviderFromDashboard({ defaultModel: 'Qwen3.6-27B' });
+    expect(result).toEqual({ ok: true });
+    const stored = readCredentials().openai;
+    expect(stored?.baseUrl).toBe('http://127.0.0.1:8000/v1');
+    expect(stored?.defaultModel).toBe('Qwen3.6-27B');
   });
 });

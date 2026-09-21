@@ -60,7 +60,7 @@ function sendResult(id: string | number, result: unknown): void {
   writeStdout({ jsonrpc: '2.0', id, result });
 }
 
-function sendError(id: string | number, code: number, message: string, data?: unknown): void {
+function sendError(id: string | number | null, code: number, message: string, data?: unknown): void {
   writeStdout({
     jsonrpc: '2.0',
     id,
@@ -149,17 +149,28 @@ async function callTool(
   }
 }
 
+// SCLI-518: tools are exposed/executed only after a successful initialize
+// negotiation. `notifications/initialized` is a client→server notification and
+// does not itself unlock the surface — the initialize RESULT does.
+let initialized = false;
+
 async function handleRequest(msg: JsonRpcMessage): Promise<void> {
   const id = msg.id as string | number;
   const method = msg.method!;
   const params = (msg.params ?? {}) as Record<string, unknown>;
 
   if (method === 'initialize') {
-    const clientProtocol = typeof params.protocolVersion === 'string'
-      ? params.protocolVersion
-      : undefined;
+    // SCLI-518: initialize MUST carry a non-empty string protocolVersion.
+    if (typeof params.protocolVersion !== 'string' || params.protocolVersion.trim() === '') {
+      sendError(id, -32602, 'initialize requires params.protocolVersion (string)');
+      return;
+    }
+    // SCLI-518: never echo an unsupported client version as negotiated/supported.
+    // MCP negotiation: the server responds with ITS supported version; a client
+    // that cannot speak it must adapt or fail on its side.
+    initialized = true;
     sendResult(id, {
-      protocolVersion: clientProtocol || DEFAULT_PROTOCOL_VERSION,
+      protocolVersion: DEFAULT_PROTOCOL_VERSION,
       capabilities: {
         tools: { listChanged: false },
       },
@@ -169,6 +180,17 @@ async function handleRequest(msg: JsonRpcMessage): Promise<void> {
         'Start with browser(action="navigate", url=...) then screenshot/interact. ' +
         'Human-mode mouse/keyboard require browser mode="human".',
     });
+    return;
+  }
+
+  // SCLI-518: no tools are exposed/executed before a successful initialize.
+  if (!initialized) {
+    // ping is a transport liveness probe and is valid at any time.
+    if (method === 'ping') {
+      sendResult(id, {});
+      return;
+    }
+    sendError(id, -32002, `Server not initialized; send initialize first (method=${method})`);
     return;
   }
 
@@ -224,13 +246,31 @@ export async function runBrowserMcpServer(): Promise<void> {
   rl.on('line', (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-    let msg: JsonRpcMessage;
+    let parsed: unknown;
     try {
-      msg = JSON.parse(trimmed) as JsonRpcMessage;
+      parsed = JSON.parse(trimmed);
     } catch {
+      // SCLI-518: malformed JSON → standards-shaped parse error, never a silent
+      // drop (the evidence bundle observed zero response for bad JSON).
+      sendError(null, -32700, 'Parse error: invalid JSON');
       return;
     }
-    if (!msg.method) return;
+    // SCLI-518: a request/notification must be a JSON object with jsonrpc:"2.0".
+    // Scalar/null/array input must never reach the handler (null previously
+    // threw an uncaughtException because `msg.method` dereferenced null).
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      sendError(null, -32600, 'Invalid Request: expected a JSON object');
+      return;
+    }
+    const msg = parsed as JsonRpcMessage;
+    if (msg.jsonrpc !== '2.0') {
+      sendError(msg.id ?? null, -32600, 'Invalid Request: jsonrpc must be "2.0"');
+      return;
+    }
+    if (typeof msg.method !== 'string' || msg.method === '') {
+      sendError(msg.id ?? null, -32600, 'Invalid Request: missing method');
+      return;
+    }
     if (msg.id !== undefined && msg.id !== null) {
       void handleRequest(msg).catch((err) => {
         log(`unhandled request error (${msg.method}): ${(err as Error).message}`);

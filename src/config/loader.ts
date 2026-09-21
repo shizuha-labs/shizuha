@@ -26,13 +26,128 @@ const CONFIG_LAYERS = [
   (cwd: string) => path.join(cwd, '.shizuha', 'config.local.toml'),
 ];
 
+const MAX_CONFIG_BYTES = 4 * 1024 * 1024; // 4 MiB bound on config reads
+
+/**
+ * Resolve a candidate path to a regular file, or return null.
+ *
+ * Refuses anything that is not an owner-acceptable bounded regular file:
+ * FIFOs/sockets/device nodes are rejected BEFORE any read so a hostile or
+ * corrupt config path can never block the process; symlinks are followed only
+ * when the resolved target is itself a regular file; oversized files are
+ * rejected so a pathological config cannot exhaust memory.
+ */
+async function resolveRegularConfigFile(
+  filePath: string,
+  maxBytes = MAX_CONFIG_BYTES,
+): Promise<string | null> {
+  try {
+    const stat = await fs.stat(filePath); // follows symlinks
+    if (!stat.isFile()) return null;
+    if (stat.size > maxBytes) return null;
+    return filePath;
+  } catch {
+    return null;
+  }
+}
+
 async function readTOML(filePath: string): Promise<Record<string, unknown> | null> {
   try {
-    const content = await fs.readFile(filePath, 'utf-8');
+    const safePath = await resolveRegularConfigFile(filePath);
+    if (!safePath) return null;
+    const content = await fs.readFile(safePath, 'utf-8');
     return parseTOML(content) as Record<string, unknown>;
   } catch {
     return null;
   }
+}
+
+/**
+ * SCLI-440: classify a selected .mcp.json candidate for the `shizuha config`
+ * command, which is a configuration-TRUTH surface and must not certify
+ * corrupt/unusable explicit state as equivalent to no config.
+ *
+ * The loader (readMcpJson) deliberately SKIPS unusable candidates so runtime
+ * callers degrade gracefully; this inspection is the command-level counterpart:
+ * anything present-but-unusable is reported as `suspect` with a concise reason
+ * so the command can fail nonzero BEFORE printing resolved configuration.
+ *
+ * Classification is no-follow (lstat): symlinks are resolved only to check the
+ * target's regularity and boundary — a symlink whose target escapes the
+ * candidate's boundary (project cwd for the project candidate, HOME for the
+ * user candidate) is suspect, never followed for content. FIFOs/sockets are
+ * classified from the lstat mode without opening, so inspection can never
+ * block.
+ */
+export type McpJsonInspection =
+  | { kind: 'absent' }
+  | { kind: 'ok'; path: string }
+  | { kind: 'suspect'; path: string; reason: string };
+
+export async function inspectMcpJsonCandidate(cwd: string): Promise<McpJsonInspection> {
+  const candidates = [
+    { filePath: path.join(cwd, '.mcp.json'), boundary: cwd },
+    { filePath: path.join(process.env['HOME'] ?? '~', '.mcp.json'), boundary: process.env['HOME'] ?? '~' },
+  ];
+  for (const { filePath, boundary } of candidates) {
+    let st: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      st = await fs.lstat(filePath); // no-follow: classify the object itself
+    } catch {
+      continue; // absent — next candidate; both absent => absent
+    }
+    const suspect = (reason: string): McpJsonInspection => ({ kind: 'suspect', path: filePath, reason });
+    if (st.isSymbolicLink()) {
+      let target: string;
+      try {
+        target = await fs.realpath(filePath);
+      } catch {
+        return suspect('dangling symlink (target does not exist)');
+      }
+      const resolvedBoundary = path.resolve(boundary);
+      if (target !== resolvedBoundary && !target.startsWith(resolvedBoundary + path.sep)) {
+        return suspect(`symlink target ${target} escapes the ${resolvedBoundary} boundary`);
+      }
+      try {
+        const tst = await fs.stat(target); // follow, now that boundary is proven
+        if (!tst.isFile()) return suspect('symlink target is not a regular file');
+      } catch {
+        return suspect('symlink target is not readable');
+      }
+    } else if (st.isDirectory()) {
+      return suspect('is a directory');
+    } else if (st.isFIFO()) {
+      return suspect('is a named pipe (FIFO) — reading it would block');
+    } else if (st.isSocket()) {
+      return suspect('is a unix socket');
+    } else if (!st.isFile()) {
+      return suspect('is not a regular file');
+    }
+    // Regular file (or symlink to a boundary-internal regular file): bound +
+    // readability + JSON validity. Open with O_NONBLOCK semantics via a plain
+    // read — at this point the object is a proven regular file, so no hang.
+    if (st.size > MAX_CONFIG_BYTES) {
+      return suspect(`exceeds the ${MAX_CONFIG_BYTES}-byte config bound`);
+    }
+    let content: string;
+    try {
+      content = await fs.readFile(filePath, 'utf-8');
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      return suspect(
+        code === 'EACCES' || code === 'EPERM'
+          ? 'is not readable by this user (check file permissions)'
+          : `cannot be read (${code ?? 'unknown error'})`,
+      );
+    }
+    try {
+      JSON.parse(content);
+    } catch {
+      return suspect('is not valid JSON');
+    }
+    return { kind: 'ok', path: filePath };
+  }
+  return { kind: 'absent' };
 }
 
 function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
@@ -199,7 +314,7 @@ function probePort(port: number, host = '127.0.0.1'): Promise<boolean> {
  * daemon port. If a daemon is already running, uses SSE transport instead
  * of spawning a new stdio process.
  */
-async function readMcpJson(cwd: string): Promise<MCPServerConfig[]> {
+async function readMcpJson(cwd: string, resolveMcpAuth = true): Promise<MCPServerConfig[]> {
   const configs: MCPServerConfig[] = [];
   if (process.env['SHIZUHA_DISABLE_MCP_JSON'] === '1') {
     return configs;
@@ -213,14 +328,20 @@ async function readMcpJson(cwd: string): Promise<MCPServerConfig[]> {
 
   for (const filePath of candidates) {
     try {
-      const content = await fs.readFile(filePath, 'utf-8');
+      // SCLI-440: reject FIFO/socket/device/oversized .mcp.json BEFORE any
+      // blocking read — fs.readFile on a FIFO hangs indefinitely, and a
+      // directory/socket would otherwise throw and be silently skipped.
+      const safePath = await resolveRegularConfigFile(filePath);
+      if (!safePath) continue;
+      const content = await fs.readFile(safePath, 'utf-8');
       const data = JSON.parse(content) as Record<string, unknown>;
       const servers = data['mcpServers'] as Record<string, Record<string, unknown>> | undefined;
       if (!servers || typeof servers !== 'object') continue;
 
       // Probe daemon ports in parallel for all known servers
       const serverNames = Object.keys(servers);
-      const needsShizuhaAuth = serverNames.some((name) => isShizuhaService(name));
+      const needsShizuhaAuth = resolveMcpAuth
+        && serverNames.some((name) => isShizuhaService(name));
       const shizuhaAccessToken = needsShizuhaAuth
         ? await getValidMcpAccessToken().catch((err) => {
           logger.debug({ err }, 'Unable to resolve Shizuha auth token for MCP auto-auth');
@@ -295,8 +416,7 @@ async function readMcpJson(cwd: string): Promise<MCPServerConfig[]> {
           config.headers = rawHeaders as Record<string, string>;
         }
 
-        const configWithAuth = applyShizuhaAuth(config, shizuhaAccessToken);
-        configs.push(configWithAuth);
+        configs.push(resolveMcpAuth ? applyShizuhaAuth(config, shizuhaAccessToken) : config);
       }
 
       const httpCount = configs.filter(c => c.transport !== 'stdio').length;
@@ -313,8 +433,12 @@ async function readMcpJson(cwd: string): Promise<MCPServerConfig[]> {
   return configs;
 }
 
-export async function loadConfig(cwd?: string): Promise<ShizuhaConfig> {
+export async function loadConfig(
+  cwd?: string,
+  options: { resolveMcpAuth?: boolean } = {},
+): Promise<ShizuhaConfig> {
   const workDir = cwd ?? process.cwd();
+  const resolveMcpAuth = options.resolveMcpAuth !== false;
   let merged: Record<string, unknown> = {};
 
   for (const layer of CONFIG_LAYERS) {
@@ -375,7 +499,9 @@ export async function loadConfig(cwd?: string): Promise<ShizuhaConfig> {
   // Read .mcp.json (Claude Code format) and merge with TOML MCP servers.
   // TOML servers take precedence — .mcp.json servers are added only if their
   // name doesn't already exist in the TOML config.
-  const mcpJsonServers = await readMcpJson(workDir);
+  // Read-only callers such as `doctor` still need the configured server list,
+  // but must not mint or persist auth state merely to inspect configuration.
+  const mcpJsonServers = await readMcpJson(workDir, resolveMcpAuth);
   if (mcpJsonServers.length > 0) {
     const mcpSection = (merged['mcp'] as Record<string, unknown>) ?? {};
     const existingServers = (mcpSection['servers'] as Array<Record<string, unknown>>) ?? [];
@@ -394,13 +520,22 @@ export async function loadConfig(cwd?: string): Promise<ShizuhaConfig> {
   const mergedServers = (mergedMcpSection['servers'] as MCPServerConfig[] | undefined) ?? [];
   if (mergedServers.length > 0) {
     const needsAuth = mergedServers.some((server) => isShizuhaService(server.name));
-    if (needsAuth) {
+    if (needsAuth && resolveMcpAuth) {
       const accessToken = await getValidMcpAccessToken();
       if (accessToken) {
         mergedMcpSection['servers'] = mergedServers.map((server) => applyShizuhaAuth(server, accessToken));
         merged['mcp'] = mergedMcpSection;
       }
     }
+  }
+
+  // SCLI-402: an explicit --cwd selector is authoritative for agent.cwd — the
+  // schema default is process.cwd(), which would silently report the caller's
+  // directory instead of the requested project. Only override when the caller
+  // explicitly passed a cwd; otherwise a config-file agent.cwd is respected.
+  if (cwd !== undefined) {
+    const agentSection = (merged['agent'] as Record<string, unknown>) ?? {};
+    merged['agent'] = { ...agentSection, cwd: workDir };
   }
 
   return configSchema.parse(merged) as ShizuhaConfig;

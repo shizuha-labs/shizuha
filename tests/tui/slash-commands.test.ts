@@ -6,6 +6,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { getVerbosity } from '../../src/tui/hooks/useSlashCommands.js';
+import { resetSettingsCache } from '../../src/tui/utils/settings.js';
 import { BackgroundTaskRegistry } from '../../src/tasks/registry.js';
 
 function createMockContext(overrides: Record<string, unknown> = {}) {
@@ -217,6 +218,40 @@ describe('handleSlashCommand', () => {
       const result = handleSlashCommand('/config nope', ctx);
       expect(result.handled).toBe(true);
       expect(result.message).toContain('Unknown /config option');
+    });
+
+    it('routes /config mcp to the MCP overlay', () => {
+      const ctx = createMockContext();
+      const result = handleSlashCommand('/config mcp', ctx);
+      expect(result.handled).toBe(true);
+      expect(ctx.setScreen).toHaveBeenCalledWith('mcp');
+    });
+  });
+
+  describe('/mcp', () => {
+    it('opens the MCP toggle overlay', () => {
+      const ctx = createMockContext();
+      const result = handleSlashCommand('/mcp', ctx);
+      expect(result.handled).toBe(true);
+      expect(ctx.setScreen).toHaveBeenCalledWith('mcp');
+      expect(ctx.showInPager).not.toHaveBeenCalled();
+    });
+
+    it('lists tools in the pager via /mcp tools', () => {
+      const ctx = createMockContext({
+        listMCPTools: vi.fn(async () => [{ name: 'wiki_search', description: 'search' }]),
+      });
+      const result = handleSlashCommand('/mcp tools', ctx);
+      expect(result.handled).toBe(true);
+      expect(result.message).toContain('Loading MCP tools');
+    });
+
+    it('toggles a server via /mcp <name> off', async () => {
+      const setMcpServerEnabled = vi.fn(async () => ({ ok: true, message: 'scs disabled (persisted)' }));
+      const ctx = createMockContext({ setMcpServerEnabled });
+      const result = await handleSlashCommandAsync('/mcp shizuha-scs off', ctx);
+      expect(result).toEqual({ handled: true, message: 'scs disabled (persisted)' });
+      expect(setMcpServerEnabled).toHaveBeenCalledWith('shizuha-scs', false);
     });
   });
 
@@ -750,6 +785,21 @@ describe('handleSlashCommand', () => {
       expect(result.message).toContain('timed out');
     });
 
+    it('handles /usage when signed out', async () => {
+      const usage = await import('../../src/provider/cortex-usage.js');
+      const spy = vi.spyOn(usage, 'fetchCortexUsage').mockResolvedValue({
+        configured: false,
+        reason: 'sign_in',
+        plans: [],
+        freeModels: ['big-pickle'],
+      });
+      const result = await handleSlashCommandAsync('/usage', createMockContext());
+      spy.mockRestore();
+      expect(result.handled).toBe(true);
+      expect(result.message).toContain('shizuha login');
+      expect(result.message).toContain('big-pickle');
+    });
+
     it('handles /logout when nothing to clear', async () => {
       const ctx = createMockContext({
         logoutShizuha: vi.fn(async () => ({ loggedOut: false, mcpReloaded: true })),
@@ -823,5 +873,66 @@ describe('handleSlashCommand', () => {
       expect(result.handled).toBe(true);
       expect(result.message).toContain('Usage: /auth status');
     });
+  });
+});
+
+// SCLI-479: sticky mouse-reporting toggle — /mouse off hands the wheel to
+// tmux/terminal scrollback and persists across restarts.
+describe('handleSlashCommand /mouse', () => {
+  const origHome = process.env['HOME'];
+  let tempHome: string;
+
+  beforeEach(() => {
+    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'scli479-mouse-'));
+    process.env['HOME'] = tempHome;
+    // Drop the module-level settings cache so each case reads the fresh HOME.
+    resetSettingsCache();
+  });
+
+  afterEach(() => {
+    process.env['HOME'] = origHome;
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it('defaults to mouse reporting ON (no persisted setting)', () => {
+    const ctx = createMockContext({ setMouseReporting: vi.fn() });
+    const result = handleSlashCommand('/mouse', ctx);
+    expect(result.handled).toBe(true);
+    // First toggle with no persisted setting flips to OFF.
+    expect(result.message).toContain('Mouse reporting: off');
+    expect(ctx.setMouseReporting).toHaveBeenCalledWith(false);
+  });
+
+  it('/mouse off disables and persists', () => {
+    const ctx = createMockContext({ setMouseReporting: vi.fn() });
+    const result = handleSlashCommand('/mouse off', ctx);
+    expect(result.handled).toBe(true);
+    expect(result.message).toContain('Mouse reporting: off');
+    expect(ctx.setMouseReporting).toHaveBeenCalledWith(false);
+    // Persisted: a fresh settings read reflects the choice.
+    const settingsPath = path.join(tempHome, '.shizuha', 'settings.json');
+    expect(fs.existsSync(settingsPath)).toBe(true);
+    const saved = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+    expect(saved.mouseReporting).toBe(false);
+  });
+
+  it('/mouse on re-enables and persists', () => {
+    const ctx = createMockContext({ setMouseReporting: vi.fn() });
+    const result = handleSlashCommand('/mouse on', ctx);
+    expect(result.handled).toBe(true);
+    expect(result.message).toContain('Mouse reporting: on');
+    expect(ctx.setMouseReporting).toHaveBeenCalledWith(true);
+    const saved = JSON.parse(fs.readFileSync(path.join(tempHome, '.shizuha', 'settings.json'), 'utf-8'));
+    expect(saved.mouseReporting).toBe(true);
+  });
+
+  it('toggles back ON after a persisted OFF', () => {
+    // Simulate a prior /mouse off persisted in settings.
+    fs.mkdirSync(path.join(tempHome, '.shizuha'), { recursive: true });
+    fs.writeFileSync(path.join(tempHome, '.shizuha', 'settings.json'), JSON.stringify({ mouseReporting: false }));
+    const ctx = createMockContext({ setMouseReporting: vi.fn() });
+    const result = handleSlashCommand('/mouse', ctx);
+    expect(result.message).toContain('Mouse reporting: on');
+    expect(ctx.setMouseReporting).toHaveBeenCalledWith(true);
   });
 });

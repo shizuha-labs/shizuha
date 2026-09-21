@@ -14,6 +14,7 @@ const baseConfig = {
   minPromptTokens: 100_000,
   minPromptOutputRatio: 100,
   minProductiveOutputTokens: 32,
+  flagToolCallingSterileTurns: true,
   baseBackoffMs: 1_000,
   maxBackoffMs: 8_000,
   notifyCooldownMs: 10_000,
@@ -59,6 +60,21 @@ describe('estimatePrefillTokens', () => {
       { inputTokens: 120_000, prefillTokens: 5_000 },
       baseConfig,
     )).toBe(125_000);
+  });
+
+  it('does not treat queued TTFT as a cache miss when the prefix is hot', () => {
+    // kai/sato 2026-08-22: 37s TTFT, 99.6% provider cache read — the wait is
+    // another session on the same TP4 group, not a 330k rebuild.
+    expect(estimatePrefillTokens(
+      {
+        inputTokens: 330_614,
+        cacheReadTokens: 329_216,
+        cacheCreationTokens: 0,
+        ttftMs: 37_764,
+      },
+      { inputTokens: 329_000, prefillTokens: 1_000 },
+      baseConfig,
+    )).toBe(330_614 - 329_216);
   });
 
   it('forces full charge when prefix cache is busted', () => {
@@ -149,6 +165,68 @@ describe('ExpensiveTurnGuard', () => {
     expect(decision.action).toBe('ok');
   });
 
+  it('SCLI-589: trips on a tool-calling expensive loop whose window produced no durable output', () => {
+    // saki class: many tool calls that each pull large context (web fetches,
+    // file reads, scan tables) with tiny final text — total window output below
+    // the productive floor. Previously invisible to the guard (toolCallCount>0
+    // always meant "productive").
+    const guard = new ExpensiveTurnGuard(baseConfig);
+    for (let i = 0; i < 3; i++) {
+      expect(guard.record({
+        now: i * 10_000,
+        inputTokens: 132_000,
+        outputTokens: 4, // tiny text, tool-call args only
+        toolCallCount: 3,
+      }).action).toBe('ok');
+    }
+    const decision = guard.record({
+      now: 30_000,
+      inputTokens: 132_000,
+      outputTokens: 4,
+      toolCallCount: 3,
+    });
+    expect(decision.action).toBe('pause');
+    if (decision.action !== 'pause') throw new Error('expected pause');
+    expect(decision.turnCount).toBe(4);
+    expect(decision.toolCallCount).toBe(12); // tool calls counted in the trip
+    // The trip feeds shizuha_agent_loop_guard_hits via loopGuardHit=true.
+  });
+
+  it('SCLI-589: a single substantive turn breaks the tool-calling spin (no false pause)', () => {
+    // Three barren tool-calling turns then one substantive output turn: the
+    // window total output rises above the floor, so the tool turns are not
+    // sterile and the guard must not pause a genuinely-productive agent.
+    const guard = new ExpensiveTurnGuard(baseConfig);
+    let decision: any = { action: 'ok' };
+    const samples = [
+      { now: 0, inputTokens: 132_000, outputTokens: 4, toolCallCount: 3 },
+      { now: 10_000, inputTokens: 132_000, outputTokens: 4, toolCallCount: 3 },
+      { now: 20_000, inputTokens: 132_000, outputTokens: 4, toolCallCount: 3 },
+      { now: 30_000, inputTokens: 132_000, outputTokens: 5_000, toolCallCount: 2 },
+      { now: 40_000, inputTokens: 132_000, outputTokens: 4, toolCallCount: 3 },
+      { now: 50_000, inputTokens: 132_000, outputTokens: 4, toolCallCount: 3 },
+    ];
+    for (const s of samples) {
+      decision = guard.record(s);
+    }
+    expect(decision.action).toBe('ok');
+  });
+
+  it('SCLI-589: SHIZUHA_EXPENSIVE_TURN_FLAG_TOOL_STERILE=0 restores the old behavior', () => {
+    const config = { ...baseConfig, flagToolCallingSterileTurns: false };
+    const guard = new ExpensiveTurnGuard(config);
+    let decision: any = { action: 'ok' };
+    for (let i = 0; i < 6; i++) {
+      decision = guard.record({
+        now: i * 8_000,
+        inputTokens: 132_000,
+        outputTokens: 4,
+        toolCallCount: 3,
+      });
+    }
+    expect(decision.action).toBe('ok');
+  });
+
   it('does not trip when high-prefill turns produce substantive text without tools', () => {
     const guard = new ExpensiveTurnGuard(baseConfig);
     let decision: any = { action: 'ok' };
@@ -164,6 +242,10 @@ describe('ExpensiveTurnGuard', () => {
   });
 
   it('reads thresholds and notify lead from environment', () => {
+    // Operator directive 2026-09-15: the guard is OPT-IN — default disabled so
+    // agents can use the model continuously; SHIZUHA_EXPENSIVE_TURN_GUARD_ENABLED=1 re-arms it.
+    expect(expensiveTurnGuardConfigFromEnv({} as any).enabled).toBe(false);
+    expect(expensiveTurnGuardConfigFromEnv({ SHIZUHA_EXPENSIVE_TURN_GUARD_ENABLED: '1' } as any).enabled).toBe(true);
     const config = expensiveTurnGuardConfigFromEnv({
       SHIZUHA_EXPENSIVE_TURN_WINDOW_MS: '30000',
       SHIZUHA_EXPENSIVE_TURN_MIN_TURNS: '2',

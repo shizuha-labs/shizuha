@@ -2,9 +2,6 @@ export type IncompleteTurnStopReason = 'stall_salvage' | 'max_tokens';
 
 export const MAX_THINKING_ONLY_RECOVERY = 3;
 
-export const AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT =
-  'Continue. Use your tools to implement the solution.';
-
 export function incompleteTurnError(stopReason: string | undefined): string | null {
   if (stopReason === 'stall_salvage') {
     return 'The model stream ended after a mid-response transport stall. Partial output was preserved, but automatic replay did not recover the turn.';

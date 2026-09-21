@@ -56,7 +56,7 @@ await build({
   platform: 'node',
   target: 'node20',
   format: 'esm',
-  outfile: 'dist/shizuha.js',
+  outfile: process.env.SHIZUHA_ESBUILD_OUTFILE || 'dist/shizuha.js',
   sourcemap: true,
   jsx: 'automatic',
   jsxImportSource: 'react',

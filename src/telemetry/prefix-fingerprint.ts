@@ -32,8 +32,12 @@ export function stableJson(value: unknown): string {
   return `{${Object.keys(obj).sort().map((k) => `${JSON.stringify(k)}:${stableJson(obj[k])}`).join(',')}}`;
 }
 
+export function declaredToolDefinitions(tools: ToolDefinition[]): ToolDefinition[] {
+  return tools.filter((tool) => !tool.deferLoading);
+}
+
 export function normalizedToolDefinitions(tools: ToolDefinition[]): ToolDefinition[] {
-  return [...tools].sort((a, b) => a.name.localeCompare(b.name));
+  return [...declaredToolDefinitions(tools)].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export function computePrefixFingerprint(input: PrefixFingerprintInput): PrefixFingerprint {

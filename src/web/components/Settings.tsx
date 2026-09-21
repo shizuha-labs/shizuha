@@ -34,6 +34,8 @@ interface SettingsData {
     openai: {
       configured: boolean;
       keyPrefix: string | null;
+      baseUrl?: string | null;
+      defaultModel?: string | null;
     };
     google: {
       configured: boolean;
@@ -2427,6 +2429,94 @@ function ConnectionSection({ data }: { data: SettingsData }) {
   );
 }
 
+type CortexUsagePayload = {
+  configured: boolean;
+  reason?: string;
+  error?: string;
+  plans?: Array<{
+    plan: string;
+    allowance_tokens: number;
+    remaining_tokens: number;
+    resets_at: string;
+  }>;
+  freeModels?: string[];
+  hane?: {
+    available: number;
+    daily_claimed: boolean;
+    mint_remaining_this_week: number;
+  } | null;
+};
+
+function CortexTrialCard({ loggedIn }: { loggedIn: boolean }) {
+  const [usage, setUsage] = useState<CortexUsagePayload | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/v1/cortex/usage')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body) => {
+        if (!cancelled && body) setUsage(body as CortexUsagePayload);
+      })
+      .catch(() => {
+        if (!cancelled) setUsage(null);
+      });
+    return () => { cancelled = true; };
+  }, [loggedIn]);
+
+  const code = usage?.plans?.find((p) => p.plan === 'shizuha-code-free-v1') ?? usage?.plans?.[0];
+  const models = (usage?.freeModels ?? [
+    'big-pickle',
+    'deepseek-v4-flash-free',
+    'mimo-v2.5-free',
+    'hy3-free',
+    'laguna-s-2.1-free',
+    'nemotron-3-ultra-free',
+    'nemotron-3.5-lightning-free',
+  ]).join(', ');
+
+  return (
+    <div className="bg-zinc-800/50 rounded-lg border border-zinc-800 px-4 py-3 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <div className="text-sm font-medium text-zinc-100">Shizuha Cortex (hosted try-out)</div>
+          <div className="text-[11px] text-zinc-500">
+            Same seven $0 OpenCode Zen models, routed user → Code → Cortex → Zen. No OpenCode key.
+          </div>
+        </div>
+        <span className={`text-[10px] font-medium ${loggedIn ? 'text-green-400' : 'text-zinc-600'}`}>
+          {loggedIn ? 'Signed in' : 'Optional'}
+        </span>
+      </div>
+      {!loggedIn && (
+        <p className="text-[11px] text-zinc-400">
+          Sign in with Shizuha ID to try <span className="font-mono text-zinc-300">cortex/big-pickle</span>.
+          Your own OpenAI-compatible URL stays unbilled.
+        </p>
+      )}
+      {loggedIn && usage?.error && (
+        <p className="text-[11px] text-amber-400">{usage.error}</p>
+      )}
+      {loggedIn && usage?.hane && (
+        <div className="text-[11px] text-amber-200 font-mono">
+          Hane {usage.hane.available.toLocaleString()} · {usage.hane.daily_claimed ? 'daily claimed' : 'daily ready'}
+        </div>
+      )}
+      {loggedIn && code && (
+        <div className="text-[11px] text-zinc-300 font-mono">
+          {code.remaining_tokens.toLocaleString()} / {code.allowance_tokens.toLocaleString()} tokens remaining
+          <span className="text-zinc-500"> · resets {code.resets_at}</span>
+        </div>
+      )}
+      {loggedIn && code && code.remaining_tokens === 0 && (
+        <p className="text-[11px] text-zinc-400">
+          Weekly grant used. Add prepaid credit later, or paste your own endpoint above.
+        </p>
+      )}
+      <p className="text-[10px] text-zinc-600 font-mono break-all">{models}</p>
+    </div>
+  );
+}
+
 function ProvidersSection({ data, onRefresh }: { data: SettingsData; onRefresh: () => void }) {
   const { providers } = data;
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -2436,6 +2526,8 @@ function ProvidersSection({ data, onRefresh }: { data: SettingsData; onRefresh: 
   const [newAnthropicToken, setNewAnthropicToken] = useState('');
   const [newAnthropicLabel, setNewAnthropicLabel] = useState('');
   const [newOpenAIKey, setNewOpenAIKey] = useState('');
+  const [newOpenAIUrl, setNewOpenAIUrl] = useState(providers.openai.baseUrl ?? '');
+  const [newOpenAIModel, setNewOpenAIModel] = useState(providers.openai.defaultModel ?? '');
   const [newGoogleKey, setNewGoogleKey] = useState('');
   const [newCodexEmail, setNewCodexEmail] = useState('');
   const [newCodexAccessToken, setNewCodexAccessToken] = useState('');
@@ -2566,10 +2658,10 @@ function ProvidersSection({ data, onRefresh }: { data: SettingsData; onRefresh: 
     },
     {
       key: 'openai',
-      name: 'OpenAI',
-      subtitle: 'GPT models (API key)',
+      name: 'OpenAI-compatible',
+      subtitle: 'Ollama, vLLM, or OpenAI — no Shizuha ID',
       configured: providers.openai.configured,
-      detail: providers.openai.keyPrefix,
+      detail: providers.openai.baseUrl || providers.openai.defaultModel || providers.openai.keyPrefix,
     },
     {
       key: 'google',
@@ -2597,6 +2689,8 @@ function ProvidersSection({ data, onRefresh }: { data: SettingsData; onRefresh: 
   return (
     <div className="space-y-6">
       <SectionHeader title="Providers" subtitle="LLM provider credentials" />
+
+      <CortexTrialCard loggedIn={data.identity.loggedIn} />
 
       {error && (
         <div className="text-xs text-red-400 bg-red-950/30 px-3 py-2 rounded-lg border border-red-900/30">
@@ -2742,43 +2836,87 @@ function ProvidersSection({ data, onRefresh }: { data: SettingsData; onRefresh: 
                     <>
                       {providers.openai.configured && (
                         <Card>
-                          <div className="flex items-center justify-between px-3 py-2">
-                            <div>
-                              <span className="text-xs text-zinc-400">API Key</span>
-                              <span className="text-xs text-zinc-200 ml-2 font-mono">{providers.openai.keyPrefix}</span>
+                          <div className="px-3 py-2 space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <span className="text-xs text-zinc-400">Endpoint</span>
+                                <span className="text-xs text-zinc-200 ml-2 font-mono break-all">
+                                  {providers.openai.baseUrl || 'api.openai.com (default)'}
+                                </span>
+                              </div>
+                              <button
+                                onClick={() => apiCall('/v1/providers/openai', 'DELETE')}
+                                disabled={busy}
+                                className="text-[10px] text-red-400 hover:text-red-300 cursor-pointer disabled:opacity-50 flex-shrink-0"
+                              >
+                                Remove
+                              </button>
                             </div>
-                            <button
-                              onClick={() => apiCall('/v1/providers/openai', 'DELETE')}
-                              disabled={busy}
-                              className="text-[10px] text-red-400 hover:text-red-300 cursor-pointer disabled:opacity-50"
-                            >
-                              Remove
-                            </button>
+                            {providers.openai.defaultModel && (
+                              <div>
+                                <span className="text-xs text-zinc-400">Model</span>
+                                <span className="text-xs text-zinc-200 ml-2 font-mono">{providers.openai.defaultModel}</span>
+                              </div>
+                            )}
+                            {providers.openai.keyPrefix && (
+                              <div>
+                                <span className="text-xs text-zinc-400">API key</span>
+                                <span className="text-xs text-zinc-200 ml-2 font-mono">{providers.openai.keyPrefix}</span>
+                              </div>
+                            )}
+                            {!providers.openai.keyPrefix && providers.openai.baseUrl && (
+                              <div className="text-[10px] text-zinc-500">No API key — local servers usually do not need one.</div>
+                            )}
                           </div>
                         </Card>
                       )}
                       <div>
                         <h4 className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500 mb-1.5">
-                          {providers.openai.configured ? 'Replace API Key' : 'Set API Key'}
+                          {providers.openai.configured ? 'Update endpoint' : 'Add endpoint'}
                         </h4>
-                        <div className="flex gap-2">
+                        <p className="text-[11px] text-zinc-500 mb-2">
+                          Paste a local or remote OpenAI-compatible URL. Shizuha ID is not required.
+                        </p>
+                        <div className="space-y-2">
                           <input
-                            type="password"
-                            placeholder="sk-..."
-                            value={newOpenAIKey}
-                            onChange={(e) => setNewOpenAIKey(e.target.value)}
-                            className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-3 py-1.5 text-xs text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-500"
+                            type="url"
+                            placeholder="http://127.0.0.1:11434/v1"
+                            value={newOpenAIUrl}
+                            onChange={(e) => setNewOpenAIUrl(e.target.value)}
+                            className="w-full bg-zinc-900 border border-zinc-700 rounded px-3 py-1.5 text-xs text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-500"
                           />
-                          <button
-                            onClick={async () => {
-                              const ok = await apiCall('/v1/providers/openai', 'PUT', { apiKey: newOpenAIKey });
-                              if (ok) setNewOpenAIKey('');
-                            }}
-                            disabled={busy || !newOpenAIKey}
-                            className="px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 text-xs text-zinc-200 rounded cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                          >
-                            Save
-                          </button>
+                          <input
+                            type="text"
+                            placeholder="Model id (optional) — llama3.2, Qwen3.6-27B"
+                            value={newOpenAIModel}
+                            onChange={(e) => setNewOpenAIModel(e.target.value)}
+                            className="w-full bg-zinc-900 border border-zinc-700 rounded px-3 py-1.5 text-xs text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-500"
+                          />
+                          <div className="flex gap-2">
+                            <input
+                              type="password"
+                              placeholder="API key (optional)"
+                              value={newOpenAIKey}
+                              onChange={(e) => setNewOpenAIKey(e.target.value)}
+                              className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-3 py-1.5 text-xs text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-500"
+                            />
+                            <button
+                              onClick={async () => {
+                                const payload: { apiKey?: string; baseUrl?: string; defaultModel?: string } = {};
+                                if (newOpenAIUrl.trim()) payload.baseUrl = newOpenAIUrl.trim();
+                                if (newOpenAIKey.trim()) payload.apiKey = newOpenAIKey.trim();
+                                if (newOpenAIModel.trim() || providers.openai.configured) {
+                                  payload.defaultModel = newOpenAIModel.trim();
+                                }
+                                const ok = await apiCall('/v1/providers/openai', 'PUT', payload);
+                                if (ok) setNewOpenAIKey('');
+                              }}
+                              disabled={busy || (!newOpenAIUrl.trim() && !newOpenAIKey.trim() && !providers.openai.configured)}
+                              className="px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 text-xs text-zinc-200 rounded cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              Save
+                            </button>
+                          </div>
                         </div>
                       </div>
                     </>

@@ -24,6 +24,8 @@ import { PrefixFingerprintTracker, computePrefixFingerprint } from '../telemetry
 import { buildProviderPrefixSnapshot, type ProviderPrefixContinuity, type ProviderPrefixSnapshot } from '../telemetry/provider-prefix-continuity.js';
 import { detectOutputDegeneracy, detectScriptCollapse, formatDegeneracyStopNotice, messagesHaveRecentToolWork } from './output-degeneracy-guard.js';
 import { requestAwareToolStreamTimeoutMs } from '../provider/stream-timeout.js';
+import { attachDeferredCatalogForEngine } from '../tools/tool-search.js';
+import { heartbeatInboxReplayContent } from '../shared/heartbeat-outcome.js';
 
 /** SCLI debug mode: when SHIZUHA_DEBUG_DIR is set, dump the EXACT context sent to the
  *  model each turn (system prompt + full message history + tools + params) as NDJSON,
@@ -123,6 +125,12 @@ export interface TurnResult {
   inputTokens: number;
   outputTokens: number;
   stopReason?: string;
+  /** Preserve a terminal stream limit even if the semantic guard changes stopReason. */
+  incompleteStreamReason?: 'max_tokens' | 'stall_salvage';
+  /** Semantic guard verdict, independent of the provider's final stop reason. */
+  outputDegeneracyReason?: string;
+  /** Explicit named tool choice was not honored. No calls in this batch ran. */
+  requiredToolFailure?: { toolName: string; reason: 'missing' | 'unexpected'; receivedToolNames: string[] };
   cacheCreationInputTokens?: number;
   cacheReadInputTokens?: number;
   /** SCLI-21/31: per-turn perf, surfaced for the telemetry sink. */
@@ -151,10 +159,21 @@ export interface TurnResult {
  */
 export function toolDefinitionsForProvider(
   toolDefs: ToolDefinition[],
-  provider: Pick<LLMProvider, 'supportsNativeWebSearch'>,
+  provider: Pick<LLMProvider, 'supportsNativeWebSearch' | 'name'>,
+  catalog?: ToolDefinition[],
 ): ToolDefinition[] {
-  if (!provider.supportsNativeWebSearch) return toolDefs;
-  return toolDefs.filter((tool) => tool.name !== 'web_search');
+  let defs = provider.supportsNativeWebSearch
+    ? toolDefs.filter((tool) => tool.name !== 'web_search')
+    : toolDefs;
+  const name = String(provider.name || '').toLowerCase();
+  // Cortex (and Anthropic/Codex) own defer_loading strip/expand. Attach the
+  // MCP catalog marked deferred so the server can expand tool_reference
+  // without rewriting the engine tools[] prefix. Raw vLLM/Ollama must not
+  // receive the catalog — they would hash it into the prompt.
+  if (catalog && (name === 'cortex' || name === 'anthropic' || name === 'codex')) {
+    defs = attachDeferredCatalogForEngine(defs, catalog);
+  }
+  return defs;
 }
 
 /** Convert agent messages to chat messages for the LLM */
@@ -201,6 +220,7 @@ export function messagesToChat(messages: Message[]): ChatMessage[] {
       if (b.type === 'text') return { type: 'text', text: b.text };
       if (b.type === 'tool_use') return { type: 'tool_use', id: b.id, name: b.name, input: b.input };
       if (b.type === 'reasoning') return { type: 'reasoning', id: b.id, encryptedContent: b.encryptedContent, rawContent: b.rawContent, signature: b.signature, summary: b.summary };
+      if (b.type === 'image') return { type: 'image', source: b.source };
       return { type: 'tool_result', toolUseId: b.toolUseId, content: b.content, isError: b.isError, image: b.image };
     });
     return { role: m.role, content: blocks } as ChatMessage;
@@ -261,6 +281,9 @@ export async function executeTurn(
   },
   toolChoice?: ChatOptions['toolChoice'],
 ): Promise<TurnResult> {
+  const requiredToolName = typeof toolChoice === 'object' && toolChoice.type === 'function'
+    ? toolChoice.function.name
+    : undefined;
   // SCLI-20(a): a single bounded retry budget for this turn. Created here so it
   // resets every turn and is shared across all of the turn's tool calls — a
   // flaky dependency can burn the budget but cannot make one turn spin forever.
@@ -301,7 +324,8 @@ export async function executeTurn(
   );
   providerPrefixContinuity?.captureWirePayload?.(chatMessages, messages.length);
   const modelProfile = getModelProfile(model);
-  const providerToolDefs = toolDefinitionsForProvider(toolDefs, provider);
+  const providerToolDefs = toolDefinitionsForProvider(toolDefs, provider, toolRegistry.definitions());
+  const toolsEnabled = providerToolDefs.length > 0 && toolChoice !== 'none';
   const providerPrefixSnapshot = buildProviderPrefixSnapshot({
     model,
     contextWindow: providerPrefixContinuity?.contextWindow,
@@ -321,6 +345,8 @@ export async function executeTurn(
       timestamp: Date.now(),
     });
   }
+  const requestKind = providerPrefixContinuity?.requestKind
+    || (providerPrefixObservation?.cacheBreaking ? 'post_compaction' : undefined);
 
   // Stream LLM response
   let text = '';
@@ -333,6 +359,7 @@ export async function executeTurn(
   let inputTokens = 0;
   let outputTokens = 0;
   let stopReason: string | undefined;
+  let incompleteStreamReason: TurnResult['incompleteStreamReason'];
   let cacheCreationInputTokens: number | undefined;
   let cacheReadInputTokens: number | undefined;
   let providerPromptEstimate: number | undefined;
@@ -479,16 +506,21 @@ export async function executeTurn(
       ...(fastMode ? { serviceTier: 'priority' as const } : {}),
       ...(context.sessionId ? { sessionId: context.sessionId } : {}),
       // PLAT-4189: first interactive turn after compaction is expected-cold.
-      ...(providerPrefixContinuity?.requestKind
-        ? { requestKind: providerPrefixContinuity.requestKind }
-        : {}),
+      // Also tag a detected cache-breaking payload (tool schema / re-serialize)
+      // so Cortex does not classify a same-home rebuild as unexpected mid-session.
+      ...(requestKind ? { requestKind } : {}),
       ...(providerPrefixContinuity?.onCortexRehomeRequired
         ? { onCortexRehomeRequired: providerPrefixContinuity.onCortexRehomeRequired }
         : {}),
+      ...(context.heartbeatInboxSatisfied ? { heartbeatInboxSatisfied: true } : {}),
       abortSignal,
     })) {
       // Check abort signal — break out of streaming immediately
       if (abortSignal?.aborted) { streamAborted = true; break; }
+
+      if (!toolsEnabled && (chunk.type === 'tool_use_start' || chunk.type === 'tool_use_delta' || chunk.type === 'tool_use_end')) {
+        throw Object.assign(new Error(`${provider.name} returned tool calls while tools are disabled`), { code: 'TOOL_CALLS_DISABLED' });
+      }
 
       // SCLI-21: TTFT = first model-output chunk (not usage/stop bookkeeping).
       // EXCLUDE 'thinking' — it's a content-less keep-alive heartbeat (types.ts)
@@ -520,7 +552,7 @@ export async function executeTurn(
 
       switch (chunk.type) {
         case 'text': {
-          leakedToolCallTags += (chunk.text.match(/<tool_call>/gi) || []).length;
+          if (toolsEnabled) leakedToolCallTags += (chunk.text.match(/<tool_call>/gi) || []).length;
           if (leakedToolCallTags >= 6) {
             outputDegeneracyReason = 'repeated_line';
             outputDegeneracyEvidence = `${leakedToolCallTags} leaked <tool_call> tags`;
@@ -539,7 +571,7 @@ export async function executeTurn(
             });
             break stream_loop;
           }
-          const held = holdDsmlStreamDelta(chunk.text, markupCarry);
+          const held = toolsEnabled ? holdDsmlStreamDelta(chunk.text, markupCarry) : { text: chunk.text, carry: '' };
           markupCarry = held.carry;
           if (!held.text) break;
           text += held.text;
@@ -686,10 +718,14 @@ export async function executeTurn(
 
           // Start read-only tools immediately during streaming (up to concurrency limit)
           const handler = toolRegistry.get(tc.name);
-          if (handler?.readOnly && inflightCount < MAX_CONCURRENT_STREAMING_TOOLS) {
+          // A named choice constrains the whole batch. Validate it before any
+          // tool executes, including read-only calls streamed before a later
+          // unexpected name. Ordinary unconstrained turns retain overlap.
+          if (!requiredToolName && handler?.readOnly && inflightCount < MAX_CONCURRENT_STREAMING_TOOLS) {
             inflightCount++;
             const promise = executeToolCallTimed(tc, toolRegistry, permissions, emitter, context, onPermissionAsk, hookEngine, retryBudget, retryConfig, abortSignal)
               .finally(() => { inflightCount--; });
+            void promise.catch(() => {});
             inflightResults.set(tc.id, promise);
           }
           break;
@@ -783,6 +819,7 @@ export async function executeTurn(
 
         case 'stop_reason':
           stopReason = chunk.reason;
+          if (chunk.reason === 'max_tokens' || chunk.reason === 'stall_salvage') incompleteStreamReason = chunk.reason;
           break;
 
         case 'done':
@@ -863,7 +900,7 @@ export async function executeTurn(
     }
   }
 
-  if (stopReason === 'tool_calls' && toolCalls.length === 0) {
+  if (!requiredToolName && stopReason === 'tool_calls' && toolCalls.length === 0) {
     logger.warn(
       { model, provider: provider.name, inputTokens, outputTokens, textLen: (finalText ?? text).length },
       'Provider signaled tool_calls but no parsable tool calls were received',
@@ -891,7 +928,7 @@ export async function executeTurn(
   // speculative decoding the engine can stream a tool invoke as CONTENT; if we
   // mark the turn degenerate first, we claim "no tool call" while salvage would
   // have recovered one — and we still replace the text with a stop notice.
-  {
+  if (toolsEnabled) {
     const rawAssistantText = finalText ?? text;
     if (rawAssistantText) {
       const dsml = salvageDsmlToolCalls(rawAssistantText);
@@ -985,7 +1022,13 @@ export async function executeTurn(
   if (rawReasoningText.trim()) {
     contentBlocks.push({ type: 'reasoning', id: `vllm_reasoning_${Date.now()}`, rawContent: rawReasoningText });
   }
+  const persistedReasoning = rawReasoningText.trim();
   for (const rb of reasoningBlocks) {
+    const raw = (rb.rawContent ?? '').trim();
+    // vLLM yields reasoning_text deltas AND a terminal reasoning block with
+    // the same CoT. Persisting both doubles prefix tokens and looks like we
+    // "cut" the original (operator 2026-09-10). Keep the streamed copy.
+    if (raw && persistedReasoning && (persistedReasoning === raw || persistedReasoning.includes(raw))) continue;
     contentBlocks.push({ type: 'reasoning', id: rb.id, encryptedContent: rb.encryptedContent, rawContent: rb.rawContent, signature: rb.signature, summary: rb.summary });
   }
   if (assistantText) contentBlocks.push({ type: 'text', text: assistantText });
@@ -999,6 +1042,25 @@ export async function executeTurn(
       : contentBlocks,
     timestamp: Date.now(),
   };
+
+  // finish_reason=stop is not proof of completion when the request explicitly
+  // required a tool. Keep the raw assistant message for diagnostics, but give
+  // callers a typed rejection before execution or model-history persistence.
+  if (requiredToolName && (toolCalls.length === 0 || toolCalls.some((tc) => tc.name !== requiredToolName))) {
+    const requiredToolFailure = {
+      toolName: requiredToolName,
+      reason: toolCalls.length === 0 ? 'missing' as const : 'unexpected' as const,
+      receivedToolNames: toolCalls.map((tc) => tc.name),
+    };
+    logger.warn({ model, provider: provider.name, ...requiredToolFailure },
+      'Required tool choice was not honored; rejected batch before execution');
+    return {
+      assistantMessage, toolCalls: [], toolResults: [], inputTokens, outputTokens,
+      stopReason, incompleteStreamReason, outputDegeneracyReason, cacheCreationInputTokens, cacheReadInputTokens, ttftMs,
+      providerPromptEstimate, servedModel, servedContextWindow,
+      requiredToolFailure,
+    };
+  }
 
   // Execute tool calls — some read-only tools may already be in-flight from streaming
   const resultMap = new Map<string, ToolResult>();
@@ -1047,7 +1109,7 @@ export async function executeTurn(
     .map((tc) => resultMap.get(tc.id))
     .filter((r): r is ToolResult => r !== undefined);
 
-  return { assistantMessage, toolCalls, toolResults, inputTokens, outputTokens, stopReason, cacheCreationInputTokens, cacheReadInputTokens, ttftMs, providerPromptEstimate, servedModel, servedContextWindow };
+  return { assistantMessage, toolCalls, toolResults, inputTokens, outputTokens, stopReason, incompleteStreamReason, outputDegeneracyReason, cacheCreationInputTokens, cacheReadInputTokens, ttftMs, providerPromptEstimate, servedModel, servedContextWindow };
 }
 
 /**
@@ -1178,6 +1240,25 @@ async function executeToolCall(
   // Guard: model faked an MCP tool call by echoing its name through bash.
   // Short-circuit with a corrective result instead of running the useless echo —
   // this breaks the imitation loop and steers the model back to a real call.
+  const inboxReplay = heartbeatInboxReplayContent(tc.name, Boolean(context.heartbeatInboxSatisfied));
+  if (inboxReplay) {
+    const result: ToolResult = {
+      toolUseId: tc.id,
+      content: inboxReplay,
+      isError: false,
+    };
+    emitter.emit({
+      type: 'tool_complete',
+      toolCallId: tc.id,
+      toolName: tc.name,
+      result: result.content,
+      isError: false,
+      durationMs: Date.now() - startTime,
+      timestamp: Date.now(),
+    });
+    return result;
+  }
+
   const fakedTool = detectFakedMcpToolCall(tc, registry);
   if (fakedTool) {
     const result: ToolResult = {
@@ -1295,13 +1376,58 @@ async function executeToolCall(
       });
     },
   };
+  const journal = context.executionJournal;
+  let invocation = 0;
+  let activeAttempt: { invocation: number; settled: boolean } | undefined;
+  const checkpoint = async (action: () => Promise<void> | void) => {
+    try { await action(); } catch (cause) {
+      throw Object.assign(new Error('Tool execution checkpoint could not be committed'), {
+        code: 'TOOL_CHECKPOINT_FAILED', retryable: false, cause,
+      });
+    }
+  };
+  const executionHandler: ToolHandler = journal ? {
+    ...handler,
+    async execute(input, innerContext) {
+      const currentAttempt = { invocation: ++invocation, settled: false };
+      await checkpoint(() => journal.begin(tc.id, tc.name, input, currentAttempt.invocation));
+      activeAttempt = currentAttempt;
+      const startedAt = Date.now();
+      if (innerContext.abortSignal?.aborted) {
+        const cancelled: ToolResult = { toolUseId: tc.id, content: `Tool ${tc.name} was cancelled before handler execution.`,
+          isError: true, metadata: { executionOutcome: 'not_started' }, durationMs: 0 };
+        await checkpoint(() => journal.complete(tc.id, currentAttempt.invocation, cancelled));
+        currentAttempt.settled = true;
+        return cancelled;
+      }
+      let result: ToolResult;
+      try {
+        result = await handler.execute(input, innerContext);
+      } catch (error) {
+        if (!currentAttempt.settled) {
+          await checkpoint(() => journal.complete(tc.id, currentAttempt.invocation, {
+            toolUseId: tc.id, content: `Tool error: ${(error as Error).message}`, isError: true, durationMs: Date.now() - startedAt,
+          }));
+          currentAttempt.settled = true;
+        }
+        throw error;
+      }
+      if (!currentAttempt.settled) {
+        await checkpoint(() => journal.complete(tc.id, currentAttempt.invocation, {
+          ...cappedToolResult(result, tc.id), durationMs: result.durationMs ?? Date.now() - startedAt,
+        }));
+        currentAttempt.settled = true;
+      }
+      return result;
+    },
+  } : handler;
   try {
     // SCLI-20(a): retry only transient failures (timeout/rate-limit/network),
     // bounded by the per-turn budget. Non-retryable errors throw on the first
     // attempt and fall through to the catch below unchanged.
     const result = retryBudget
       ? await executeToolWithRetry(
-          () => runToolGuarded(handler, tc, toolContext),
+          () => runToolGuarded(executionHandler, tc, toolContext),
           retryBudget,
           retryConfig,
           {
@@ -1320,18 +1446,17 @@ async function executeToolCall(
             },
           },
         )
-      : await runToolGuarded(handler, tc, toolContext);
-    result.toolUseId = tc.id;
-
-    // Cap tool output before it enters the transcript / model context.
-    // Unbounded grep/bash dumps (hundreds of KB) cause provider
-    // context_length_exceeded even when the status bar still looks fine.
-    const MAX_TOOL_RESULT_CHARS = 40_000;
-    if (typeof result.content === 'string' && result.content.length > MAX_TOOL_RESULT_CHARS) {
-      const original = result.content.length;
-      result.content = `${result.content.slice(0, MAX_TOOL_RESULT_CHARS)}\n\n`
-        + `[... tool output truncated: kept ${MAX_TOOL_RESULT_CHARS}/${original} chars to protect the context window ...]`;
+      : await runToolGuarded(executionHandler, tc, toolContext);
+    if (journal && activeAttempt && !activeAttempt.settled) {
+      result.content += '\nExecution outcome is unknown; the handler has not confirmed completion and side effects may still occur.';
+      result.metadata = { ...result.metadata, executionOutcome: 'unknown', interrupted: true };
+      const currentAttempt = activeAttempt;
+      await checkpoint(() => journal.interrupt(tc.id, currentAttempt.invocation, {
+        ...cappedToolResult(result, tc.id), durationMs: result.durationMs ?? Date.now() - startTime,
+      }));
+      currentAttempt.settled = true;
     }
+    Object.assign(result, cappedToolResult(result, tc.id));
 
     // PostToolUse hooks
     if (hookEngine?.hasHooks('PostToolUse')) {
@@ -1360,6 +1485,7 @@ async function executeToolCall(
     });
     return result;
   } catch (err) {
+    if ((err as { code?: string }).code === 'TOOL_CHECKPOINT_FAILED') throw err;
     const result: ToolResult = {
       toolUseId: tc.id,
       content: `Tool error: ${(err as Error).message}`,
@@ -1376,4 +1502,12 @@ async function executeToolCall(
     });
     return result;
   }
+}
+
+function cappedToolResult(result: ToolResult, toolUseId: string): ToolResult {
+  const maxChars = 40_000;
+  const content = typeof result.content === 'string' && result.content.length > maxChars
+    ? `${result.content.slice(0, maxChars)}\n\n[... tool output truncated: kept ${maxChars}/${result.content.length} chars to protect the context window ...]`
+    : result.content;
+  return { ...result, toolUseId, content };
 }

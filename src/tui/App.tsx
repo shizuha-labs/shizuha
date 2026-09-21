@@ -1,5 +1,6 @@
-import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
-import { render, Box, Text, useApp, useInput } from 'ink';
+import React, { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo } from 'react';
+import { render, Box, Text, useApp, useInput, measureElement, type DOMElement } from 'ink';
+import { consumeCurrentInputDispatch } from './renderer/inputDispatch.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -28,16 +29,26 @@ import { loadSettings, saveSettings } from './utils/settings.js';
 import { maybeAutoUpdateTui, restartInstalledTui } from './auto-update.js';
 import {
   ConversationViewport,
+  remainingViewportRows,
   type ConversationViewportHandle,
 } from './components/ConversationViewport.js';
 import { parseMouseWheel } from './utils/mouse.js';
-import { enterInteractiveScreen, leaveInteractiveScreen } from './utils/interactiveScreen.js';
+import { enterInteractiveScreen, leaveInteractiveScreen, setMouseReporting as applyMouseReporting, resetTuiCanvas, resetScrollRegion } from './utils/interactiveScreen.js';
+import { getCronJobs } from '../tools/builtin/cron.js';
+import { TasksPane } from './components/TasksPane.js';
+import { McpOverlay } from './components/McpOverlay.js';
+import { slashMessageKind } from './utils/slashDisplay.js';
+import { demoteForegroundBash } from '../tools/builtin/bash.js';
 
 
 // Module-level ref for SIGINT handler to access the interrupt function
 let _interruptFn: (() => void) | null = null;
 let _isProcessing = false;
 let _currentSessionId: string | null = null;
+// Registered by the App component; called by the SIGCONT handler (which lives
+// in launchTUI, outside React scope) to force a redraw + transient "Resumed"
+// status after `fg` resumes a Ctrl+Z-suspended job (SCLI-448).
+let _onResume: (() => void) | null = null;
 
 /**
  * Persist the current TUI session id to a marker file so a hard crash (e.g. a
@@ -86,6 +97,30 @@ function exitTui(exit: () => void): void {
   }
   exit();
   setImmediate(() => process.exit(0));
+}
+
+/**
+ * SCLI-448: suspend the full foreground process group on Ctrl+Z so the shell
+ * reports a stopped job and `fg` resumes the same TUI. The TUI runs in raw
+ * mode (ISIG off), so Ctrl+Z arrives as a keypress, not a signal — we restore
+ * the cooked terminal, then stop our process group. SIGSTOP (not SIGTSTP) is
+ * used because Node.js ignores SIGTSTP by default; SIGSTOP is uncatchable and
+ * always stops, and the shell's waitpid reports the stop identically. SIGCONT
+ * re-enters raw mode and the alternate screen.
+ */
+function suspendTui(): void {
+  leaveInteractiveScreen();
+  try {
+    process.stdin.setRawMode(false);
+  } catch {
+    // Non-TTY stdin: nothing to restore; still suspend below.
+  }
+  try {
+    process.kill(0, 'SIGSTOP');
+  } catch {
+    // No process group (e.g. non-interactive): fall back to suspending self.
+    process.kill(process.pid, 'SIGSTOP');
+  }
 }
 
 function defaultThinkingLevelForModel(slug?: string | null): string {
@@ -138,6 +173,8 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
   const [composerDraft, setComposerDraft] = useState('');
   const [composerDraftVersion, setComposerDraftVersion] = useState(0);
   const inputRef = useRef<string>('');
+  // Timer for the transient "Resumed" status shown after `fg` (SCLI-448).
+  const resumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** SCLI-383: after help/pager dismiss, lock composer briefly so the dismiss
    *  keystroke cannot land in the draft (q → `q/mode supervised`). */
   const [composerKeySuppressed, setComposerKeySuppressed] = useState(false);
@@ -148,6 +185,33 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
     setTimeout(() => setComposerKeySuppressed(false), 0);
   }, []);
   const conversationViewportRef = useRef<ConversationViewportHandle>(null);
+  // PLAT-7382: the chrome rendered ABOVE the viewport (error/status/header/
+  // welcome-art) is variable-height; its measured height + the viewport's own
+  // measured height give the viewport's absolute screen rows for the DECSTBM
+  // region. The ref is the wheel-time read (no re-render needed); the state
+  // feeds the viewport prop.
+  const aboveChromeRef = useRef<DOMElement>(null);
+  const aboveChromeRowsRef = useRef(2);
+  const [aboveChromeRows, setAboveChromeRows] = useState(2);
+  const belowChromeRef = useRef<DOMElement>(null);
+  const belowChromeRowsRef = useRef(4);
+  const [belowChromeRows, setBelowChromeRows] = useState(4);
+  useLayoutEffect(() => {
+    if (aboveChromeRef.current) {
+      const measured = Math.max(0, Math.floor(measureElement(aboveChromeRef.current).height));
+      if (measured !== aboveChromeRowsRef.current) {
+        aboveChromeRowsRef.current = measured;
+        setAboveChromeRows(measured);
+      }
+    }
+    if (belowChromeRef.current) {
+      const measured = Math.max(1, Math.floor(measureElement(belowChromeRef.current).height));
+      if (measured !== belowChromeRowsRef.current) {
+        belowChromeRowsRef.current = measured;
+        setBelowChromeRows(measured);
+      }
+    }
+  });
   const draftRemeasureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestConversationRemeasure = useCallback(() => {
     if (draftRemeasureTimerRef.current) return;
@@ -169,6 +233,15 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
     setComposerDraft(value);
     setComposerDraftVersion((version) => version + 1);
   }, []);
+  /** SCLI-460: buffer keystrokes typed while the help panel is open into the
+   *  composer draft so they are not silently lost. The composer is unmounted
+   *  during help; on dismiss it remounts and reads this draft. */
+  const appendComposerDraft = useCallback((value: string) => {
+    const next = inputRef.current + value;
+    inputRef.current = next;
+    setComposerDraft(next);
+    setComposerDraftVersion((version) => version + 1);
+  }, []);
 
   const {
     ready, initStatus, completedEntries, retryNotice, liveEntry, transcript, getPagerTranscript,
@@ -179,7 +252,7 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
     submitPrompt, dequeueQueuedPrompts, resolveApproval, setModel, setMode, clearTranscript,
     compact, interrupt, listSessions, resumeSession, newSession,
     initWarning, availableModels, availableProviders,
-    renameSession, forkSession, listMCPTools, addTranscriptEntry, submitWithImage,
+    renameSession, forkSession, listMCPTools, listMcpServers, setMcpServerEnabled, addTranscriptEntry, submitWithImage,
     setThinkingLevel: setSessionThinkingLevel,
     setReasoningEffort: setSessionReasoningEffort, setFastMode: setSessionFastMode,
     deleteSession, configureAuth, codexDeviceAuthDone, consumeAutoShowModelPicker,
@@ -208,12 +281,27 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
   const [pagerEntries, setPagerEntries] = useState<typeof transcript | null>(null);
   const [startTime] = useState(() => Date.now());
   const { rows: terminalRows, columns: terminalCols } = useTerminalSize();
+  const viewportRows = remainingViewportRows(terminalRows, aboveChromeRows, belowChromeRows);
   const gitInfo = useGitInfo(cwd);
 
   // Keep module-level state in sync for SIGINT handler
   _interruptFn = interrupt;
   _isProcessing = isProcessing;
   _currentSessionId = sessionId;
+
+  // SCLI-448: register the resume callback for the SIGCONT handler (which
+  // lives in launchTUI, outside React scope). Forces a redraw + transient
+  // "Resumed" status after `fg` resumes a Ctrl+Z-suspended job.
+  useEffect(() => {
+    _onResume = () => {
+      setStatusMessage('Resumed (Ctrl+Z suspends, fg resumes)');
+      if (resumeTimerRef.current) clearTimeout(resumeTimerRef.current);
+      resumeTimerRef.current = setTimeout(() => setStatusMessage(null), 2500);
+    };
+    return () => {
+      _onResume = null;
+    };
+  }, []);
 
   // This performs synchronous filesystem work; doing it during render put a
   // mkdir/stat/write sequence on every character. Session ids change rarely.
@@ -289,9 +377,27 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
         exitTui(exit);
       }
     }
+    // SCLI-447: at an idle empty composer, Ctrl+D is the conventional terminal
+    // EOF/exit affordance — exit cleanly (same as Ctrl+C at idle). With a
+    // non-empty draft it is intentionally ignored (no data loss).
+    if (key.ctrl && _input === 'd') {
+      if (!inputRef.current || inputRef.current.trim() === '') {
+        exitTui(exit);
+      }
+    }
+    // SCLI-448: Ctrl+Z must suspend the foreground job (Unix job control),
+    // never be captured as editor Undo. Handled here (always active) so it
+    // works during streaming/overlays too.
+    if (key.ctrl && _input === 'z') {
+      suspendTui();
+    }
     if (key.escape) {
       if (screen !== 'prompt') {
+        if (screen === 'pager') resetTuiCanvas();
+        else resetScrollRegion();
         setScreen('prompt');
+        setPagerContent(null);
+        setPagerEntries(null);
       } else if (isProcessing) {
         setStatusMessage('Interrupting...');
         interrupt();
@@ -310,6 +416,9 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
 
     const wheel = parseMouseWheel(_input);
     if (wheel) {
+      // Same path as PgUp/PgDn. Native DECSTBM wheel-scroll (PLAT-7382)
+      // overscrolled past the last line (blank cells) and left the Ink
+      // model unsynced, so later keyboard scroll showed an empty canvas.
       conversationViewportRef.current?.scrollBy(wheel === 'up' ? -3 : 3);
       return;
     }
@@ -322,8 +431,9 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
       return;
     }
 
-    // Ctrl+Z — undo last edit
-    if (key.ctrl && _input === 'z' && !isProcessing) {
+    // Ctrl+Y — undo last edit (SCLI-448: Ctrl+Z now suspends the job, so
+    // editor Undo moved to Ctrl+Y, the readline/yank-adjacent binding).
+    if (key.ctrl && _input === 'y' && !isProcessing) {
       const edit = popEdit();
       if (edit) {
         try {
@@ -387,6 +497,23 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
         setStashedInput(inputRef.current);
         replaceComposerDraft('');
         setStatusMessage('Input stashed');
+      }
+    }
+    // Ctrl+G — toggle the tasks pane (SCLI-621). Live view of background
+    // tasks + cron jobs; refreshes from the shared poll loop.
+    if (key.ctrl && _input === 'g') {
+      setScreen('tasks');
+    }
+    // Ctrl+B — demote the running foreground command to the background
+    // (SCLI-619). The command keeps running, gets a task ID, and its output
+    // continues to accumulate in the BackgroundTaskRegistry. Works while a
+    // foreground bash is in flight; no-op otherwise.
+    if (key.ctrl && _input === 'b') {
+      const taskId = demoteForegroundBash();
+      if (taskId) {
+        setStatusMessage(`Demoted foreground command to background task ${taskId}`);
+      } else {
+        setStatusMessage('No foreground command running to demote');
       }
     }
     // Ctrl+P — open transcript pager (must work during active execution too).
@@ -504,6 +631,8 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
         renameSession,
         forkSession,
         listMCPTools,
+        listMcpServers,
+        setMcpServerEnabled,
         getLastAssistantMessage: () => {
           for (let i = transcript.length - 1; i >= 0; i--) {
             if (transcript[i]!.role === 'assistant') return transcript[i]!.content;
@@ -519,9 +648,28 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
         getShizuhaAuthStatus,
         verifyShizuhaIdentity,
         configureAuth,
+        setMouseReporting: (enabled: boolean) => { applyMouseReporting(enabled, process.stdout); },
       });
       if (result.handled) {
-        if (result.message) setStatusMessage(result.message);
+        if (result.message) {
+          // SCLI-519: multi-line slash output (e.g. /doctor's diagnostics) is a
+          // transcript-visible block, not a transient status notice. The
+          // transcript viewport is virtualized + height-measured, so it can
+          // never be overwritten by the persistent header/status chrome. The
+          // single-line statusMessage slot and the fixed-CHROME WelcomeArt both
+          // collapse when a tall block sits above them (the header redraw used
+          // to overwrite /doctor rows at 120x40).
+          if (slashMessageKind(result.message) === 'transcript') {
+            addTranscriptEntry({
+              id: `slash-${Date.now()}`,
+              role: 'assistant',
+              content: result.message,
+              timestamp: Date.now(),
+            });
+          } else {
+            setStatusMessage(result.message);
+          }
+        }
         return;
       }
     }
@@ -732,7 +880,13 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
         entries={pagerContent ? undefined : (pagerEntries ?? transcript)}
         rawContent={pagerContent ?? undefined}
         manageAlternateScreen={false}
-        onExit={() => { armComposerKeySuppress(); setScreen('prompt'); setPagerContent(null); setPagerEntries(null); }}
+        onExit={() => {
+          resetTuiCanvas();
+          consumeCurrentInputDispatch();
+          setScreen('prompt');
+          setPagerContent(null);
+          setPagerEntries(null);
+        }}
       />
     );
   }
@@ -769,30 +923,35 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
             </Box>
           )}
 
-          {/* Error display */}
-          {error && (
-            <Box paddingX={1}>
-              <Text color="red">{'\u2717'} {error}</Text>
-            </Box>
-          )}
+          {/* PLAT-7382: everything above the viewport, measured — its height
+              anchors the viewport's absolute screen rows for the DECSTBM
+              scroll region. */}
+          <Box ref={aboveChromeRef} flexDirection="column">
+            {/* Error display */}
+            {error && (
+              <Box paddingX={1}>
+                <Text color="red">{'\u2717'} {error}</Text>
+              </Box>
+            )}
 
-          {/* Status message */}
-          {statusMessage && (
-            <Box paddingX={1}>
-              <Text color="cyan">{'\u2139'} {statusMessage}</Text>
-            </Box>
-          )}
+            {/* Status message */}
+            {statusMessage && (
+              <Box paddingX={1}>
+                <Text color="cyan">{'\u2139'} {statusMessage}</Text>
+              </Box>
+            )}
 
-          {/* Header */}
-          <Box paddingX={1} marginBottom={1}>
-            <Text bold color="cyan">{appGlyph} Shizuha</Text>
-            <Text dimColor> | Interactive Agent | /help for commands</Text>
+            {/* Header */}
+            <Box paddingX={1} marginBottom={1}>
+              <Text bold color="cyan">{appGlyph} Shizuha</Text>
+              <Text dimColor> | Interactive Agent | /help for commands</Text>
+            </Box>
+
+            {/* Welcome art — shown on idle start screen before any messages */}
+            {screen === 'prompt' && completedEntries.length === 0 && !showLiveEntry && !isProcessing && (
+              <WelcomeArt columns={terminalCols} rows={terminalRows} model={model} mode={mode} cwd={cwd} />
+            )}
           </Box>
-
-          {/* Welcome art — shown on idle start screen before any messages */}
-          {screen === 'prompt' && completedEntries.length === 0 && !showLiveEntry && !isProcessing && (
-            <WelcomeArt columns={terminalCols} rows={terminalRows} model={model} mode={mode} cwd={cwd} />
-          )}
 
           {/* Full source transcript, virtualized to visible terminal rows. The
               alternate screen owns scrolling; tmux history stays empty while
@@ -803,7 +962,8 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
               completedEntries={completedEntries}
               liveEntry={showLiveEntry ? liveEntry : null}
               columns={terminalCols}
-              rows={terminalRows}
+              rows={viewportRows}
+              aboveChromeRows={aboveChromeRows}
             />
           )}
 
@@ -846,51 +1006,88 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
             </>
           )}
 
-          {screen === 'sessions' && (
-            <SessionPicker
-              sessions={listSessions()}
-              onSelect={handleSessionSelect}
-              onNew={handleNewSession}
-              onCancel={() => setScreen('prompt')}
-              onDelete={(id) => {
-                const ok = deleteSession(id);
-                if (ok) setStatusMessage(`Session ${id.slice(0, 8)} deleted`);
-                return ok;
-              }}
-            />
-          )}
+          {screen !== 'prompt' && screen !== 'pager' && (
+            <Box
+              key={screen}
+              flexGrow={1}
+              flexShrink={1}
+              minHeight={1}
+              overflow="hidden"
+              flexDirection="column"
+            >
+              {screen === 'sessions' && (
+                <SessionPicker
+                  sessions={listSessions()}
+                  onSelect={handleSessionSelect}
+                  onNew={handleNewSession}
+                  onCancel={() => { resetScrollRegion(); setScreen('prompt'); }}
+                  onDelete={(id) => {
+                    const ok = deleteSession(id);
+                    if (ok) setStatusMessage(`Session ${id.slice(0, 8)} deleted`);
+                    return ok;
+                  }}
+                />
+              )}
 
-          {screen === 'models' && (
-            <ModelPicker
-              models={availableModels()}
-              currentModel={model}
-              availableProviders={availableProviders()}
-              onSelect={handleModelSelect}
-              onCancel={() => setScreen('prompt')}
-              onAuthConfigure={handleAuthConfigure}
-              onCodexDeviceAuth={handleCodexDeviceAuth}
-            />
-          )}
+              {screen === 'models' && (
+                <ModelPicker
+                  models={availableModels()}
+                  currentModel={model}
+                  availableProviders={availableProviders()}
+                  onSelect={handleModelSelect}
+                  onCancel={() => { resetScrollRegion(); setScreen('prompt'); }}
+                  onAuthConfigure={handleAuthConfigure}
+                  onCodexDeviceAuth={handleCodexDeviceAuth}
+                />
+              )}
 
-          {screen === 'help' && (
-            <HelpOverlay onDismiss={() => {
-              armComposerKeySuppress();
-              setScreen('prompt');
-            }} />
+              {screen === 'help' && (
+                <HelpOverlay onDismiss={() => {
+                  resetScrollRegion();
+                  consumeCurrentInputDispatch();
+                  setScreen('prompt');
+                }} onInput={appendComposerDraft} />
+              )}
+
+              {screen === 'tasks' && (
+                <TasksPane
+                  getTaskRegistry={getTaskRegistry}
+                  getCronJobs={getCronJobs}
+                  onExit={() => {
+                    resetScrollRegion();
+                    consumeCurrentInputDispatch();
+                    setScreen('prompt');
+                  }}
+                />
+              )}
+
+              {screen === 'mcp' && (
+                <McpOverlay
+                  listServers={listMcpServers}
+                  setEnabled={setMcpServerEnabled}
+                  onExit={() => {
+                    resetScrollRegion();
+                    consumeCurrentInputDispatch();
+                    setScreen('prompt');
+                  }}
+                />
+              )}
+            </Box>
           )}
         </>
         )}
       </Box>
 
+      <Box ref={belowChromeRef} flexDirection="column" flexShrink={0}>
       {/* Input — stays available during execution; only lock during approval to avoid key leakage.
           Hidden (unmounted) while pager is open; App snapshots the local draft (SCLI-382).
-          Also locked for one tick after help/pager dismiss so the dismiss key cannot leak (SCLI-383). */}
+          The exact stdin generation that dismissed help/pager is rejected (SCLI-548). */}
       {ready && screen === 'prompt' && !historySearchActive && (
         <Box paddingX={1} flexShrink={0}>
           <InputBox
             onSubmit={handleComposerSubmit}
             isProcessing={isProcessing}
-            isLocked={!!pendingApproval || composerKeySuppressed}
+            isLocked={!!pendingApproval}
             queuedCount={queuedPromptCount}
             queuedPrompts={queuedPrompts}
             onDequeueQueuedPrompts={dequeueQueuedPrompts}
@@ -932,6 +1129,7 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
           planFilePath={planFilePath}
         />
       </Box>
+      </Box>
     </Box>
   );
 };
@@ -939,6 +1137,20 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
 /** Launch the TUI — called from CLI entry point */
 export function launchTUI(options: { cwd?: string; model?: string; mode?: PermissionMode; resumeSessionId?: string } = {}): void {
   const cwd = options.cwd ?? process.cwd();
+
+  // SCLI-722: the interactive TUI requires a TTY stdin. Ink's input hook
+  // enables raw mode on mount and throws "Raw mode is not supported" when
+  // stdin is not a TTY (closed stdin, piped input). That throw used to be
+  // swallowed by Ink's ErrorBoundary, whose ErrorOverview renders stack
+  // lines with `key: line` — repeated React frames then collide and the
+  // resulting duplicate-key warning (carrying internal bundle paths) landed
+  // on stderr on every rigor-env startup (closed stdin, TERM=dumb). Degrade
+  // gracefully instead: a note on stdout, exit with EOF semantics, and
+  // stderr stays empty per the SCLI-178 evidence standard.
+  if (!process.stdin.isTTY) {
+    console.log('\u2139 Interactive TUI requires a TTY stdin; nothing to interact with \u2014 exiting.');
+    return;
+  }
 
   // Interactive sessions should fail fast and show a clear timeout budget.
   // Batch/daemon paths keep the longer Cortex/vLLM queue-tolerant defaults.
@@ -950,6 +1162,13 @@ export function launchTUI(options: { cwd?: string; model?: string; mode?: Permis
   enterInteractiveScreen(process.stdout);
   process.once('exit', leaveInteractiveScreen);
 
+  // SCLI-479: honor the persisted mouse-reporting preference. When the user
+  // chose /mouse off, hand the wheel back to tmux/terminal scrollback on every
+  // startup (sticky across restarts) instead of re-capturing it.
+  if (loadSettings().mouseReporting === false) {
+    applyMouseReporting(false, process.stdout);
+  }
+
   // Route TUI logs to a rotating file so the UI stays clean while retaining
   // detailed debugging data for long-running/stuck sessions.
   import('../utils/logger.js').then(({ enableFileLogging }) => {
@@ -957,6 +1176,21 @@ export function launchTUI(options: { cwd?: string; model?: string; mode?: Permis
       ?? process.env['SHIZUHA_LOG_LEVEL']
       ?? 'debug';
     enableFileLogging({ level, mirrorToStderr: false });
+  });
+
+  // SIGCONT handler: re-enter the TUI after `fg` resumes a Ctrl+Z-suspended
+  // job (SCLI-448). Raw mode + alternate screen were torn down before
+  // suspending; restore both and hand off to the App component (via the
+  // module-level _onResume callback) to force a redraw — the alternate screen
+  // was cleared on re-entry, so Ink must write the full frame.
+  process.on('SIGCONT', () => {
+    try {
+      process.stdin.setRawMode(true);
+    } catch {
+      // Non-TTY stdin: nothing to restore.
+    }
+    enterInteractiveScreen(process.stdout);
+    _onResume?.();
   });
 
   // SIGINT handler: interrupt the agent or exit cleanly

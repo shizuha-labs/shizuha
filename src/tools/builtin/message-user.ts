@@ -18,6 +18,17 @@ import { sendConnectDm } from '../../platform/connect-dm.js';
 
 const AGENT_USERNAME = process.env['AGENT_USERNAME'] || 'agent';
 
+/** Talk-seat leftover, forged voice-prompt `pong`, or liveness/test spam. */
+export function isAckOnlyMessage(content: string): boolean {
+  const text = content.trim();
+  if (/^(replied|done|sent|ok|noted|pong( sent)?|ping)[.!]?$/i.test(text)) return true;
+  if (/^test message\b/i.test(text)) return true;
+  if (/please confirm you can see this/i.test(text)) return true;
+  if (/^i['’]m here\b.{0,80}what would you like me to do/i.test(text)) return true;
+  if (/^i['’]m stuck in a loop\b/i.test(text) && !/\b[A-Z]{2,}-\d+\b/.test(text)) return true;
+  return false;
+}
+
 export const messageUserTool: ToolHandler = {
   name: 'message_user',
   description:
@@ -28,8 +39,8 @@ export const messageUserTool: ToolHandler = {
     '`recipient_email` (when you only have an email). Both paths work whether the ' +
     'backend is the real platform or the local daemon mini-Connect.\n\n' +
     'Examples:\n' +
-    '  message_user(recipient_username="hritik", content="pong")\n' +
-    '  message_user(recipient_username="kai", content="please review AT-91")',
+    '  message_user(recipient_username="<inbound-username>", content="<the actual reply they should see>")\n' +
+    '  message_user(recipient_username="kai", content="AT-91 is on my queue; reviewing this turn.")',
   parameters: z.object({
     recipient_username: z.string().optional().describe(
       'Backend username of the recipient (preferred). Inbound messages arrive prefixed `[username]`.',
@@ -61,6 +72,13 @@ export const messageUserTool: ToolHandler = {
     }
     if (!content) {
       return { toolUseId: '', content: 'Error: content is required.', isError: true };
+    }
+    if (isAckOnlyMessage(content)) {
+      return {
+        toolUseId: '',
+        content: 'Error: content must be the words the recipient should see. Do not send "Replied." — put the actual reply in content and call message_user again.',
+        isError: true,
+      };
     }
 
     const result = await sendConnectDm({

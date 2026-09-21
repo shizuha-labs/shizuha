@@ -53,7 +53,7 @@ type FallbackHarness = AgentProcess & {
     activeProvider: { name: string },
     useFallbackChain: boolean,
     toolContext: unknown,
-    msg: { source: string },
+    msg: { source: string; id?: string; threadId?: string },
     channel: unknown,
     forceHeartbeatQueueTool?: boolean,
     requestKind?: string,
@@ -64,12 +64,12 @@ type FallbackHarness = AgentProcess & {
 const normalizeModelName = (model: string) => model;
 
 function makeHarness(): FallbackHarness {
-  return new AgentProcess({
+  return Object.assign(new AgentProcess({
     channels: [],
     model: 'DeepSeek-V4-Flash',
     cwd: '/tmp',
     permissionMode: 'autonomous',
-  }) as unknown as FallbackHarness;
+  }), { sessionId: 'fallback-test', store: { recoverToolTurns: vi.fn(() => []) } }) as unknown as FallbackHarness;
 }
 
 afterEach(() => {
@@ -81,6 +81,20 @@ afterEach(() => {
 });
 
 describe('AgentProcess fallback pin alignment', () => {
+  it('never retries a failed durable tool checkpoint through a provider fallback', async () => {
+    const agent = makeHarness();
+    agent.modelFallbacks = [
+      { method: 'shizuha/cortex', model: 'DeepSeek-V4-Flash' },
+      { method: 'shizuha/cortex', model: 'DeepSeek-V4-Flash-fallback' },
+    ];
+    agent.providerReg = { resolve: vi.fn(() => ({ name: 'cortex' })) };
+    const failure = Object.assign(new Error('Tool execution checkpoint could not be committed'), { code: 'TOOL_CHECKPOINT_FAILED', retryable: false });
+    const executeTurn = vi.fn(async () => { throw failure; });
+    await expect(agent.executeTurnWithFallback(executeTurn, 'DeepSeek-V4-Flash', { name: 'cortex' }, true,
+      {}, { id: 'inbound', threadId: 'thread', source: 'user' }, {})).rejects.toBe(failure);
+    expect(executeTurn).toHaveBeenCalledOnce();
+    expect(agent.providerReg.resolve).not.toHaveBeenCalled();
+  });
   // RETIRED 2026-08-06 (operator: "completely remove the concept of model
   // fallbacks ... only one agent-model is allowed"). These two cases used to
   // pin env ACCEPTANCE — legacy-vs-canonical precedence. Both env names are now
@@ -167,14 +181,18 @@ describe('AgentProcess fallback pin alignment', () => {
     expect(agent.provider).toBe(grokProvider);
   });
 
-  it('forces the Pulse alert inbox before the task queue on a Cortex heartbeat', async () => {
+  it('forces the combined Pulse inbox on a Cortex heartbeat', async () => {
     const agent = makeHarness();
     agent.toolDefs = [{
+      name: 'mcp__shizuha-pulse__pulse_get_my_work',
+      description: 'Get alerts and tasks in one snapshot',
+      inputSchema: { type: 'object', properties: {} },
+    }, {
       name: 'mcp__shizuha-pulse__pulse_get_my_alerts',
       description: 'Get the current agent alert inbox',
       inputSchema: { type: 'object', properties: {} },
     }];
-    const executeTurn = vi.fn(async (...args: any[]) => args[20]);
+    const executeTurn = vi.fn(async (...args: any[]) => ({ toolChoice: args[20] }));
 
     const choice = await agent.executeTurnWithFallback(
       executeTurn,
@@ -182,15 +200,15 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'cortex' },
       false,
       {},
-      { source: 'heartbeat' },
+      { id: 'inbound', threadId: 'thread', source: 'heartbeat' },
       {},
       true,
     );
 
-    expect(choice).toEqual({
+    expect(choice).toMatchObject({ toolChoice: {
       type: 'function',
-      function: { name: 'mcp__shizuha-pulse__pulse_get_my_alerts' },
-    });
+      function: { name: 'mcp__shizuha-pulse__pulse_get_my_work' },
+    } });
   });
 
   it('keeps non-Cortex turns on automatic tool selection', async () => {
@@ -200,7 +218,7 @@ describe('AgentProcess fallback pin alignment', () => {
       description: 'Get the current agent queue',
       inputSchema: { type: 'object', properties: {} },
     }];
-    const executeTurn = vi.fn(async (...args: any[]) => args[20]);
+    const executeTurn = vi.fn(async (...args: any[]) => ({ toolChoice: args[20] }));
 
     const choice = await agent.executeTurnWithFallback(
       executeTurn,
@@ -208,12 +226,12 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'codex' },
       false,
       {},
-      { source: 'heartbeat' },
+      { id: 'inbound', threadId: 'thread', source: 'heartbeat' },
       {},
       true,
     );
 
-    expect(choice).toBeUndefined();
+    expect(choice).toMatchObject({ toolChoice: undefined });
   });
 
   it('forwards the one-shot post-compaction tag to the provider turn', async () => {
@@ -226,7 +244,7 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'cortex' },
       false,
       {},
-      { source: 'user' },
+      { id: 'inbound', threadId: 'thread', source: 'user' },
       {},
       false,
       'post_compaction',
@@ -251,7 +269,7 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'cortex' },
       false,
       {},
-      { source: 'user' },
+      { id: 'inbound', threadId: 'thread', source: 'user' },
       {},
       false,
       undefined,
@@ -284,7 +302,7 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'cortex' },
       true,
       {},
-      { source: 'user', threadId: 'thread' },
+      { id: 'inbound', source: 'user', threadId: 'thread' },
       { sendEvent: vi.fn() },
       false,
       undefined,
@@ -324,7 +342,7 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'cortex' },
       true,
       {},
-      { source: 'user', threadId: 'thread' },
+      { id: 'inbound', source: 'user', threadId: 'thread' },
       { sendEvent },
     )).rejects.toThrow('Provider upstream stream failed');
 
@@ -359,7 +377,7 @@ describe('AgentProcess fallback pin alignment', () => {
       agent.provider,
       true,
       {},
-      { source: 'user', threadId: 'thread-default-cap' },
+      { id: 'inbound', source: 'user', threadId: 'thread-default-cap' },
       { sendEvent: vi.fn() },
     )).rejects.toThrow('Provider upstream stream failed');
 
@@ -401,9 +419,9 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'cortex' },
       true,
       {},
-      { source: 'user', threadId: 'thread' },
+      { id: 'inbound', source: 'user', threadId: 'thread' },
       { sendEvent: vi.fn() },
-    )).resolves.toEqual({ ok: true });
+    )).resolves.toMatchObject({ ok: true });
 
     expect(executeTurn.mock.calls.map((call) => call[2])).toEqual([
       'grok-4.5',
@@ -464,9 +482,9 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'cortex' },
       true,
       {},
-      { source: 'user', threadId: 'thread' },
+      { id: 'inbound', source: 'user', threadId: 'thread' },
       { sendEvent: vi.fn() },
-    )).resolves.toEqual({ ok: true });
+    )).resolves.toMatchObject({ ok: true });
 
     expect(executeTurn.mock.calls.map((call) => call[2])).toEqual([
       'grok-4.5',
@@ -515,9 +533,9 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'cortex' },
       true,
       {},
-      { source: 'user', threadId: 'thread' },
+      { id: 'inbound', source: 'user', threadId: 'thread' },
       { sendEvent: vi.fn() },
-    )).resolves.toEqual({ ok: true });
+    )).resolves.toMatchObject({ ok: true });
 
     expect(warmModels).toEqual(['DeepSeek-V4-Flash', 'DeepSeek-V4-Flash']);
     expect(executeTurn.mock.calls.map((call) => call[2])).toEqual([
@@ -551,9 +569,9 @@ describe('AgentProcess fallback pin alignment', () => {
       { name: 'cortex' },
       true,
       {},
-      { source: 'user', threadId: 'thread' },
+      { id: 'inbound', source: 'user', threadId: 'thread' },
       { sendEvent: vi.fn() },
-    )).resolves.toEqual({ ok: true });
+    )).resolves.toMatchObject({ ok: true });
 
     expect(executeTurn.mock.calls.map((call) => call[2])).toEqual([
       'grok-4.5',

@@ -13,6 +13,7 @@ import Database from 'better-sqlite3';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { pinPreparedStatements } from '../../shared/sqlite-statement-cache.js';
 
 export interface User {
   id: number;
@@ -86,6 +87,7 @@ export class ConnectStore {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 
     this.db = new Database(dbPath);
+    pinPreparedStatements(this.db);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('synchronous = NORMAL');

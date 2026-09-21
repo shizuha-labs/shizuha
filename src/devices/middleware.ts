@@ -11,6 +11,7 @@ const PUBLIC_PATHS = new Set([
   '/health',
   '/manifest.json',
   '/sw.js',
+  '/v1/voice/s2s',
 ]);
 
 // Paths that only need to be accessible for pairing

@@ -21,6 +21,9 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
+    // SCLI-601: sanitize ambient agent-pod env so the suite is deterministic
+    // regardless of the runner (agent shell vs clean CI Job).
+    setupFiles: ['tests/setup.ts'],
     // Shared workstations/runners expose far more CPUs than the SQLite- and
     // subprocess-heavy suite can use efficiently. Unbounded file workers starve
     // healthy tests past their 30s timeout. Keep every invocation (npm test,

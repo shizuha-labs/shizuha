@@ -18,6 +18,11 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    proxy: {
+      '/v1': 'http://127.0.0.1:8016',
+      '/health': 'http://127.0.0.1:8016',
+      '/ws': { target: 'ws://127.0.0.1:8016', ws: true },
+    },
   },
   // Prevent vite from obscuring rust errors
   clearScreen: false,

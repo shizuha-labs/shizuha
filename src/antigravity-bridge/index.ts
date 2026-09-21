@@ -24,6 +24,7 @@ import cors from '@fastify/cors';
 // @ts-ignore — ws has no declaration file
 import { WebSocketServer, WebSocket } from 'ws';
 import { resolveBrowserMcpServer } from '../browser-mcp.js';
+import { StateStore } from '../state/store.js';
 import {
   brokerExpected,
   fetchBrokerModelToken,
@@ -183,6 +184,7 @@ export class AntigravityBridge {
   private initialized = false;
   private agyPath = '';
   private directConversationId = '';
+  private store: StateStore;
 
   private streamingThreadId: string | null = null;
   private streamingContent = '';
@@ -229,6 +231,11 @@ export class AntigravityBridge {
 
   constructor(private opts: AntigravityBridgeOptions) {
     this.sessionId = `antigravity-bridge-${opts.agentId ?? 'default'}`;
+    // PLAT-8787: durable inbound-processing acks live in the bridge state DB
+    // (same pattern as .claude-state.db / .codex-state.db siblings).
+    this.store = new StateStore(
+      path.join(this.opts.cwd ?? process.cwd(), '.antigravity-state.db'),
+    );
   }
 
   async start(): Promise<void> {
@@ -265,6 +272,10 @@ export class AntigravityBridge {
       const { ConnectClient } = await import('../connect-client/index.js');
       this.connectClient = new ConnectClient({
         onOpen: () => this.emitTelemetry(),
+        // PLAT-8787: re-ack the durably-completed inbound backlog on every
+        // reconnect — a turn-end ack lost to a dying socket otherwise
+        // guarantees a byte-identical replay re-delivery next reconnect.
+        completedInboundMessageIds: () => this.store.completedInboundMessageIds(),
         onMessage: (convId, content, _senderId, senderName, messageId) => {
           const queued: QueuedMessage = {
             clientId: `connect:${convId}`,

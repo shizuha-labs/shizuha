@@ -39,6 +39,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { ResultSchema, type ServerCapabilities, type Implementation } from '@modelcontextprotocol/sdk/types.js';
 import { buildUpstreamHeaders } from '../mcp-proxy/server.js';
+import {
+  ProjectionAuthority,
+  fetchBrokerProjection,
+  loadPinnedMcpProjectionKeyring,
+  type ProjectionAuthoritySnapshot,
+} from './projection.js';
 
 // ── Types ──
 
@@ -56,6 +62,107 @@ export interface MultiplexerConfig {
   services: UpstreamServiceConfig[];
   /** Interval for liveness probes (ms). 0 = disabled. */
   livenessIntervalMs: number;
+  /** Agent/workload audience signed into the Hive projection. */
+  agentAudience: string;
+  /** Test seam only. Production always constructs the pinned broker authority. */
+  projectionAuthority?: Pick<ProjectionAuthority, 'start' | 'stop' | 'snapshot' | 'isAllowed'>;
+  /** Test seam for exact built-artifact dispatch regressions. */
+  upstreamFactory?: (config: UpstreamServiceConfig, authorize: (service: string) => boolean) => UpstreamConnection;
+}
+
+/**
+ * Validate a parsed `--services` array and `--liveness-interval` value before
+ * any connection is opened or startup is announced (SCLI-401).
+ *
+ * Returns the normalized config on success, or a bounded, field/index-specific
+ * diagnostic. Every failure message contains no raw stack, no absolute bundle
+ * path, no retry/success wording, and identifies the exact offending entry so
+ * callers can exit nonzero promptly.
+ */
+export function validateMcpMultiplexerConfig(
+  rawServices: unknown,
+  rawLivenessIntervalMs: unknown,
+): { ok: true; config: Pick<MultiplexerConfig, 'services' | 'livenessIntervalMs'> } | { ok: false; error: string } {
+  if (!Array.isArray(rawServices)) {
+    return { ok: false, error: 'mcp-multiplexer: --services must be a JSON array of service objects' };
+  }
+  if (rawServices.length === 0) {
+    return { ok: false, error: 'mcp-multiplexer: at least one upstream service is required' };
+  }
+
+  const services: UpstreamServiceConfig[] = [];
+  const seenNames = new Set<string>();
+  for (let i = 0; i < rawServices.length; i++) {
+    const entry = rawServices[i];
+    const label = `service[${i}]`;
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      return { ok: false, error: `mcp-multiplexer: ${label} must be an object` };
+    }
+    const obj = entry as Record<string, unknown>;
+
+    // name: non-empty, unique, printable string (no control chars / newlines).
+    const name = obj.name;
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      return { ok: false, error: `mcp-multiplexer: ${label}.name must be a non-empty string` };
+    }
+    if (name !== name.trim() || /[\x00-\x1f\x7f]/.test(name)) {
+      return {
+        ok: false,
+        error: `mcp-multiplexer: ${label}.name must not contain leading/trailing whitespace or control characters`,
+      };
+    }
+    if (seenNames.has(name)) {
+      return { ok: false, error: `mcp-multiplexer: ${label}.name must be unique (duplicate '${name}')` };
+    }
+    seenNames.add(name);
+
+    // url: absolute HTTP(S), no userinfo.
+    const url = obj.url;
+    if (typeof url !== 'string' || url.trim().length === 0) {
+      return { ok: false, error: `mcp-multiplexer: ${label}.url must be a non-empty string` };
+    }
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      return { ok: false, error: `mcp-multiplexer: ${label}.url must be an absolute URL` };
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      return { ok: false, error: `mcp-multiplexer: ${label}.url must use http:// or https://` };
+    }
+    if (parsedUrl.username || parsedUrl.password) {
+      return { ok: false, error: `mcp-multiplexer: ${label}.url must not contain userinfo` };
+    }
+
+    // headers: optional object of string-to-string.
+    let headers: Record<string, string> = {};
+    if (obj.headers !== undefined && obj.headers !== null) {
+      if (typeof obj.headers !== 'object' || Array.isArray(obj.headers)) {
+        return { ok: false, error: `mcp-multiplexer: ${label}.headers must be an object of string-to-string` };
+      }
+      for (const [key, value] of Object.entries(obj.headers as Record<string, unknown>)) {
+        if (typeof value !== 'string') {
+          return { ok: false, error: `mcp-multiplexer: ${label}.headers['${key}'] must be a string` };
+        }
+      }
+      headers = obj.headers as Record<string, string>;
+    }
+
+    services.push({ name, url, headers });
+  }
+
+  // liveness interval: finite positive integer (reject 0/negative/decimal/NaN/
+  // overflow — the old `parseInt(...) || 30000` coerced these into a live timer).
+  const livenessStr = String(rawLivenessIntervalMs ?? '').trim();
+  if (!/^[1-9][0-9]*$/.test(livenessStr)) {
+    return { ok: false, error: 'mcp-multiplexer: --liveness-interval must be a finite positive integer' };
+  }
+  const livenessIntervalMs = Number(livenessStr);
+  if (!Number.isSafeInteger(livenessIntervalMs) || livenessIntervalMs <= 0) {
+    return { ok: false, error: 'mcp-multiplexer: --liveness-interval must be a finite positive integer' };
+  }
+
+  return { ok: true, config: { services, livenessIntervalMs } };
 }
 
 // ── Constants ──
@@ -112,8 +219,9 @@ export async function settleWithin<T>(
 export async function buildMultiplexerUpstreamHeaders(
   configuredHeaders: Record<string, string>,
   env: NodeJS.ProcessEnv = process.env,
+  bearerResolver?: (env: NodeJS.ProcessEnv) => Promise<string>,
 ): Promise<Record<string, string>> {
-  return buildUpstreamHeaders(configuredHeaders, env);
+  return buildUpstreamHeaders(configuredHeaders, env, bearerResolver);
 }
 
 // ── Logging ──
@@ -213,6 +321,8 @@ export class UpstreamConnection {
   constructor(
     readonly config: UpstreamServiceConfig,
     private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly authorizeDispatch: (service: string) => boolean = () => true,
+    private readonly bearerResolver?: (env: NodeJS.ProcessEnv) => Promise<string>,
   ) {}
 
   get connected(): boolean { return this._connected; }
@@ -225,6 +335,10 @@ export class UpstreamConnection {
     if (this.livenessTimer || intervalMs <= 0) return;
     const tick = async (): Promise<void> => {
       if (this.livenessInFlight || !this.client || this.activeForwardRequests > 0) return;
+      if (!this.authorizeDispatch(this.config.name)) {
+        await this.invalidate().catch(() => {});
+        return;
+      }
       this.livenessInFlight = true;
       this.metrics.livenessProbeCount++;
       try {
@@ -262,6 +376,7 @@ export class UpstreamConnection {
 
   /** Ensure a live upstream client. Dedups concurrent callers. */
   async ensure(): Promise<Client> {
+    if (!this.authorizeDispatch(this.config.name)) throw scopeDenied(this.config.name);
     if (this.client) return this.client;
     if (this.connecting) return this.connecting;
     this.connecting = this.connectWithRetry();
@@ -292,9 +407,19 @@ export class UpstreamConnection {
   private async connectWithRetry(): Promise<Client> {
     let attempt = 0;
     for (;;) {
+      if (!this.authorizeDispatch(this.config.name)) throw scopeDenied(this.config.name);
       try {
-        return await this.connectOnce();
+        const client = await this.connectOnce();
+        // Projection expiry/revocation may race the transport handshake. Never
+        // publish a freshly connected client unless the same admission boundary
+        // still authorizes it; close it before returning to the caller.
+        if (!this.authorizeDispatch(this.config.name)) {
+          await this.invalidate();
+          throw scopeDenied(this.config.name);
+        }
+        return client;
       } catch (err) {
+        if (!this.authorizeDispatch(this.config.name)) throw scopeDenied(this.config.name);
         attempt++;
         const base = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1), RECONNECT_MAX_DELAY_MS);
         const jitter = base * 0.25 * (2 * Math.random() - 1);
@@ -314,6 +439,7 @@ export class UpstreamConnection {
     const headers = await buildMultiplexerUpstreamHeaders(
       this.config.headers,
       this.env,
+      this.bearerResolver,
     );
     const transport = new StreamableHTTPClientTransport(new URL(this.config.url), {
       requestInit: { headers },
@@ -345,7 +471,9 @@ export class UpstreamConnection {
     this.activeForwardRequests++;
     try {
       for (let attempt = 0; ; attempt++) {
+        if (!this.authorizeDispatch(this.config.name)) throw scopeDenied(this.config.name);
         const client = await this.ensureWithin();
+        if (!this.authorizeDispatch(this.config.name)) throw scopeDenied(this.config.name);
         const genAtCall = this.generation;
         try {
           return await client.request(req, ResultSchema, { timeout: UPSTREAM_REQUEST_TIMEOUT_MS });
@@ -376,7 +504,7 @@ export class UpstreamConnection {
 
   /** Best-effort background warm-up. */
   warm(): void {
-    this.ensure().catch(() => {});
+    if (this.authorizeDispatch(this.config.name)) this.ensure().catch(() => {});
   }
 
   /** Clean up resources. */
@@ -450,20 +578,96 @@ function sendError(id: string | number, code: number, message: string, data?: un
 }
 
 const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
+const MCP_METRICS_TOOL_NAME = '__mcp_metrics';
+const SCOPE_DENIED_CODE = -32003;
+
+function scopeDenied(service: string): Error & { code: number; data: Record<string, string> } {
+  return Object.assign(new Error(`MCP service "${service}" is outside the verified Hive projection`), {
+    code: SCOPE_DENIED_CODE,
+    data: { code: 'scope_denied', service },
+  });
+}
+
+function projectionMetrics(snapshot: ProjectionAuthoritySnapshot): Record<string, unknown> {
+  const claims = snapshot.verified?.claims;
+  return {
+    state: snapshot.state,
+    reason: snapshot.reason,
+    ...(claims ? {
+      schemaVersion: claims.schema_version,
+      generation: claims.generation,
+      issuedAt: claims.issued_at,
+      expiresAt: claims.expires_at,
+      leaseDeadline: claims.lease_deadline,
+      catalogVersion: claims.catalog_version,
+      fingerprint: claims.fingerprint,
+      kid: claims.kid,
+      allowedServices: claims.mcp_services,
+      monoDeadline: snapshot.verified?.monoDeadlineMs,
+      sSlowMs: snapshot.verified?.sSlowMs,
+    } : {}),
+  };
+}
 
 export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void> {
+  if (!config.agentAudience.trim()) throw new Error('mcp projection agent audience is required');
+  let authority: Pick<ProjectionAuthority, 'start' | 'stop' | 'snapshot' | 'isAllowed'>;
+  try {
+    authority = config.projectionAuthority ?? new ProjectionAuthority({
+      agentAudience: config.agentAudience,
+      pinnedKeyringJson: loadPinnedMcpProjectionKeyring(),
+      fetchEnvelope: (nonce) => fetchBrokerProjection(nonce),
+    });
+  } catch (err) {
+    log(`projection authority unavailable: ${(err as Error).message}`);
+    authority = {
+      async start() {}, stop() {}, isAllowed: () => false,
+      snapshot: () => ({ state: 'fenced', reason: 'pinned_trust_unavailable', verified: null }),
+    };
+  }
+  // Projection verification precedes construction, warm-up, liveness, and every
+  // other upstream surface. A missing/refused/invalid response leaves zero dials.
+  try {
+    await authority.start();
+  } catch (err) {
+    // Keep the stdio transport alive with an empty authority surface. A broker
+    // refusal is an authorization result, not permission to crash-loop and let
+    // a caller fall back to some broader MCP configuration.
+    log(`projection authority fenced at startup: ${(err as Error).message}`);
+  }
   const upstreams = new Map<string, UpstreamConnection>();
   for (const svc of config.services) {
-    upstreams.set(svc.name, new UpstreamConnection(svc));
+    const authorize = (service: string) => authority.isAllowed(service);
+    upstreams.set(svc.name, config.upstreamFactory?.(svc, authorize)
+      ?? new UpstreamConnection(svc, process.env, authorize));
   }
 
   log(`starting mcp-multiplexer for ${config.services.length} services: ${config.services.map(s => s.name).join(', ')}`);
 
   // Start liveness probes for all upstreams
   const livenessMs = config.livenessIntervalMs > 0 ? config.livenessIntervalMs : DEFAULT_LIVENESS_INTERVAL_MS;
-  for (const [name, upstream] of upstreams) {
+  for (const [, upstream] of upstreams) {
     upstream.warm();
     upstream.startLiveness(livenessMs);
+  }
+
+  function authoritySnapshot(): ProjectionAuthoritySnapshot {
+    return authority.snapshot();
+  }
+
+  function allowedEntries(snapshot = authoritySnapshot()): Array<[string, UpstreamConnection]> {
+    const allowed = snapshot.state === 'verified' ? snapshot.verified?.allowedServices : null;
+    return allowed ? [...upstreams].filter(([name]) => allowed.has(name)) : [];
+  }
+
+  function allowedUpstream(service: string): UpstreamConnection | null {
+    if (!authority.isAllowed(service)) return null;
+    return upstreams.get(service) ?? null;
+  }
+
+  function denyScope(id: string | number, service: string): void {
+    const err = scopeDenied(service);
+    sendError(id, err.code, err.message, err.data);
   }
 
   async function handleRequest(msg: JsonRpcMessage): Promise<void> {
@@ -476,13 +680,12 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
       // Warm all upstreams in parallel, but never let one infinite reconnect
       // inherit into the stdio handshake. Timed-out upstreams continue warming
       // in the background and join later list/call requests once healthy.
-      await Promise.allSettled(
-        [...upstreams.values()].map(u => u.ensureWithin()),
-      );
+      const initSnapshot = authoritySnapshot();
+      await Promise.allSettled(allowedEntries(initSnapshot).map(([, u]) => u.ensureWithin()));
 
       // Aggregate capabilities: union of all upstream capabilities
       const aggregatedCaps: ServerCapabilities = {};
-      for (const [name, upstream] of upstreams) {
+      for (const [, upstream] of allowedEntries(initSnapshot)) {
         const caps = upstream.upstreamCapabilities;
         if (!caps) continue;
         if (caps.tools) aggregatedCaps.tools = caps.tools;
@@ -491,6 +694,7 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
         if (caps.logging) aggregatedCaps.logging = caps.logging;
         if (caps.experimental) aggregatedCaps.experimental = caps.experimental;
       }
+      aggregatedCaps.tools = aggregatedCaps.tools ?? {};
 
       const clientProtocol = (params as { protocolVersion?: string } | undefined)?.protocolVersion;
       sendResult(id, {
@@ -509,7 +713,8 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
 
     // ── tools/list: aggregate tools from all upstreams ──
     if (method === 'tools/list') {
-      const toolSets = await Promise.all([...upstreams].map(async ([name, upstream]) => {
+      const listSnapshot = authoritySnapshot();
+      const toolSets = await Promise.all(allowedEntries(listSnapshot).map(async ([name, upstream]) => {
         try {
           const client = await upstream.ensureWithin();
           const result = await client.request(
@@ -526,23 +731,50 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
           return [];
         }
       }));
-      sendResult(id, { tools: toolSets.flat() });
+      sendResult(id, { tools: [
+        ...toolSets.flat(),
+        {
+          name: MCP_METRICS_TOOL_NAME,
+          description: 'Multiplexer connection and signed Hive projection provenance',
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        },
+      ] });
       return;
     }
 
     // ── tools/call: route to the correct upstream ──
     if (method === 'tools/call') {
       const fullName = (params as { name?: string })?.name ?? '';
+      if (fullName === MCP_METRICS_TOOL_NAME) {
+        const metricsSnapshot = authoritySnapshot();
+        const metricsAllowedEntries = allowedEntries(metricsSnapshot);
+        const upstreamMetrics: Record<string, unknown> = {};
+        for (const [name, upstream] of metricsAllowedEntries) {
+          upstreamMetrics[name] = { connected: upstream.connected, ...upstream.metrics };
+        }
+        sendResult(id, {
+          content: [{ type: 'text', text: JSON.stringify({
+            upstreams: {
+              configured: upstreams.size,
+              allowed: metricsAllowedEntries.length,
+              details: upstreamMetrics,
+            },
+            projection: projectionMetrics(metricsSnapshot),
+          }) }],
+        });
+        return;
+      }
       const parsed = parseToolName(fullName);
       if (!parsed) {
         sendError(id, -32602, `Invalid tool name "${fullName}" — expected "{service}__{tool}" format`);
         return;
       }
-      const upstream = upstreams.get(parsed.service);
-      if (!upstream) {
+      if (!upstreams.has(parsed.service)) {
         sendError(id, -32602, `Unknown service "${parsed.service}" in tool name "${fullName}"`);
         return;
       }
+      const upstream = allowedUpstream(parsed.service);
+      if (!upstream) { denyScope(id, parsed.service); return; }
       try {
         const result = await upstream.forward('tools/call', {
           name: parsed.tool,
@@ -559,7 +791,8 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
 
     // ── resources/list: aggregate resources from all upstreams ──
     if (method === 'resources/list') {
-      const resourceSets = await Promise.all([...upstreams].map(async ([name, upstream]) => {
+      const resourceSnapshot = authoritySnapshot();
+      const resourceSets = await Promise.all(allowedEntries(resourceSnapshot).map(async ([name, upstream]) => {
         try {
           const client = await upstream.ensureWithin();
           const result = await client.request(
@@ -588,11 +821,12 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
         sendError(id, -32602, `Invalid resource URI "${uri}" — expected "{service}:..." format`);
         return;
       }
-      const upstream = upstreams.get(parsed.service);
-      if (!upstream) {
+      if (!upstreams.has(parsed.service)) {
         sendError(id, -32602, `Unknown service "${parsed.service}" in resource URI "${uri}"`);
         return;
       }
+      const upstream = allowedUpstream(parsed.service);
+      if (!upstream) { denyScope(id, parsed.service); return; }
       try {
         const result = await upstream.forward('resources/read', { uri: parsed.uri });
         sendResult(id, result);
@@ -610,7 +844,9 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
       const memUsage = process.memoryUsage();
       const upstreamMetrics: Record<string, unknown> = {};
       let connectedCount = 0;
-      for (const [name, upstream] of upstreams) {
+      const metricsSnapshot = authoritySnapshot();
+      const metricsAllowedEntries = allowedEntries(metricsSnapshot);
+      for (const [name, upstream] of metricsAllowedEntries) {
         if (upstream.connected) connectedCount++;
         upstreamMetrics[name] = {
           connected: upstream.connected,
@@ -633,17 +869,20 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
           memoryHeapTotal: memUsage.heapTotal,
         },
         upstreams: {
-          total: upstreams.size,
+          configured: upstreams.size,
+          allowed: metricsAllowedEntries.length,
           connected: connectedCount,
           details: upstreamMetrics,
         },
+        projection: projectionMetrics(metricsSnapshot),
       });
       return;
     }
 
     // ── prompts/list: aggregate from all upstreams ──
     if (method === 'prompts/list') {
-      const promptSets = await Promise.all([...upstreams].map(async ([, upstream]) => {
+      const promptSnapshot = authoritySnapshot();
+      const promptSets = await Promise.all(allowedEntries(promptSnapshot).map(async ([name, upstream]) => {
         try {
           const client = await upstream.ensureWithin();
           const result = await client.request(
@@ -651,7 +890,10 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
             ResultSchema,
             { timeout: 30_000 },
           ) as { prompts?: Array<Record<string, unknown>> };
-          return result.prompts ?? [];
+          return (result.prompts ?? []).map((prompt) => ({
+            ...prompt,
+            name: buildToolName(name, prompt.name as string),
+          }));
         } catch { return []; }
       }));
       sendResult(id, { prompts: promptSets.flat() });
@@ -666,11 +908,12 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
         sendError(id, -32602, `Invalid prompt name "${name}" — expected "{service}__{name}" format`);
         return;
       }
-      const upstream = upstreams.get(parsed.service);
-      if (!upstream) {
+      if (!upstreams.has(parsed.service)) {
         sendError(id, -32602, `Unknown service "${parsed.service}" in prompt name "${name}"`);
         return;
       }
+      const upstream = allowedUpstream(parsed.service);
+      if (!upstream) { denyScope(id, parsed.service); return; }
       try {
         const result = await upstream.forward('prompts/get', { ...params, name: parsed.tool });
         sendResult(id, result);
@@ -684,7 +927,8 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
 
     // ── Unknown method: try all upstreams (best-effort) ──
     // This handles methods like `logging/setLevel`, `completion/complete`, etc.
-    for (const [, upstream] of upstreams) {
+    const unknownSnapshot = authoritySnapshot();
+    for (const [, upstream] of allowedEntries(unknownSnapshot)) {
       try {
         const client = await upstream.ensureWithin();
         const result = await client.request(
@@ -705,7 +949,8 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
     const method = msg.method!;
     if (method === 'notifications/initialized') return;
     // Forward notifications to all upstreams best-effort
-    await Promise.allSettled([...upstreams.values()].map(async upstream => {
+    const notificationSnapshot = authoritySnapshot();
+    await Promise.allSettled(allowedEntries(notificationSnapshot).map(async ([, upstream]) => {
       try {
         const client = await upstream.ensureWithin();
         await (client as unknown as { notification: (n: unknown) => Promise<void> })
@@ -739,6 +984,8 @@ export async function runMcpMultiplexer(config: MultiplexerConfig): Promise<void
   });
 
   rl.on('close', () => {
+    authority.stop();
+    for (const upstream of upstreams.values()) void upstream.destroy();
     log('stdin closed — exiting');
     process.exit(0);
   });

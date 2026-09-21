@@ -7,7 +7,9 @@ import {
   OptionPreflightError,
   requireEnum,
   requireOptionalEnumNonEmpty,
+  requireOptionalModel,
   requirePort,
+  requireBindHost,
   requireNonNegativeInt,
   validateCommonAgentOptions,
   PERMISSION_MODES,
@@ -137,9 +139,84 @@ describe('channel modes + host + context-prompt-file (PLAT-5893 / SCLI-400)', ()
     expect(validateCommonAgentOptions({ host: '127.0.0.1' }).host).toBe('127.0.0.1');
   });
 
+  it('rejects path-like/URL-like/overlong/control host with bounded --host diagnostic (SCLI-555)', () => {
+    // Full 16-case matrix: every invalid form must throw OptionPreflightError
+    // naming --host with a bounded message (no raw stack / bundle path), and
+    // valid controls must pass through unchanged.
+    const valid = ['127.0.0.1', 'localhost', '0.0.0.0', '::1', '[::1]', '2001:db8::1', 'my-host.example.com'];
+    for (const h of valid) {
+      expect(validateCommonAgentOptions({ host: h }).host).toBe(h);
+    }
+
+    const invalid = [
+      '',                       // empty
+      '   ',                    // whitespace
+      '\t',                     // tab
+      '\n',                     // newline
+      'a\u0000b',               // control char
+      '../tmp/socket',          // path-like
+      '/tmp/socket',            // path-like (absolute)
+      'http://127.0.0.1',       // URL-like
+      'https://example.com',    // URL-like (scheme)
+      'x'.repeat(2048),         // overlong hostname
+      'bad host',               // embedded space
+      'host,other',             // out-of-charset
+      'under_score',            // out-of-charset
+    ];
+    for (const h of invalid) {
+      try {
+        validateCommonAgentOptions({ host: h });
+        expect.fail(`should reject host ${JSON.stringify(h)}`);
+      } catch (err) {
+        expect(err).toBeInstanceOf(OptionPreflightError);
+        const e = err as OptionPreflightError;
+        expect(e.field).toBe('host');
+        expect(e.message).toContain('--host');
+        expect(e.message).not.toMatch(/TypeError|ENOTFOUND|EADDRNOTAVAIL|\/opt\/|\n\s+at /i);
+      }
+    }
+  });
+
+  it('requireBindHost rejects path/URL/overlong and accepts host/IP forms (SCLI-555)', () => {
+    for (const good of ['127.0.0.1', 'localhost', '0.0.0.0', '::1', '[::1]', 'my-host.example.com']) {
+      expect(requireBindHost('host', good)).toBe(good);
+    }
+    for (const bad of ['../tmp/socket', 'http://127.0.0.1', 'x'.repeat(2048), 'a b', '']) {
+      expect(() => requireBindHost('host', bad)).toThrow(OptionPreflightError);
+    }
+  });
+
   it('rejects explicit-empty/non-regular context-prompt-file without FIFO hang', () => {
     expect(() => validateCommonAgentOptions({ contextPromptFile: '' })).toThrow(OptionPreflightError);
     expect(() => validateCommonAgentOptions({ contextPromptFile: '/no/such/file' })).toThrow(OptionPreflightError);
+  });
+});
+
+describe('inline --context-prompt fail-closed (SCLI-547)', () => {
+  it('accepts a valid printable single-line context prompt', () => {
+    const v = validateCommonAgentOptions({ contextPrompt: 'You are a helpful assistant.' });
+    expect(v.contextPrompt).toBe('You are a helpful assistant.');
+  });
+
+  it('rejects explicit-empty and blank/whitespace-only values', () => {
+    for (const bad of ['', '   ', '\t', '\n']) {
+      expect(() => validateCommonAgentOptions({ contextPrompt: bad })).toThrow(OptionPreflightError);
+    }
+  });
+
+  it('rejects control-bearing values (embedded LF, TAB, ANSI escape)', () => {
+    for (const bad of ['line1\nline2', 'a\tb', '\u001b[31mred\u001b[0m', 'a\u0007b']) {
+      expect(() => validateCommonAgentOptions({ contextPrompt: bad })).toThrow(OptionPreflightError);
+    }
+  });
+
+  it('rejects over-limit values (>4096 chars)', () => {
+    expect(() => validateCommonAgentOptions({ contextPrompt: 'x'.repeat(4097) })).toThrow(OptionPreflightError);
+    expect(validateCommonAgentOptions({ contextPrompt: 'x'.repeat(4096) }).contextPrompt).toHaveLength(4096);
+  });
+
+  it('omitted context-prompt stays optional', () => {
+    expect(validateCommonAgentOptions({}).contextPrompt).toBeUndefined();
   });
 });
 
@@ -187,6 +264,34 @@ describe('exec --toolset fail-closed (PLAT-5893 / SCLI-178 exec-toolset)', () =>
   it('omitted toolset stays optional (undefined, NOT full expansion)', () => {
     expect(validateCommonAgentOptions({}).toolset).toBeUndefined();
     expect(validateCommonAgentOptions({ toolset: undefined }).toolset).toBeUndefined();
+  });
+});
+
+describe('requireOptionalEnumNonEmpty direct helper (SCLI-418 resume --mode)', () => {
+  it('accepts a valid mode when present', () => {
+    expect(requireOptionalEnumNonEmpty('mode', 'plan', PERMISSION_MODES)).toBe('plan');
+    expect(requireOptionalEnumNonEmpty('mode', 'autonomous', PERMISSION_MODES)).toBe('autonomous');
+    expect(requireOptionalEnumNonEmpty('mode', 'supervised', PERMISSION_MODES)).toBe('supervised');
+  });
+
+  it('returns undefined when absent/null (optional)', () => {
+    expect(requireOptionalEnumNonEmpty('mode', undefined, PERMISSION_MODES)).toBeUndefined();
+    expect(requireOptionalEnumNonEmpty('mode', null, PERMISSION_MODES)).toBeUndefined();
+  });
+
+  it('rejects explicit-empty / whitespace / out-of-domain (SCLI-178 QA shapes)', () => {
+    for (const bad of ['', '   ', 'synthetic-mode', 'PLAN', 'Supervised', 'nope']) {
+      try {
+        requireOptionalEnumNonEmpty('mode', bad, PERMISSION_MODES);
+        expect.fail(`should reject mode ${JSON.stringify(bad)}`);
+      } catch (err) {
+        expect(err).toBeInstanceOf(OptionPreflightError);
+        const e = err as OptionPreflightError;
+        expect(e.field).toBe('mode');
+        expect(e.message).toContain('expected one of');
+        expect(e.message).not.toMatch(/TypeError|stack/i);
+      }
+    }
   });
 });
 
@@ -247,5 +352,52 @@ describe('bridge --cwd preflight (SCLI-493 / SCLI-529)', () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('requireOptionalModel (SCLI-564)', () => {
+  it('returns undefined when absent', () => {
+    expect(requireOptionalModel('model', undefined)).toBeUndefined();
+    expect(requireOptionalModel('model', null)).toBeUndefined();
+  });
+
+  it('accepts a valid canonical model selector', () => {
+    expect(requireOptionalModel('model', 'claude-opus-4-7')).toBe('claude-opus-4-7');
+    expect(requireOptionalModel('model', 'gemini-3.6-flash-high')).toBe('gemini-3.6-flash-high');
+  });
+
+  it('rejects explicit-empty and whitespace-only values', () => {
+    for (const bad of ['', ' ', '\t']) {
+      expect(() => requireOptionalModel('model', bad)).toThrowError(/non-empty model selector/);
+    }
+  });
+
+  it('rejects control/whitespace-bearing values without echoing raw bytes', () => {
+    for (const bad of ['a b', 'a\tb', 'a\nb', '\u001b[31mred\u001b[0m', 'a\u2003b']) {
+      let caught: Error | undefined;
+      try {
+        requireOptionalModel('model', bad);
+      } catch (err) {
+        caught = err as Error;
+      }
+      expect(caught).toBeDefined();
+      expect(caught!.message).toMatch(/whitespace or control characters/);
+      // The diagnostic must not reflect the raw control bytes.
+      expect(caught!.message).not.toContain('\u001b');
+      expect(caught!.message).not.toContain('\t');
+    }
+  });
+
+  it('rejects over-limit values', () => {
+    const long = 'x'.repeat(2049);
+    expect(() => requireOptionalModel('model', long)).toThrowError(/exceeds 2048 characters/);
+    expect(requireOptionalModel('model', 'x'.repeat(2048))).toBe('x'.repeat(2048));
+  });
+
+  it('validateCommonAgentOptions rejects invalid model before side effects', () => {
+    expect(() => validateCommonAgentOptions({ model: '' })).toThrowError(/non-empty model selector/);
+    expect(() => validateCommonAgentOptions({ model: 'a\nb' })).toThrowError(/whitespace or control/);
+    expect(() => validateCommonAgentOptions({ model: 'x'.repeat(2049) })).toThrowError(/exceeds 2048/);
+    expect(validateCommonAgentOptions({ model: 'claude-opus-4-7' }).model).toBe('claude-opus-4-7');
   });
 });

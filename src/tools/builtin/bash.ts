@@ -6,8 +6,38 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ToolHandler, ToolContext, ToolResult } from '../types.js';
 import { buildSandboxedSpawn } from '../../sandbox/index.js';
+import { evaluateCortexKubectlGuardrail } from '../../safety/cortex-kubectl-guardrail.js';
 
 const MAX_OUTPUT = 30000; // 30K chars max output
+
+/**
+ * SCLI-619 — foreground→background demotion.
+ *
+ * A foreground `bash` tool call blocks the agent loop (and the TUI) until the
+ * command exits. Grok Build lets the user press Ctrl+B to demote that running
+ * foreground command to the background: it keeps running, gets a task ID, and
+ * its output continues to accumulate in the BackgroundTaskRegistry.
+ *
+ * The bash tool registers the currently-running foreground command in a
+ * module-level handle; the TUI calls `demoteForegroundBash()` on Ctrl+B. Only
+ * one foreground bash can be running per process, so a single slot is safe.
+ */
+interface ForegroundBashHandle {
+  /** Detach the running command into a background task. Returns the task ID,
+   *  or null when there is nothing to demote (already resolved/aborted). */
+  demote: () => string | null;
+}
+
+let activeForegroundBash: ForegroundBashHandle | null = null;
+
+/**
+ * Demote the currently-running foreground bash command to the background.
+ * Returns the new background task ID, or null when no foreground command is
+ * running (or it cannot be demoted). Used by the TUI Ctrl+B keybinding.
+ */
+export function demoteForegroundBash(): string | null {
+  return activeForegroundBash?.demote() ?? null;
+}
 
 // Persistent working directory per session — makes `cd` behave like a real
 // terminal across separate bash tool calls (Claude Code / Codex keep a live
@@ -142,9 +172,23 @@ export const bashTool: ToolHandler = {
     const { command, timeout, run_in_background } = this.parameters.parse(params);
     const timeoutMs = timeout ?? DEFAULT_TIMEOUT;
 
+    // Cortex model-serving guardrail (PLAT-5392): refuse mutating kubectl
+    // against the ai-models namespace from the agent bash tool unless a
+    // break-glass approval marker is present in the trusted runtime env.
+    const cortexGuardrail = evaluateCortexKubectlGuardrail(command);
+    if (!cortexGuardrail.allowed) {
+      return {
+        toolUseId: '',
+        content: cortexGuardrail.message,
+        isError: true,
+        metadata: { cortexGuardrail: { blocked: true, reasons: cortexGuardrail.reasons } },
+      };
+    }
+    const cortexBreakGlass = cortexGuardrail.breakGlass;
+
     // Background execution — fire and forget
     if (run_in_background && context.taskRegistry) {
-      return launchBackgroundBash(command, timeoutMs, context);
+      return launchBackgroundBash(command, timeoutMs, context, cortexBreakGlass);
     }
 
     // Resolve the persistent cwd for this session (falls back to the agent cwd).
@@ -171,6 +215,8 @@ export const bashTool: ToolHandler = {
       let timedOut = false;
       let aborted = false;
       let resolved = false;
+      let demoted = false;
+      let demotedTaskId: string | null = null;
       let finalCwd = effectiveCwd; // updated from the wrapper-captured PWD
       const persistCwd = () => {
         if (!cwdFile || !sid) return;
@@ -190,6 +236,37 @@ export const bashTool: ToolHandler = {
           resolve(result);
         }
       };
+
+      // SCLI-619: foreground→background demotion handle. Registered while the
+      // command runs so the TUI's Ctrl+B can detach it into a background task.
+      const demoteHandle: ForegroundBashHandle = {
+        demote: () => {
+          if (resolved || demoted || !context.taskRegistry) return null;
+          demoted = true;
+          const registry = context.taskRegistry;
+          const desc = command.length > 80 ? command.slice(0, 77) + '...' : command;
+          const task = registry.create('bash', desc);
+          demotedTaskId = task.id;
+          task.pid = proc.pid;
+          // Detach from the turn's abort signal so a later Ctrl+C / queued
+          // message no longer kills the demoted command.
+          if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+          // The foreground timeout no longer applies — the demoted task runs
+          // until it exits (killable via TaskStop).
+          clearTimeout(timeoutTimer);
+          // Carry already-collected output into the registry so nothing is lost.
+          if (stdout) registry.appendOutput(task.id, stdout);
+          if (stderr) registry.appendOutput(task.id, stderr);
+          safeResolve({
+            toolUseId: '',
+            content: `[Demoted to background task ${task.id}] The command continues running in the background. ` +
+              `Use TaskOutput(task_id="${task.id}") to read its output and TaskStop(task_id="${task.id}") to kill it.`,
+            isError: false,
+          });
+          return task.id;
+        },
+      };
+      activeForegroundBash = demoteHandle;
 
       // Apply OS-level sandbox if configured
       const baseEnv = bashChildEnvironment();
@@ -246,6 +323,10 @@ export const bashTool: ToolHandler = {
       const PROGRESS_INTERVAL_MS = 500;
 
       proc.stdout.on('data', (data: Buffer) => {
+        if (demoted && demotedTaskId && context.taskRegistry) {
+          context.taskRegistry.appendOutput(demotedTaskId, data.toString());
+          return;
+        }
         stdout += data.toString();
         if (stdout.length > MAX_OUTPUT) {
           killProcessGroup(proc);
@@ -264,6 +345,10 @@ export const bashTool: ToolHandler = {
       });
 
       proc.stderr.on('data', (data: Buffer) => {
+        if (demoted && demotedTaskId && context.taskRegistry) {
+          context.taskRegistry.appendOutput(demotedTaskId, data.toString());
+          return;
+        }
         stderr += data.toString();
         if (stderr.length > MAX_OUTPUT) {
           killProcessGroup(proc);
@@ -273,8 +358,86 @@ export const bashTool: ToolHandler = {
 
       proc.on('close', (code, signal) => {
         clearTimeout(timeoutTimer);
+        onStdioSettled('close', code, signal);
+      });
+
+      // SCLI-6xx (operator 2026-09-18): settle on process EXIT with a bounded
+      // stdio drain — never on an unbounded 'close'. Node's 'close' waits for
+      // ALL stdio streams to end; a detached grandchild that inherited the
+      // pipes (e.g. `gcloud auth login` relaunched detached inside the tool
+      // call) keeps them open for hours after the command itself finished,
+      // and the turn wedges on a tool that already completed (operator saw
+      // `Running bash · 78m` with no process alive). grok-build-style
+      // harnesses bound this the same way: the process handle owns the
+      // pipes, and the tool result settles when the COMMAND is done, not
+      // when unrelated pipe-holders die.
+      const DRAIN_GRACE_MS = Math.max(
+        1000,
+        Number(process.env.SCLI_BASH_DRAIN_GRACE_MS ?? 5000),
+      );
+      let exited = false;
+      let exitCode: number | null = null;
+      let exitSignal: NodeJS.Signals | null = null;
+      let drainTimer: NodeJS.Timeout | null = null;
+      const stdioOpen = new Set<string>(['stdout', 'stderr']);
+      const settleOnExit = () => {
+        if (!exited || resolved) return;
+        if (stdioOpen.size > 0 && drainTimer === null) {
+          // Direct child is dead but pipes are still held by a detached
+          // grandchild. Give it a short grace window to finish streaming,
+          // then cut the pipes and settle — the command's result is final.
+          drainTimer = setTimeout(() => {
+            drainTimer = null;
+            for (const s of stdioOpen) {
+              try { (proc as unknown as Record<string, { destroy(): void }>)[s]?.destroy(); } catch { /* already gone */ }
+            }
+            stdioOpen.clear();
+            onStdioSettled('drain-timeout', exitCode, exitSignal);
+          }, DRAIN_GRACE_MS);
+          drainTimer.unref();
+          return;
+        }
+        onStdioSettled('exit', exitCode, exitSignal);
+      };
+      proc.on('exit', (code, signal) => {
+        exited = true;
+        exitCode = code;
+        exitSignal = signal;
+        settleOnExit();
+      });
+      proc.stdout?.on('end', () => {
+        stdioOpen.delete('stdout');
+        settleOnExit();
+      });
+      proc.stderr?.on('end', () => {
+        stdioOpen.delete('stderr');
+        settleOnExit();
+      });
+
+      function onStdioSettled(_source: string, code: number | null, signal: NodeJS.Signals | null) {
+        if (!exited) return; // 'close' before 'exit' cannot happen, but guard anyway
+        if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+        clearTimeout(timeoutTimer);
+        if (activeForegroundBash === demoteHandle) activeForegroundBash = null;
         if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
         persistCwd(); // carry any `cd` into subsequent calls
+
+        // SCLI-619: after a demotion the foreground promise already resolved
+        // with the task ID (resolved === true); this settle just completes the
+        // background task — it must run DESPITE resolved, so it sits before
+        // the resolved guard.
+        if (demoted && demotedTaskId && context.taskRegistry) {
+          const t = context.taskRegistry.get(demotedTaskId);
+          if (t && t.status === 'running') {
+            if (code !== null && code !== 0) {
+              context.taskRegistry.fail(demotedTaskId, `Exited with code ${code}${signal ? ` (signal ${signal})` : ''}`);
+            } else {
+              context.taskRegistry.complete(demotedTaskId, code ?? 0);
+            }
+          }
+          return;
+        }
+        if (resolved) return;
 
         // Detect timeout or signal-based kill. An abort kills via signal too, so
         // check `aborted` first to report it distinctly (not as a timeout).
@@ -311,12 +474,19 @@ export const bashTool: ToolHandler = {
         if (isError || finalCwd !== context.cwd) {
           body += `\n[cwd: ${finalCwd}]`;
         }
+        // Cortex guardrail break-glass audit trail (PLAT-5392): when a mutating
+        // kubectl against ai-models was allowed via a trusted approval marker,
+        // prefix the output so the approval is visible in the transcript.
+        if (cortexBreakGlass) {
+          body = `[Cortex guardrail break-glass] approval=${cortexBreakGlass.approval}; reason=${cortexBreakGlass.reason}\n${body}`;
+        }
 
         safeResolve({ toolUseId: '', content: body, isError });
-      });
+      }
 
       proc.on('error', (err) => {
         clearTimeout(timeoutTimer);
+        if (activeForegroundBash === demoteHandle) activeForegroundBash = null;
         try { if (cwdFile) fs.unlinkSync(cwdFile); } catch { /* ignore */ }
         safeResolve({
           toolUseId: '',
@@ -332,10 +502,21 @@ export const bashTool: ToolHandler = {
  * Launch a bash command as a background task.
  * Returns immediately with a task ID — the command runs asynchronously.
  */
-function launchBackgroundBash(command: string, timeoutMs: number, context: ToolContext): Promise<ToolResult> {
+function launchBackgroundBash(
+  command: string,
+  timeoutMs: number,
+  context: ToolContext,
+  cortexBreakGlass?: { approval: string; reason: string },
+): Promise<ToolResult> {
   const registry = context.taskRegistry!;
   const desc = command.length > 80 ? command.slice(0, 77) + '...' : command;
   const task = registry.create('bash', desc);
+  if (cortexBreakGlass) {
+    registry.appendOutput(
+      task.id,
+      `[Cortex guardrail break-glass] approval=${cortexBreakGlass.approval}; reason=${cortexBreakGlass.reason}\n`,
+    );
+  }
 
   // Apply OS-level sandbox if configured
   const baseEnv = bashChildEnvironment();

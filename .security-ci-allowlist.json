@@ -8,6 +8,14 @@
       "path_contains": ".forgejo/workflows/build-publish-scli.yml",
       "owner": "security@shizuha.com",
       "reason": "Accepted false positive (PLAT-4771): github.sha is a Forgejo-generated hexadecimal commit identifier, not attacker-controlled free-form context, so using it to derive the artifact release ID cannot inject shell syntax."
+    },
+    {
+      "source_id": "security-ci:94cf54e38e65480cdef04927",
+      "tool": "semgrep",
+      "rule": "yaml.github-actions.security.run-shell-injection.run-shell-injection",
+      "path_contains": ".forgejo/workflows/build-publish-scli.yml",
+      "owner": "security@shizuha.com",
+      "reason": "Accepted false positive (PLAT-4771, re-keyed PLAT-5655): same github.sha-derived release ID at build-publish-scli.yml:60 after line movement; source_id re-keyed because the fingerprint includes the line number. github.sha is a Forgejo-generated hexadecimal commit identifier, not attacker-controlled free-form context, so deriving the artifact release ID cannot inject shell syntax."
     }
   ]
 }

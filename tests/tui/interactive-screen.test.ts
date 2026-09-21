@@ -4,6 +4,8 @@ import {
   LEAVE_INTERACTIVE_SCREEN,
   enterInteractiveScreen,
   leaveInteractiveScreen,
+  resetTuiCanvas,
+  resetScrollRegion,
 } from '../../src/tui/utils/interactiveScreen.js';
 
 describe('interactive terminal lifecycle', () => {
@@ -23,5 +25,26 @@ describe('interactive terminal lifecycle', () => {
     expect(ENTER_INTERACTIVE_SCREEN).toContain('\x1b[?1006h');
     expect(LEAVE_INTERACTIVE_SCREEN).toContain('\x1b[?1006l');
     expect(LEAVE_INTERACTIVE_SCREEN).toContain('\x1b[?1049l');
+  });
+
+  it('resetTuiCanvas clears DECSTBM and the screen so overlays cannot ghost', () => {
+    const writes: string[] = [];
+    const stream = {
+      isTTY: true,
+      write: (chunk: string) => { writes.push(chunk); return true; },
+    } as unknown as NodeJS.WriteStream;
+    resetTuiCanvas(stream);
+    expect(writes.join('')).toContain('\x1b[r');
+    expect(writes.join('')).toContain('\x1b[2J');
+  });
+
+  it('resetScrollRegion only drops DECSTBM so Ink overlays keep their cells', () => {
+    const writes: string[] = [];
+    const stream = {
+      isTTY: true,
+      write: (chunk: string) => { writes.push(chunk); return true; },
+    } as unknown as NodeJS.WriteStream;
+    resetScrollRegion(stream);
+    expect(writes.join('')).toBe('\x1b[r');
   });
 });

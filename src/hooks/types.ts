@@ -38,3 +38,25 @@ export interface HookResult {
   /** Reason for blocking (from stdout when exit code 2) */
   blockReason?: string;
 }
+
+/**
+ * Environment variables available to lifecycle hooks.
+ *
+ * SessionStart / SessionStop hooks receive:
+ *   SESSION_ID       — current session ID
+ *   MODEL            — active model slug
+ *   CWD              — working directory
+ *   BACKGROUND_TASKS — JSON array of `{id, type, status, description}` for
+ *                      non-terminal background tasks (SCLI-618; SessionStop only)
+ *   ACTIVE_CRONS     — JSON array of `{id, name, schedule}` for enabled cron
+ *                      jobs (SCLI-618; SessionStop only)
+ */
+export interface HookEnv {
+  SESSION_ID: string;
+  MODEL: string;
+  CWD: string;
+  /** JSON string; empty array when no background tasks are active. */
+  BACKGROUND_TASKS?: string;
+  /** JSON string; empty array when no cron jobs are scheduled. */
+  ACTIVE_CRONS?: string;
+}

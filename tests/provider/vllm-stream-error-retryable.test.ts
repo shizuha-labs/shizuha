@@ -111,6 +111,18 @@ describe('VLlmProvider Cortex SSE stream error retryability', () => {
     expect(caught.retryable).toBe(true);
   });
 
+  it('retries an empty SSE error object (gateway reconnect cut)', async () => {
+    const caught = await throwFromStreamError({});
+    expect(caught.message).toMatch(/stream error: unknown error/i);
+    expect(caught.retryable).toBe(true);
+  });
+
+  it('classifies "vLLM stream error: unknown error" as transient', () => {
+    expect(isTransientProviderFailure({
+      message: 'vLLM stream error: unknown error',
+    })).toBe(true);
+  });
+
   it('marks OpenAI server_error as retryable even without retryable flag', async () => {
     const caught = await throwFromStreamError({
       message:

@@ -35,12 +35,41 @@ function makeLargeConversation(messageCount: number): Message[] {
   }));
 }
 
+function queueSummaries(target: MockProvider, count: number, label: string): void {
+  for (let i = 0; i < count; i++) {
+    target.queueResponse(ResponseBuilder.textOnly(longSummary(`${label} ${i}.`)));
+  }
+}
+
 /** Generate a mock summary long enough to pass the compaction quality gate (>= 200 tokens) */
 function longSummary(core: string): string {
   // Pad with enough text to reliably exceed MIN_SUMMARY_TOKENS (200).
   // Using 'word ' repeated 250 times ≈ 250 tokens, well above the threshold.
   return `<summary>${core}\n\n${'word '.repeat(250)}</summary>`;
 }
+
+it('summarizes a bounded oldest window instead of the full oversized prefix', async () => {
+  const messages = makeLargeConversation(24);
+  const original = structuredClone(messages);
+  provider.queueResponse(ResponseBuilder.textOnly(longSummary(
+    '1. Primary Request: bounded prefix.\n7. Pending Tasks: continue.\n8. Current Work: resume.',
+  )));
+  // Recursive semanticPass after the first window — more summaries than one.
+  for (let i = 0; i < 16; i++) {
+    provider.queueResponse(ResponseBuilder.textOnly(longSummary(
+      `Pass ${i}: remaining oldest prefix summarized. Pending: continue. Current: resume.`,
+    )));
+  }
+  const result = await compactMessages(messages, provider, 'cortex/GLM-5.3-Flash', 500_000, { force: true });
+  expect(result.compacted).toBe(true);
+  const firstPayload = String(provider.capturedMessages[0]?.[0]?.content ?? '');
+  const fullJoin = messages.map((m) => String(m.content)).join('\n\n');
+  // Keep a live suffix; summarize a large oldest prefix (not a 16k slice).
+  expect(firstPayload.length).toBeLessThan(fullJoin.length);
+  expect(countTokens(firstPayload, 'cortex/GLM-5.3-Flash')).toBeGreaterThan(16_384);
+  expect(String(result.messages.at(-1)?.content)).toContain('Message 23:');
+  expect(messages).toEqual(original);
+});
 
 describe('compactMessages — threshold', () => {
   // compactMessages applies a 1.35x tiktoken safety factor internally.
@@ -82,7 +111,10 @@ describe('compactMessages — threshold', () => {
     const rawTokens = estimateTokens(messages);
     const adjusted = Math.ceil(rawTokens * SAFETY_FACTOR);
     const maxTokens = Math.floor(adjusted / 0.95);
-    provider.queueResponse(ResponseBuilder.textOnly(longSummary('Summary of the 60-message conversation.')));
+    // PLAT-9194 band: multi-pass budget (unused responses are fine).
+    for (let pass = 0; pass < 40; pass++) {
+      provider.queueResponse(ResponseBuilder.textOnly(longSummary('Summary of the 60-message conversation.')));
+    }
     const result = await compactMessages(messages, provider, 'test-model', maxTokens, {
       overheadTokens: 0,
     });
@@ -113,10 +145,10 @@ describe('compactMessages — output budget + progress', () => {
     return Math.max(80000, Math.floor(Math.ceil(raw * 1.35) / 0.95));
   }
 
-  it('caps output budget at 2048 for slow local (cortex/) models', async () => {
+  it('caps output budget at 8192 for slow local (cortex/) models', async () => {
     const messages = makeLargeConversation(80);
     const maxTokens = maxTokensToTrigger(messages, 'cortex/GLM-4.7');
-    provider.queueResponse(ResponseBuilder.textOnly(longSummary('Local model summary.')));
+    queueSummaries(provider, 24, 'Local model summary');
 
     const budgets: number[] = [];
     const result = await compactMessages(messages, provider, 'cortex/GLM-4.7', maxTokens, {
@@ -124,7 +156,7 @@ describe('compactMessages — output budget + progress', () => {
     });
     expect(result.compacted).toBe(true);
     expect(budgets.length).toBeGreaterThan(0);
-    expect(budgets.every((b) => b === 2048)).toBe(true);
+    expect(budgets.every((b) => b === 8192)).toBe(true);
   });
 
   it('keeps the compaction request itself below the context window for cortex models', async () => {
@@ -138,24 +170,23 @@ describe('compactMessages — output budget + progress', () => {
       timestamp: Date.now() + i,
     }));
 
-    provider.queueResponse(ResponseBuilder.textOnly(longSummary('Oversized cortex transcript summary.')));
-
-    for (let pass = 0; pass < 6; pass++) {
-      provider.queueResponse(ResponseBuilder.textOnly(longSummary(`Hierarchical pass ${pass}.`)));
-    }
+    queueSummaries(provider, 50, 'Oversized cortex transcript summary');
     const result = await compactMessages(messages, provider, 'cortex/Qwen3.6-35B-A3B-NVFP4', 262144, {
       force: true,
     });
 
     expect(result.compacted).toBe(true);
-    expect(provider.callCount).toBeGreaterThan(1);
+    expect(provider.callCount).toBeGreaterThanOrEqual(1);
     for (let call = 0; call < provider.callCount; call++) {
       const compactionPrompt = provider.capturedMessages[call]?.[0]?.content;
       expect(typeof compactionPrompt).toBe('string');
       const promptTokens = countTokens(compactionPrompt as string, 'cortex/Qwen3.6-35B-A3B-NVFP4');
-      expect(promptTokens).toBeLessThan(150000);
-      expect(provider.capturedOptions[call]?.maxTokens).toBe(2048);
+      // Request must fit in the model window (262144) after output/prompt/guard.
+      expect(promptTokens).toBeLessThan(200000);
+      expect(provider.capturedOptions[call]?.maxTokens).toBe(8192);
     }
+    const firstPrompt = provider.capturedMessages[0]?.[0]?.content as string;
+    expect(countTokens(firstPrompt, 'cortex/Qwen3.6-35B-A3B-NVFP4')).toBeGreaterThan(16_384);
   });
 
   it('skips a futile retry when a local model saturates the budget in reasoning only', async () => {
@@ -168,19 +199,18 @@ describe('compactMessages — output budget + progress', () => {
     }));
     provider.queueResponse([
       { type: 'reasoning_text', text: 'private analysis '.repeat(300) },
-      { type: 'usage', inputTokens: 31_086, outputTokens: 2048 },
+      { type: 'usage', inputTokens: 31_086, outputTokens: 8192 },
       { type: 'stop_reason', reason: 'max_tokens' },
       { type: 'done' },
     ]);
 
-    // Forced compaction never dead-ends on quality — it resolves via the
-    // fallback ladder — but the futile retry must still be skipped.
-    const result = await compactMessages(messages, provider, 'cortex/DeepSeek-V4-Flash', 524288, {
+    const before = structuredClone(messages);
+    await expect(compactMessages(messages, provider, 'cortex/DeepSeek-V4-Flash', 524288, {
       force: true,
-    });
-    expect(result.compacted).toBe(true);
+    })).rejects.toBeInstanceOf(CompactionQualityError);
+    expect(messages).toEqual(before);
     expect(provider.callCount).toBe(1);
-    expect(provider.capturedOptions[0]?.maxTokens).toBe(2048);
+    expect(provider.capturedOptions[0]?.maxTokens).toBe(8192);
   });
 
   it('fails closed on a junk summary when compaction is optional (no force)', async () => {
@@ -198,7 +228,7 @@ describe('compactMessages — output budget + progress', () => {
     expect(messages).toEqual(before);
   });
 
-  it('forced compaction with a junk summary resolves via the task-anchor fallback', async () => {
+  it('forced junk summary preserves the prefix instead of substituting an anchor fallback', async () => {
     const messages: Message[] = Array.from({ length: 24 }, (_, i) => ({
       role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
       content: i === 22
@@ -212,18 +242,13 @@ describe('compactMessages — output budget + progress', () => {
       ResponseBuilder.textOnly('OK'),
     );
 
-    const result = await compactMessages(messages, provider, 'cortex/Qwen3.6-35B-A3B-NVFP4', 262144, {
+    const before = structuredClone(messages);
+    await expect(compactMessages(messages, provider, 'cortex/Qwen3.6-35B-A3B-NVFP4', 262144, {
       force: true,
-    });
-
+    })).rejects.toBeInstanceOf(CompactionQualityError);
+    expect(messages).toEqual(before);
     expect(provider.callCount).toBe(2);
-    expect(provider.capturedOptions[0]?.maxTokens).toBe(2048);
-    expect(provider.capturedOptions[1]?.maxTokens).toBe(1024);
-    expect(result.compacted).toBe(true);
-    const summaryText = result.messages
-      .map((m) => (typeof m.content === 'string' ? m.content : ''))
-      .join('\n');
-    expect(summaryText).toContain('fix SCLI resume context exhaustion permanently');
+    expect(provider.capturedOptions.map((o) => o.maxTokens)).toEqual([8192, 4096]);
   });
 
   it('keeps the 20000 budget for cloud models', async () => {
@@ -243,7 +268,7 @@ describe('compactMessages — output budget + progress', () => {
   it('reports streaming progress with non-decreasing output token counts', async () => {
     const messages = makeLargeConversation(80);
     const maxTokens = maxTokensToTrigger(messages, 'cortex/GLM-4.7');
-    provider.queueResponse(ResponseBuilder.textOnly(longSummary('Progress summary.')));
+    queueSummaries(provider, 24, 'Progress summary');
 
     const seen: number[] = [];
     await compactMessages(messages, provider, 'cortex/GLM-4.7', maxTokens, {
@@ -262,9 +287,13 @@ describe('compactMessages — summary format', () => {
     const tokens = estimateTokens(messages);
     const maxTokens = Math.floor(Math.ceil(tokens * 1.35) / 0.95);
 
-    provider.queueResponse(
-      ResponseBuilder.textOnly(longSummary('This is the summary content.')),
-    );
+    // PLAT-9194 band: the 0.40 floor can require several hierarchical passes;
+    // queue a budget (unused responses are fine).
+    for (let pass = 0; pass < 40; pass++) {
+      provider.queueResponse(
+        ResponseBuilder.textOnly(longSummary('This is the summary content.')),
+      );
+    }
 
     const result = await compactMessages(messages, provider, 'test-model', maxTokens);
     expect(result.compacted).toBe(true);
@@ -278,13 +307,17 @@ describe('compactMessages — summary format', () => {
     const tokens = estimateTokens(messages);
     const maxTokens = Math.floor(Math.ceil(tokens * 1.35) / 0.95);
 
-    provider.queueResponse(
-      ResponseBuilder.textOnly(longSummary('Summary here.')),
-    );
+    // PLAT-9194 band: multi-pass budget (unused responses are fine).
+    for (let pass = 0; pass < 40; pass++) {
+      provider.queueResponse(
+        ResponseBuilder.textOnly(longSummary('Summary here.')),
+      );
+    }
 
     const result = await compactMessages(messages, provider, 'test-model', maxTokens);
     expect(result.messages[1]!.role).toBe('assistant');
-    expect(result.messages[1]!.content).toContain('context');
+    expect(result.messages[1]!.content).toContain('validated summary');
+    expect(result.messages[1]!.content).not.toContain('full context');
   });
 
   it('extracts content from <summary> tags', async () => {
@@ -311,6 +344,8 @@ describe('compactMessages — recent message preservation', () => {
 
     provider.queueResponse(
       ResponseBuilder.textOnly(longSummary('Summary of first 16 messages.')),
+      // PLAT-9194 band: the 0.40 floor can demand a second hierarchical pass.
+      ResponseBuilder.textOnly(longSummary('Deeper pass: remaining prefix summarized.')),
     );
 
     const result = await compactMessages(messages, provider, 'test-model', maxTokens);
@@ -354,6 +389,8 @@ describe('compactMessages — recent message preservation', () => {
 
     provider.queueResponse(
       ResponseBuilder.textOnly(longSummary('Summary of tool interactions.')),
+      // PLAT-9194 band: the 0.40 floor can demand a second hierarchical pass.
+      ResponseBuilder.textOnly(longSummary('Deeper pass: remaining tool interactions summarized.')),
     );
 
     const result = await compactMessages(messages, provider, 'test-model', maxTokens);
@@ -501,6 +538,54 @@ describe('compactMessages — hierarchical semantic prefixes (SCLI-18)', () => {
     expect(String(result.messages.at(-1)?.content)).toContain('sentinel-29');
   });
 
+  it('keeps the last reduced projection when a later hierarchical pass is aborted', async () => {
+    const messages: Message[] = Array.from({ length: 30 }, (_, index) => ({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: `sentinel-${index}: ${'word '.repeat(800)}`,
+    }));
+    const original = structuredClone(messages);
+    const controller = new AbortController();
+    const reason = new Error('SCLI-389 compaction deadline exceeded (900000ms, phase=pre-turn)');
+    provider.queueResponse(ResponseBuilder.textOnly(longSummary('First validated semantic pass.')));
+    const chat = provider.chat.bind(provider);
+    provider.chat = async function* (input, options) {
+      if (provider.callCount) {
+        controller.abort(reason);
+        throw reason;
+      }
+      yield* chat(input, options);
+    };
+    const result = await compactMessages(messages, provider, 'test-model', 12_000, {
+      force: true,
+      abortSignal: controller.signal,
+    });
+    expect(result.compacted).toBe(true);
+    expect(provider.callCount).toBe(1);
+    expect(String(result.messages[0]?.content)).toContain('[Conversation Summary]');
+    expect(String(result.messages[0]?.content)).toContain('First validated semantic pass');
+    expect(result.messages.length).toBeLessThan(messages.length);
+    expect(result.messages.length).toBeGreaterThan(8);
+    expect(result.messages.at(-1)).toEqual(messages.at(-1));
+    expect(messages).toEqual(original);
+  });
+
+  it('rejects the whole hierarchical projection if a later summary is unusable', async () => {
+    const messages: Message[] = Array.from({ length: 30 }, (_, index) => ({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: `sentinel-${index}: ${'word '.repeat(800)}`,
+    }));
+    const before = structuredClone(messages);
+    provider.queueResponse(
+      ResponseBuilder.textOnly(longSummary('First validated semantic pass.')),
+      ResponseBuilder.textOnly('OK'), ResponseBuilder.textOnly('OK'),
+    );
+    await expect(compactMessages(messages, provider, 'test-model', 12_000, { force: true }))
+      .rejects.toBeInstanceOf(CompactionQualityError);
+    expect(provider.callCount).toBe(3);
+    expect(messages).toEqual(before);
+    expect(String(provider.capturedMessages[1]?.[0]?.content)).toContain('First validated semantic pass');
+  });
+
   it('fails before calling the provider when one oldest message cannot fit', async () => {
     const messages: Message[] = [
       { role: 'user', content: `oversized-oldest: ${'word '.repeat(3_000)}` },
@@ -547,11 +632,14 @@ describe('compactMessages — hierarchical semantic prefixes (SCLI-18)', () => {
 describe('compactMessages — summary fidelity (SCLI-18)', () => {
   it('summary prompt references all 9 required sections', async () => {
     const messages = makeLargeConversation(6);
-    provider.queueResponse(ResponseBuilder.textOnly(longSummary('Fidelity test summary.')));
+    // PLAT-9194 band: multi-pass budget (unused responses are fine).
+    for (let pass = 0; pass < 40; pass++) {
+      provider.queueResponse(ResponseBuilder.textOnly(longSummary('Fidelity test summary.')));
+    }
 
     await compactMessages(messages, provider, 'test-model', estimateTokens(messages) + 10000, { force: true });
 
-    const sentContent = provider.capturedMessages[0]![0]!.content as string;
+    const sentContent = provider.capturedOptions[0]!.systemPrompt as string;
     // Verify the 9 COMPACTION_PROMPT sections are present in the sent prompt
     const requiredSections = [
       'Primary Request',
@@ -571,7 +659,10 @@ describe('compactMessages — summary fidelity (SCLI-18)', () => {
 
   it('result starts with [Conversation Summary] and includes acknowledged assistant message', async () => {
     const messages = makeLargeConversation(6);
-    provider.queueResponse(ResponseBuilder.textOnly(longSummary('Fidelity test.')));
+    provider.queueResponse(ResponseBuilder.textOnly(longSummary('Fidelity test.')),
+      // PLAT-9194 band: the 0.40 floor can demand several hierarchical passes
+      // on a near-window-sized history — queue a buffer; extras are unused.
+      ...Array.from({ length: 8 }, () => ResponseBuilder.textOnly(longSummary('Deeper pass: remaining prefix summarized.'))));
 
     const result = await compactMessages(messages, provider, 'test-model', estimateTokens(messages) + 10000, { force: true });
     expect(result.compacted).toBe(true);
@@ -598,7 +689,10 @@ describe('compactMessages — resume fidelity (SCLI-18)', () => {
     const maxTokens = tokens + 20000;
 
     const summaryContent = 'Task: write a function with error handling. Status: done.';
-    provider.queueResponse(ResponseBuilder.textOnly(longSummary(summaryContent)));
+    provider.queueResponse(ResponseBuilder.textOnly(longSummary(summaryContent)),
+      // PLAT-9194 band: the 0.40 floor can demand many hierarchical passes on
+      // a near-window-sized history — queue a buffer; extras are unused.
+      ...Array.from({ length: 60 }, () => ResponseBuilder.textOnly(longSummary('Deeper pass: remaining prefix summarized.'))));
 
     const result = await compactMessages(originalMessages, provider, 'test-model', maxTokens, { force: true });
     expect(result.compacted).toBe(true);
@@ -637,7 +731,18 @@ describe('compactMessages — resume fidelity (SCLI-18)', () => {
     const tokens = estimateTokens(messages);
     const maxTokens = tokens + 10000;
 
-    provider.queueResponse(ResponseBuilder.textOnly(longSummary('Tool pair test.')));
+    // PLAT-9194 band: the 0.40 floor on a near-window-sized history can
+    // demand a deep hierarchical tree — hand-counting passes is brittle, so
+    // serve a fresh summary whenever the queue runs dry (same pattern as the
+    // gateway recovery harness). Unused-queue assertions are not affected.
+    const baseChat = provider.chat.bind(provider);
+    provider.chat = async function* (msgs, opts) {
+      const inner = provider as unknown as { responses: unknown[]; callIndex: number };
+      if (!inner.responses[inner.callIndex]) {
+        inner.responses.splice(inner.callIndex, 0, ResponseBuilder.textOnly(longSummary('Tool pair test.')));
+      }
+      yield* baseChat(msgs, opts);
+    };
     const result = await compactMessages(messages, provider, 'test-model', maxTokens, {
       force: true,
       allowNonReducing: true,
@@ -687,8 +792,8 @@ describe('compactMessages — reasoning encryptedContent uses [thinking] placeho
   });
 });
 
-describe('forced compaction accepts short-but-real summaries (shizuha5 2026-08-10)', () => {
-  it('accepts a terse non-degenerate summary under force instead of dead-ending the session', async () => {
+describe('forced compaction preserves the semantic quality contract', () => {
+  it('does not lower the quality bar for a terse summary under force', async () => {
     const { MockProvider: MP } = await import('../helpers/mock-provider.js');
     const provider = new MP();
     const messages: Message[] = Array.from({ length: 24 }, (_, i) => ({
@@ -696,8 +801,7 @@ describe('forced compaction accepts short-but-real summaries (shizuha5 2026-08-1
       content: `Message ${i}: ${'important state '.repeat(120)}`,
       timestamp: Date.now() + i,
     }));
-    // ~120 tokens: short of the 10%/200 quality bar but clearly a real summary
-    // — a resume that hard-fails here leaves the session unresumable.
+    // Plausible prose below the existing quality bar cannot authorize history removal.
     const terse = 'The agent worked on SCLI resume context exhaustion: '
       + 'investigated compaction failures, fixed the deadline scaling, and '
       + 'verified fleet health across three DeepSeek lanes. '.repeat(3)
@@ -706,11 +810,23 @@ describe('forced compaction accepts short-but-real summaries (shizuha5 2026-08-1
       ResponseBuilder.textOnly(terse),
       ResponseBuilder.textOnly(terse),
     );
-    const result = await compactMessages(messages, provider, 'cortex/Qwen3.6-35B-A3B-NVFP4', 262144, {
+    const before = structuredClone(messages);
+    await expect(compactMessages(messages, provider, 'cortex/Qwen3.6-35B-A3B-NVFP4', 262144, {
       force: true,
-    });
-    expect(result.compacted).toBe(true);
-    expect(result.messages.length).toBeLessThan(messages.length);
+    })).rejects.toBeInstanceOf(CompactionQualityError);
+    expect(messages).toEqual(before);
+  });
+
+  it('retains genuine short summaries when the existing input-relative quality bar allows them', async () => {
+    const messages: Message[] = [
+      { role: 'user', content: 'Verify receipt ABC-7. Preserve its deployment identity, timestamp, and completed checks before continuing the investigation. Do not change lifecycle settings.' },
+      { role: 'assistant', content: 'The latest receipt is available, and I will continue the pending verification.' },
+    ];
+    const summary = 'Task ABC-7 requires checking the deployment receipt and retaining its identity, timestamp, and completed checks. Lifecycle changes are forbidden. Verification remains pending.';
+    provider.queueResponse(ResponseBuilder.textOnly(summary));
+    const result = await compactMessages(messages, provider, 'test-model', 100_000, { force: true, allowNonReducing: true });
+    expect(result.messages[0]?.content).toContain(summary);
+    expect(provider.callCount).toBe(1);
   });
 
   it('strips echoed serialized tool blocks under force and keeps the real prose', async () => {
@@ -721,11 +837,11 @@ describe('forced compaction accepts short-but-real summaries (shizuha5 2026-08-1
       content: `Message ${i}: ${'important state '.repeat(120)}`,
       timestamp: Date.now() + i,
     }));
-    const prose = 'The agent investigated the compaction pipeline end to end: '
-      + 'reproduced the resume failure, scaled the TUI deadline with prompt size, '
-      + 'retired the fleet-wide serializer per the operator ruling, and verified '
-      + 'all three DeepSeek lanes healthy on the live Backends page. '.repeat(6)
-      + 'Next: watch the DSpark A/B for several days before converting another lane.';
+    const prose = 'The agent investigated the compaction pipeline end to end. '
+      + Array.from({ length: 20 }, (_, index) =>
+        `Receipt ${index} records a verified deployment, the corresponding source identity, and the remaining validation work. `,
+      ).join('')
+      + 'Next: complete the pending verification without changing lifecycle settings.';
     const echoed = `${prose}\n\n`
       + '[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"kubectl get pods"}}]\n'
       + '[{"type":"tool_result","tool_use_id":"toolu_1","content":"3 pods Running"}]\n';

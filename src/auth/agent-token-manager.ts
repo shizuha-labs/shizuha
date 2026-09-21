@@ -21,6 +21,7 @@ import * as path from 'node:path';
 
 import { brokerPresent, fetchBrokerToken } from './broker-token.js';
 import { readAgentCredential } from './credential-resolver.js';
+import { writeAgentTokenCache } from './agent-token-cache.js';
 
 const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // refresh 5 min before expiry
 
@@ -43,6 +44,16 @@ export interface AgentTokenManagerOptions {
   tokenDir?: string;
   /** Ignore AGENT_ACCESS_TOKEN env fallback; used after a token was rejected by the platform. */
   ignoreEnvToken?: boolean;
+  /**
+   * PLAT-8236: bypass the in-memory AND on-disk caches and force a fresh mint
+   * (broker → refresh → login). The 401-recovery paths construct the manager
+   * knowing the current token was rejected by the platform — serving the same
+   * token back from a cache (fresh === token) is a no-op retry. The disk
+   * record is still read to harvest the refresh token, and a broker token
+   * identical to the rejected one is treated as a miss so the refresh/login
+   * legs actually run.
+   */
+  forceRefresh?: boolean;
   /** Optional daemon-side password override for supervised agent-as-sender calls. */
   agentPassword?: string;
 }
@@ -55,12 +66,14 @@ export class AgentTokenManager {
   private agentEmail: string;
   private agentUsername: string;
   private ignoreEnvToken: boolean;
+  private forceRefresh: boolean;
   private agentPassword?: string;
 
   constructor(opts: AgentTokenManagerOptions) {
     this.agentUsername = opts.agentUsername;
     this.agentEmail = opts.agentEmail || `${opts.agentUsername}@agents.shizuha.io`;
     this.ignoreEnvToken = opts.ignoreEnvToken === true;
+    this.forceRefresh = opts.forceRefresh === true;
     this.agentPassword = opts.agentPassword;
     // Use HTTP for internal service calls — Tailscale handles encryption and
     // self-signed nginx certs would otherwise trip TLS validation from inside
@@ -78,17 +91,25 @@ export class AgentTokenManager {
    * Returns null only when shizuha-id is unreachable or credentials are wrong.
    */
   async getToken(): Promise<string | null> {
-    if (this.token && !this.isExpired(this.token.expiresAt)) {
-      return this.token.accessToken;
-    }
-    const envToken = this.ignoreEnvToken ? null : this.tokenFromEnv();
-    if (envToken && !this.isExpired(envToken.expiresAt)) {
-      this.token = envToken;
-      this.persistToDisk(envToken);
-      return envToken.accessToken;
+    // PLAT-8236: with forceRefresh the in-memory and on-disk caches are
+    // bypassed — the caller knows the current token was rejected by the
+    // platform, so serving it back (fresh === token) is a no-op retry. The
+    // disk record is still loaded to harvest the refresh token for the
+    // refresh leg below.
+    if (!this.forceRefresh) {
+      if (this.token && !this.isExpired(this.token.expiresAt)) {
+        return this.token.accessToken;
+      }
+      const envToken = this.ignoreEnvToken ? null : this.tokenFromEnv();
+      if (envToken && !this.isExpired(envToken.expiresAt)) {
+        this.token = envToken;
+        this.persistToDisk(envToken);
+        return envToken.accessToken;
+      }
     }
     if (!this.token) this.token = this.loadFromDisk();
-    if (this.token && !this.isExpired(this.token.expiresAt)) {
+    const rejectedAccessToken = this.token?.accessToken ?? null;
+    if (!this.forceRefresh && this.token && !this.isExpired(this.token.expiresAt)) {
       return this.token.accessToken;
     }
     // PLAT-169: per-agent broker sidecar path. When the broker UDS is present,
@@ -101,16 +122,24 @@ export class AgentTokenManager {
     // ready (the agent's readiness is gated on the broker's /readyz).
     if (brokerPresent()) {
       const brokered = await this.tokenFromBroker();
-      if (brokered) {
+      // forceRefresh: a broker token identical to the rejected one is a miss —
+      // fall through so the refresh/login legs mint a genuinely new token.
+      const brokerUsable =
+        brokered && (!this.forceRefresh || brokered.accessToken !== rejectedAccessToken);
+      if (brokerUsable) {
         this.token = brokered;
         this.persistToDisk(brokered);
         return brokered.accessToken;
       }
       if (!readAgentCredential('AGENT_PASSWORD')) {
-        console.warn(`[${this.agentUsername}] Agent token: broker /token not ready and AGENT_PASSWORD absent — will retry`);
-        return null;
+        if (!this.forceRefresh) {
+          console.warn(`[${this.agentUsername}] Agent token: broker /token not ready and AGENT_PASSWORD absent — will retry`);
+          return null;
+        }
+        console.warn(`[${this.agentUsername}] Agent token: forced refresh — broker /token ${brokered ? 'returned the rejected token' : 'unavailable'}; no AGENT_PASSWORD for login fallback`);
+      } else {
+        console.warn(`[${this.agentUsername}] Agent token: broker /token unavailable — falling back to own shizuha-id credential`);
       }
-      console.warn(`[${this.agentUsername}] Agent token: broker /token unavailable — falling back to own shizuha-id credential`);
     }
     if (this.token?.refreshToken) {
       const refreshed = await this.refreshToken(this.token.refreshToken);
@@ -209,7 +238,8 @@ export class AgentTokenManager {
           if (data?.accessToken) return data;
         }
       } catch (err) {
-        console.warn(`[${this.agentUsername}] Agent token: failed to read ${file}: ${(err as Error).message}`);
+        // JSON parse errors can contain a fragment of the credential file.
+        console.warn(`[${this.agentUsername}] Agent token: failed to read cached token`);
       }
     }
     return null;
@@ -217,7 +247,7 @@ export class AgentTokenManager {
 
   private persistToDisk(token: TokenData): void {
     try {
-      fs.writeFileSync(this.tokenFile, JSON.stringify(token, null, 2), { mode: 0o600 });
+      writeAgentTokenCache(this.tokenFile, token);
     } catch (err) {
       console.warn(`[${this.agentUsername}] Agent token: failed to write ${this.tokenFile}: ${(err as Error).message}`);
     }

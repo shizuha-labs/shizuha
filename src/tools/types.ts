@@ -35,6 +35,18 @@ export interface ToolContext {
   sandbox?: import('../sandbox/types.js').SandboxConfig;
   /** Parent agent config — used by task tool to spawn sub-agents with same model/provider */
   agentConfig?: import('../agent/types.js').AgentConfig;
+  /**
+   * Heartbeat prefetch already attached the combined inbox this turn.
+   * Repeat pulse_get_my_work / alerts / tasks calls get a stub, not another
+   * Pulse round-trip (Ryo 2026-09-11 170k get_my_work ping-pong).
+   */
+  heartbeatInboxSatisfied?: boolean;
+  executionJournal?: {
+    generation: string;
+    begin(toolCallId: string, name: string, input: unknown, invocation: number): Promise<void> | void;
+    complete(toolCallId: string, invocation: number, result: ToolResult): Promise<void> | void;
+    interrupt(toolCallId: string, invocation: number, result: ToolResult): Promise<void> | void;
+  };
 }
 
 // ── Tool Definition (sent to LLM) ──
@@ -43,6 +55,12 @@ export interface ToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /**
+   * Claude/Codex/Cortex contract: the tool is in the request catalog so the
+   * server can expand tool_reference, but it must NOT enter the engine tools[]
+   * prefix. Cortex strips these; hosted Anthropic/OpenAI APIs do the same.
+   */
+  deferLoading?: boolean;
 }
 
 // ── Tool Handler (implementation) ──

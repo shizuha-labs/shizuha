@@ -46,7 +46,7 @@ export function isProgressOnlyAssistantText(text: string): boolean {
   const lower = normalized.toLowerCase();
   // `let me know` is a CLOSER inviting user input, not intent to act — without
   // the exclusion, "let me know if you want me to check X" reads as intent.
-  const actionVerb = '(?:check|search|inspect|look(?:\\s+up|\\s+for|\\s+at)?|run|open|read|list|query|call|fetch|verify|test|debug|investigate|trace|diagnose|probe|follow|try|use|execute|access|find|write|create|build|apply|commit|push|deploy)';
+  const actionVerb = '(?:check|search|inspect|look(?:\\s+up|\\s+for|\\s+at)?|run|open|read|list|query|call|fetch|pull|load|verify|test|debug|investigate|trace|diagnose|probe|follow|try|use|execute|access|find|write|create|build|apply|commit|push|deploy)';
   const intentLead = "(?:let me(?! know)|i(?:'|\\u2019)?ll|i will|i(?:'|\\u2019)?m going to|i am going to|now i(?:'|\\u2019)?ll|next i(?:'|\\u2019)?ll)";
   const futureIntent = new RegExp(
     `\\b${intentLead}\\b.{0,160}\\b${actionVerb}\\b`,
@@ -82,12 +82,46 @@ export function isProgressOnlyAssistantText(text: string): boolean {
   // participle progress line, e.g. "Creating the teaching module now — rich
   // lessons...".  Requiring "now"/"next" keeps substantive gerund-led
   // explanations ("Creating indexes reduces latency") out of this guard.
+  // Optional `re-` covers "Re-calling the tool live:" (shizuha1 2026-09-11:
+  // GLM EOS'd after that closer; `calling` is in the list but the hyphenated
+  // prefix made every gerund/colon rule miss, so the TUI treated narration as
+  // a finished answer).
+  const gerundBody = 'checking|searching|inspecting|looking|running|opening|reading|listing|querying|calling|fetching|pulling|loading|verifying|testing|debugging|investigating|trying|using|executing|accessing|finding|writing|creating|building|applying|committing|pushing|deploying';
+  const gerunds = `(?:re-)?(?:${gerundBody})`;
   const gerundProgress = new RegExp(
-    `^(?:checking|searching|inspecting|looking|running|opening|reading|listing|querying|calling|fetching|verifying|testing|debugging|investigating|trying|using|executing|accessing|finding|writing|creating|building|applying|committing|pushing|deploying)\\b.{0,240}\\b(?:now|next)\\b`,
+    `^(?:${gerunds})\\b.{0,240}\\b(?:now|next)\\b`,
     'i',
   );
   if (gerundProgress.test(normalized)) return true;
 
-  return /^(?:searching|checking|inspecting|querying|fetching|verifying|testing|debugging|investigating)\b[ .,!-]*$/i
+  // shizuha1 2026-09-10: "Now pulling both vantages in parallel — Hive's
+  // fleet view and Pulse work-state:" — "now" leads, "pulling" was not in
+  // the gerund list, hasActionableText was true, the loop idled.
+  const nowGerundProgress = new RegExp(
+    `^(?:now|next)[,:]?\\s+(?:${gerunds})\\b`,
+    'i',
+  );
+  if (nowGerundProgress.test(normalized)) return true;
+
+  // "Loading the skill and pulling the fleet snapshot in parallel:" — gerund
+  // announcement that ends at a colon, no tool call.
+  const colonGerund = new RegExp(`^(?:${gerunds})\\b.{0,240}:\\s*$`, 'i');
+  if (colonGerund.test(normalized)) return true;
+
+  // Kei 2026-09-11 gen34: "Snapshot is in hand — advancing PLAT-8469 now.
+  // Opening the task, its comments, and available transitions in parallel:"
+  // The gerund/colon rules only matched the START of the whole string, so a
+  // one-line preamble hid a stalling last sentence and the heartbeat ended
+  // as a completed answer (0 tools, ready queue, needs_help). Same rule as
+  // the long-stall path: the ENDING is the signal.
+  const sentences = normalized.split(/(?<=[.!?])\s+/).map((part) => part.trim()).filter(Boolean);
+  const last = sentences[sentences.length - 1] ?? '';
+  if (last && last !== normalized) {
+    if (gerundProgress.test(last) || nowGerundProgress.test(last) || colonGerund.test(last)) {
+      return true;
+    }
+  }
+
+  return /^(?:searching|checking|inspecting|querying|fetching|pulling|loading|verifying|testing|debugging|investigating)\b[ .,!-]*$/i
     .test(normalized);
 }

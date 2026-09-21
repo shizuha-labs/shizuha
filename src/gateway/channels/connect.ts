@@ -14,7 +14,7 @@ import type { AgentEvent } from '../../events/types.js';
 import type { Channel, Inbox, InboundMessage, ConnectChannelConfig } from '../types.js';
 import { ConnectClient } from '../../connect-client/index.js';
 import { sendConnectDm } from '../../platform/connect-dm.js';
-import { isRoutineTaskNotificationContent, isWorkingDeferredTaskNotification } from '../inbox.js';
+import { isProbeOrLivenessContent, isRoutineTaskNotificationContent, isWorkingDeferredTaskNotification } from '../inbox.js';
 import { connectAutoReplyEnabled } from '../../platform/lean-conversational.js';
 import { logger } from '../../utils/logger.js';
 
@@ -26,9 +26,9 @@ export class ConnectChannel implements Channel {
   private client: ConnectClient;
   private agentId?: string;
 
-  // Lean talk seats auto-reply by default (Grok Build already did). DeepSeek
-  // does not reliably call message_user. Opt out with SHIZUHA_CONNECT_AUTOREPLY=0.
-  // Reply goes to the inbound sender (conversation-scoped), not a fixed inbox.
+  // Auto-reply is opt-in (SHIZUHA_CONNECT_AUTOREPLY=1). CEO Office seats
+  // deliver via message_user like every other agent. Relaying turn text
+  // plus a leftover message_user("Replied.") dual-wrote Live chats.
   private readonly autoReply = connectAutoReplyEnabled();
   private readonly replyEmail = (process.env['SHIZUHA_CONNECT_REPLY_EMAIL'] || '').trim();
   private readonly replyBuf = new Map<string, string>();
@@ -52,6 +52,11 @@ export class ConnectChannel implements Channel {
             username: username || undefined,
             email: this.replyEmail || undefined,
           });
+        }
+        if (isProbeOrLivenessContent(content)) {
+          if (messageId) this.client.ackMessageProcessed(messageId);
+          logger.info({ messageId, senderName }, 'Dropped QA/liveness probe before agent turn');
+          return;
         }
         const routineTaskNotification = isRoutineTaskNotificationContent(content);
         const taskKey = routineTaskNotification

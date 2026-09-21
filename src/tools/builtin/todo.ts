@@ -59,15 +59,10 @@ export const todoWriteTool: ToolHandler = {
     }).join('\n');
 
     const pending = list.filter((t) => t.status !== 'completed').length;
-    // When work remains, nudge the model to keep going — this prevents premature
-    // completion on complex tasks. Both Claude Code and qwen-code use similar patterns.
-    const nudge = pending > 0
-      ? `\n\n${pending} task${pending === 1 ? '' : 's'} remaining. Continue with the next task.`
-      : '';
 
     return {
       toolUseId: '',
-      content: `Todo list updated (${list.length} items):\n${summary}${nudge}`,
+      content: `Todo list updated (${list.length} items, ${pending} open):\n${summary}`,
       metadata: {
         rawTodos: list.map((t) => ({ id: t.id, content: t.content, status: t.status })),
       },

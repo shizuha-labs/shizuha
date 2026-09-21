@@ -388,7 +388,7 @@ describe('2. Cron Store + Scheduler Integration', () => {
     });
 
     expect(job.enabled).toBe(true);
-    expect(job.repeat.times).toBeNull(); // repeats forever
+    expect(job.repeat.times).toBe(50);
     expect(job.repeat.completed).toBe(0);
 
     // Job should not be due yet (nextRunAt is ~1m in the future)
@@ -424,7 +424,7 @@ describe('2. Cron Store + Scheduler Integration', () => {
     const updated = store.getJob(job.id)!;
     expect(updated.lastStatus).toBe('ok');
     expect(updated.repeat.completed).toBe(1);
-    expect(updated.enabled).toBe(true); // still enabled (infinite repeat)
+    expect(updated.enabled).toBe(true); // still enabled (1 of 50)
   });
 
   it('delay job disables after single completion', async () => {
@@ -1433,6 +1433,19 @@ describe('9. Loop Detector Integration', () => {
     expect(detector.record('write', inputB)).toBe('ok');
     expect(detector.record('read', inputA)).toBe('ok');
     expect(detector.record('write', inputB)).toBe('warning'); // 3rd ping-pong pair
+  });
+
+  it('detects same-tool two-argument ping-pong', async () => {
+    const { LoopDetector } = await import('../../src/agent/loop-detector.js');
+    const detector = new LoopDetector({ warningThreshold: 3, breakThreshold: 5 });
+    const a = { task_key: 'HIVE-1953' };
+    const b = { task_key: 'PLS-986' };
+    expect(detector.record('pulse_get_task', a)).toBe('ok');
+    expect(detector.record('pulse_get_task', b)).toBe('ok');
+    expect(detector.record('pulse_get_task', a)).toBe('ok');
+    expect(detector.record('pulse_get_task', b)).toBe('ok');
+    expect(detector.record('pulse_get_task', a)).toBe('ok');
+    expect(detector.record('pulse_get_task', b)).toBe('warning');
   });
 
   it('reset clears history', async () => {

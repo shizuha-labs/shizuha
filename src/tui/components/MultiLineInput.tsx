@@ -1,8 +1,10 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { pasteBufferRef } from './InputBox.js';
-import { applyBackwardDelete, applyForwardDelete, findLineEnd, findLineStart, findNextWordEnd, findPreviousWordStart } from '../utils/textEdit.js';
+import { applyBackwardDelete, applyForwardDelete, findLineEnd, findLineStart, findNextWordEnd, findPreviousWordStart, graphemeOffsets, nextGraphemeIndex, prevGraphemeIndex, graphemeMoveLeft, graphemeMoveRight, graphemeClusterAt, transposeWords } from '../utils/textEdit.js';
 import { isSgrMouseSequence } from '../utils/mouse.js';
+import { sanitizePastedChunk } from '../utils/pasteNormalize.js';
+import { currentInputDispatchWasConsumed } from '../renderer/inputDispatch.js';
 
 interface MultiLineInputProps {
   value: string;
@@ -21,6 +23,12 @@ interface MultiLineInputProps {
   rightGutter?: number;
   /** Maximum rendered editor rows; the full draft remains in valueRef. */
   maxRows?: number;
+  /**
+   * When an external value is applied (draft restore after Ctrl+R/Esc, pager,
+   * stash — not a local keystroke ack), place the cursor at the end so the
+   * user resumes typing where they left off (SCLI-449).
+   */
+  cursorAtEndOnExternalValue?: boolean;
 }
 
 /**
@@ -50,6 +58,7 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
   promptColor = textColor,
   rightGutter = 1,
   maxRows,
+  cursorAtEndOnExternalValue = false,
 }) => {
   const [, setCursor] = useState(0);
   const [, setRenderTick] = useState(0);
@@ -98,6 +107,12 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
   // This prevents transient prop rollbacks from rewinding the live refs.
   const pendingCommitAcksRef = useRef<string[]>([]);
 
+  // SCLI-489: a Windows/CRLF clipboard paste can be split across input events
+  // (the chunk boundary lands between \r and \n). We buffer a trailing \r and
+  // combine it with a leading \n from the next event into ONE logical newline,
+  // so a 3-line paste renders 3 lines instead of 5.
+  const pendingCRRef = useRef(false);
+
   const commitValue = useCallback((nextValue: string, nextCursor: number) => {
     valueRef.current = nextValue;
     cursorRef.current = Math.max(0, Math.min(nextCursor, nextValue.length));
@@ -112,17 +127,42 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
   const inputHandlerRef = useRef<(input: string, key: any) => void>(() => {});
   inputHandlerRef.current = (input: string, key: any) => {
     if (!isActive) return;
+    if (currentInputDispatchWasConsumed()) return;
     // Mouse reports are delivered to every Ink useInput subscriber. They
     // belong to the conversation viewport and must never become draft text.
     if (isSgrMouseSequence(input)) return;
-    const currentValue = valueRef.current;
-    const currentCursor = cursorRef.current;
+    let currentValue = valueRef.current;
+    let currentCursor = cursorRef.current;
+
+    // SCLI-489: a CRLF split across input events. A trailing \r buffered by a
+    // previous paste chunk is the first half of \r\n when this event starts
+    // with \n — consume the \n so the pair becomes ONE newline, not two. A
+    // standalone CR (CR-only line ending) also flushes as one newline.
+    if (pendingCRRef.current) {
+      pendingCRRef.current = false;
+      if (input.startsWith('\n')) {
+        input = input.slice(1);
+      }
+      currentValue = currentValue.slice(0, currentCursor) + '\n' + currentValue.slice(currentCursor);
+      currentCursor += 1;
+      if (!input) {
+        commitValue(currentValue, currentCursor);
+        return;
+      }
+    }
 
     // Bracketed paste detection: pasted text arrives as a single input with
     // embedded newlines (or CRLF). Normalize before inserting so rendering
     // stays stable and background fill remains uniform.
     if (input.length > 1 && (input.includes('\n') || input.includes('\r'))) {
-      const normalized = sanitizePastedChunk(input);
+      // Buffer a trailing \r that may be the first half of a CRLF split across
+      // events; the next event's leading \n (if any) is consumed above.
+      let raw = input;
+      if (raw.endsWith('\r')) {
+        raw = raw.slice(0, -1);
+        pendingCRRef.current = true;
+      }
+      const normalized = sanitizePastedChunk(raw);
       if (!normalized) return;
       // Large paste: store in shared ref for deferred expansion on submit
       if (normalized.length > 1024) {
@@ -195,12 +235,21 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
 
     // Some terminals emit held backspace as a run of DEL chars. (BS is handled
     // above as Ctrl+Backspace; matching it here too would swallow word-deletes.)
+    // SCLI-450: delete one EXTENDED GRAPHEME CLUSTER per DEL char, never a
+    // code-unit fragment — a naive slice(0, -1) corrupts emoji ZWJ, combining
+    // marks, flags, and skin-tone modifiers into U+FFFD/residue.
     if (!key.ctrl && !key.meta && /^\u007f+$/.test(input)) {
       if (currentCursor <= 0) return;
-      const removeCount = Math.min(currentCursor, input.length);
-      const start = currentCursor - removeCount;
-      const newValue = currentValue.slice(0, start) + currentValue.slice(currentCursor);
-      commitValue(newValue, start);
+      const count = Math.min(currentCursor, input.length);
+      let value = currentValue;
+      let cursor = currentCursor;
+      for (let n = 0; n < count; n++) {
+        const del = applyBackwardDelete(value, cursor);
+        if (!del) break;
+        value = del.text;
+        cursor = del.cursor;
+      }
+      commitValue(value, cursor);
       return;
     }
 
@@ -240,6 +289,22 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
       const nextCursor = findNextWordEnd(currentValue, currentCursor);
       cursorRef.current = nextCursor;
       setCursor(nextCursor);
+      return;
+    }
+
+    // Meta-T / Alt+T: transpose words (Bash/readline transpose-words). Terminals
+    // send ESC + t (\u001bt); Ink surfaces it as key.meta + input 't'. Was a
+    // silent no-op before SCLI-465 — the draft stayed unchanged with no
+    // feedback, breaking readline muscle memory.
+    const isTransposeWords =
+      (key.meta && input.toLowerCase() === 't') ||
+      input === '\u001bt' ||
+      input === '\u001bT';
+    if (isTransposeWords) {
+      const result = transposeWords(currentValue, currentCursor);
+      if (result) {
+        commitValue(result.text, result.cursor);
+      }
       return;
     }
 
@@ -290,17 +355,18 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
       return;
     }
 
-    // Left arrow
+    // Left arrow — move by one extended grapheme cluster (SCLI-463), never a
+    // UTF-16 code unit, so navigation cannot split an emoji/combining mark.
     if (key.leftArrow) {
-      const nextCursor = Math.max(0, currentCursor - 1);
+      const nextCursor = graphemeMoveLeft(currentValue, currentCursor);
       cursorRef.current = nextCursor;
       setCursor(nextCursor);
       return;
     }
 
-    // Right arrow
+    // Right arrow — move by one extended grapheme cluster (SCLI-463).
     if (key.rightArrow) {
-      const nextCursor = Math.min(currentValue.length, currentCursor + 1);
+      const nextCursor = graphemeMoveRight(currentValue, currentCursor);
       cursorRef.current = nextCursor;
       setCursor(nextCursor);
       return;
@@ -308,6 +374,75 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
 
     // Up/Down handled by parent (history) — only forward if on first/last line
     if (key.upArrow || key.downArrow) return;
+
+    // SCLI-458: readline character-level bindings (grapheme-aware).
+    // Ctrl+F / forward-char: move cursor forward one grapheme.
+    const isForwardChar =
+      (key.ctrl && input.toLowerCase() === 'f') || input === '\u0006';
+    if (isForwardChar) {
+      const nextCursor = nextGraphemeIndex(currentValue, currentCursor);
+      cursorRef.current = nextCursor;
+      setCursor(nextCursor);
+      return;
+    }
+
+    // Ctrl+B / backward-char: move cursor backward one grapheme.
+    const isBackwardChar =
+      (key.ctrl && input.toLowerCase() === 'b') || input === '\u0002';
+    if (isBackwardChar) {
+      const nextCursor = prevGraphemeIndex(currentValue, currentCursor);
+      cursorRef.current = nextCursor;
+      setCursor(nextCursor);
+      return;
+    }
+
+    // Ctrl+D / delete-char: delete the grapheme at the cursor.
+    // (Ctrl+D on an empty composer is SCLI-447, a separate surface.)
+    const isDeleteChar =
+      (key.ctrl && input.toLowerCase() === 'd') || input === '\u0004';
+    if (isDeleteChar) {
+      const next = nextGraphemeIndex(currentValue, currentCursor);
+      if (next > currentCursor) {
+        const newValue = currentValue.slice(0, currentCursor) + currentValue.slice(next);
+        commitValue(newValue, currentCursor);
+      }
+      return;
+    }
+
+    // Ctrl+T / transpose-chars: swap the grapheme before the cursor with the
+    // grapheme at the cursor (or the last two when the cursor is at the end),
+    // advancing the cursor — readline semantics.
+    const isTranspose =
+      (key.ctrl && input.toLowerCase() === 't') || input === '\u0014';
+    if (isTranspose) {
+      const offsets = graphemeOffsets(currentValue);
+      if (offsets.length < 2) return;
+      let before: number;
+      let at: number;
+      if (currentCursor >= currentValue.length) {
+        // At end: transpose the last two graphemes, cursor stays at end.
+        const lastTwo = offsets[offsets.length - 2];
+        const lastOne = offsets[offsets.length - 1];
+        if (lastTwo === undefined || lastOne === undefined) return;
+        before = lastTwo;
+        at = lastOne;
+      } else {
+        before = prevGraphemeIndex(currentValue, currentCursor);
+        at = nextGraphemeIndex(currentValue, currentCursor);
+        if (before === at) return; // cursor at start, nothing before it
+      }
+      const afterAt = nextGraphemeIndex(currentValue, at);
+      const first = currentValue.slice(before, at);
+      const second = currentValue.slice(at, afterAt);
+      const newValue =
+        currentValue.slice(0, before) + second + first + currentValue.slice(afterAt);
+      const newCursor =
+        currentCursor >= currentValue.length
+          ? newValue.length
+          : at + (at - before);
+      commitValue(newValue, newCursor);
+      return;
+    }
 
     // Escape, Ctrl+U, Ctrl+K handled by parent
     if (key.escape) return;
@@ -340,10 +475,15 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
       return;
     }
 
-    if (valueRef.current !== value) {
+    if (valueRef.current !== value || (cursorAtEndOnExternalValue && value !== '')) {
       valueRef.current = value;
-      // Clamp cursor if external value is shorter than current cursor
-      if (cursorRef.current > value.length) {
+      if (cursorAtEndOnExternalValue && value !== '') {
+        // External draft restore (Ctrl+R/Esc, pager, stash) — resume typing
+        // at the end of the restored text (SCLI-449).
+        cursorRef.current = value.length;
+        setCursor(value.length);
+      } else if (cursorRef.current > value.length) {
+        // Clamp cursor if external value is shorter than current cursor
         cursorRef.current = value.length;
         setCursor(value.length);
       } else {
@@ -355,7 +495,7 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
       cursorRef.current = 0;
       setCursor(0);
     }
-  }, [value]);
+  }, [value, cursorAtEndOnExternalValue]);
 
   // Render from refs — they are always in sync with each other because
   // commitValue updates both atomically. The `value` prop and `cursor` state
@@ -448,10 +588,14 @@ export const MultiLineInput: React.FC<MultiLineInputProps> = ({
             {isActive && isCurrentLine ? (
               (() => {
                 const cursorInLine = Math.max(0, Math.min(contentWidth, cursorCol - line.segmentStart));
-                const before = line.text.slice(0, cursorInLine);
-                const cursorChar = line.text[cursorInLine] ?? ' ';
-                const after = line.text.slice(cursorInLine + 1);
-                const padding = Math.max(0, contentWidth - (before.length + 1 + after.length));
+                // SCLI-463: slice at extended-grapheme boundaries so the cursor
+                // char is the WHOLE cluster under the cursor — never a lone
+                // surrogate / half of a combining sequence.
+                const cluster = graphemeClusterAt(line.text, cursorInLine);
+                const before = line.text.slice(0, cluster.start);
+                const cursorChar = line.text.slice(cluster.start, cluster.end) || ' ';
+                const after = line.text.slice(cluster.end);
+                const padding = Math.max(0, contentWidth - (before.length + cursorChar.length + after.length));
                 return (
                   <Text color={textColor} backgroundColor={backgroundColor}>
                     {before}

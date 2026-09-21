@@ -67,11 +67,80 @@ describe('CLI E2E tests (dist/shizuha.js)', () => {
     expect(fs.existsSync(CLI)).toBe(true);
   });
 
+  describe('device command identity boundary (SCLI-491)', () => {
+    it('rejects logged-out inventory, lookup, and pairing before device state is read or written', async () => {
+      for (const [label, args] of [
+        ['list', ['devices', 'list']],
+        ['revoke', ['devices', 'revoke', 'device-does-not-exist']],
+        ['pair-show-code', ['pair', '--show-code']],
+        ['pair', ['pair']],
+      ] as const) {
+        const home = fs.mkdtempSync(path.join(os.tmpdir(), `scli491-${label}-`));
+        try {
+          const stateFile = path.join(home, '.shizuha', 'devices.json');
+          const result = await runCli([...args], {
+            cwd: home,
+            env: {
+              HOME: home,
+              USERPROFILE: home,
+              XDG_CONFIG_HOME: path.join(home, '.config'),
+            },
+            timeout: 5_000,
+          });
+
+          expect(result.exitCode, label).toBe(1);
+          expect(result.stdout, label).toBe('');
+          expect(result.stderr, label).toBe('Not logged in. Run: shizuha login\n');
+          expect(result.stderr, label).not.toMatch(/not found|No paired devices|Pairing code|at |node:internal|\/dist\//i);
+          expect(fs.existsSync(stateFile), `${label} created device state`).toBe(false);
+        } finally {
+          fs.rmSync(home, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it('rejects blank revoke identifiers after authentication, before lookup', async () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'scli491-blank-id-'));
+      try {
+        const authDir = path.join(home, '.shizuha');
+        fs.mkdirSync(authDir, { recursive: true });
+        fs.writeFileSync(path.join(authDir, 'auth.json'), JSON.stringify({
+          username: 'scli491-test',
+          accessToken: 'test-access-token',
+          refreshToken: 'test-refresh-token',
+          lastLoginAt: new Date(0).toISOString(),
+        }));
+
+        for (const [label, deviceId] of [
+          ['empty', ''],
+          ['ascii-whitespace', ' \t '],
+          ['unicode-whitespace', '\u00a0\u2003'],
+        ] as const) {
+          const result = await runCli(['devices', 'revoke', deviceId], {
+            cwd: home,
+            env: {
+              HOME: home,
+              USERPROFILE: home,
+              XDG_CONFIG_HOME: path.join(home, '.config'),
+            },
+          });
+          expect(result.exitCode, label).toBe(1);
+          expect(result.stdout, label).toBe('');
+          expect(result.stderr, label).toBe('Invalid deviceId: must be non-empty after trimming.\n');
+          expect(result.stderr, label).not.toMatch(/not found|at |node:internal|\/dist\//i);
+        }
+        expect(fs.existsSync(path.join(authDir, 'devices.json'))).toBe(false);
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe('bridge --cwd fail-fast boundary (SCLI-493 / SCLI-529)', () => {
     it('rejects every invalid cwd at both CLI commands with one exact-line diagnostic and no startup state', async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scli529-cli-cwd-'));
       try {
-        for (const command of ['codex-bridge', 'openclaw-bridge']) {
+        for (const command of ['codex-bridge', 'openclaw-bridge', 'antigravity-bridge']) {
           for (const label of INVALID_CWD_LABELS) {
             const caseRoot = fs.mkdtempSync(path.join(root, `${command}-${label}-`));
             const cwd = makeInvalidCwd(caseRoot, label);
@@ -516,6 +585,24 @@ describe('CLI E2E tests (dist/shizuha.js)', () => {
       const { exitCode } = await runCli(['doctor', '--help']);
       expect(exitCode).toBe(0);
     });
+
+    it('openclaw-bridge --help lists the accepted --effort values (SCLI-538)', async () => {
+      const { stdout, exitCode } = await runCli(['openclaw-bridge', '--help']);
+      expect(exitCode).toBe(0);
+      // The option description must enumerate the exact validator choices so a
+      // user can discover the contract without supplying a bad value.
+      expect(stdout).toContain('--effort <level>');
+      expect(stdout).toContain('low/medium/high/xhigh/ultra/max');
+    });
+
+    it('openclaw-bridge rejects an invalid --effort before side effects (SCLI-538)', async () => {
+      const { stdout, stderr, exitCode } = await runCli(['openclaw-bridge', '--effort', 'banana']);
+      expect(exitCode).toBe(1);
+      expect(stdout).toBe('');
+      expect(stderr).toContain('--effort');
+      // The validator diagnostic enumerates the authoritative accepted set.
+      expect(stderr).toContain('low, medium, high, xhigh, ultra, max');
+    });
   });
 
   // ── Error Handling ──
@@ -542,6 +629,175 @@ describe('CLI E2E tests (dist/shizuha.js)', () => {
       const combined = stdout + stderr;
       // Should produce some output (error message, header, etc.)
       expect(combined.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ── reseed-heartbeat scope safety (SCLI-412) ──
+
+  describe('reseed-heartbeat', () => {
+    /** Create a synthetic HOME with zen/mika workspaces, return the env to use. */
+    function makeHome(): { env: Record<string, string | undefined>; home: string } {
+      const home = path.join(
+        os.tmpdir(),
+        'scli412-reseed-home-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+      );
+      const workspaces = path.join(home, '.shizuha', 'workspaces');
+      fs.mkdirSync(path.join(workspaces, 'zen'), { recursive: true });
+      fs.mkdirSync(path.join(workspaces, 'mika'), { recursive: true });
+      fs.writeFileSync(path.join(workspaces, 'zen', 'HEARTBEAT.md'), 'zen-original');
+      fs.writeFileSync(path.join(workspaces, 'mika', 'HEARTBEAT.md'), 'mika-original');
+      return { env: { ...process.env, HOME: home }, home };
+    }
+
+    it('omitted --agent targets all workspaces (dry-run)', async () => {
+      const { env, home } = makeHome();
+      const { stdout, exitCode } = await runCli(['reseed-heartbeat', '--dry-run'], { env });
+      try {
+        expect(exitCode).toBe(0);
+        expect(stdout).toContain('zen');
+        expect(stdout).toContain('mika');
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    it('--agent zen targets exactly zen (dry-run)', async () => {
+      const { env, home } = makeHome();
+      const { stdout, exitCode } = await runCli(['reseed-heartbeat', '--dry-run', '--agent', 'zen'], { env });
+      try {
+        expect(exitCode).toBe(0);
+        expect(stdout).toContain('zen');
+        expect(stdout).not.toContain('mika');
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      ['-a', ''],
+      ['--agent', ''],
+      ['--agent='],
+    ])('explicit-empty selector (%s%s) is rejected, not collapsed to all', async (flag, inline) => {
+      const { env, home } = makeHome();
+      const args = inline !== undefined ? [flag, inline] : [flag];
+      const { stdout, stderr, exitCode } = await runCli(
+        ['reseed-heartbeat', '--dry-run', ...args],
+        { env },
+      );
+      try {
+        const combined = stdout + stderr;
+        expect(exitCode).not.toBe(0);
+        // Must NOT have enumerated both workspaces as the target set, and must
+        // not have rewritten anything (dry-run). Whether commander rejects the
+        // empty value at parse time or our code rejects it (SCLI-412) is
+        // irrelevant — the safety invariant is nonzero exit + no all-targets
+        // enumeration.
+        expect(stdout).not.toContain('mika');
+        expect(stdout).not.toMatch(/Would rewrite/);
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    it('whitespace-only --agent value is rejected (not all-workspace)', async () => {
+      const { env, home } = makeHome();
+      const { stdout, stderr, exitCode } = await runCli(
+        ['reseed-heartbeat', '--dry-run', '--agent', '   '],
+        { env },
+      );
+      try {
+        const combined = stdout + stderr;
+        expect(exitCode).not.toBe(0);
+        expect(combined).toMatch(/invalid --agent/i);
+        expect(stdout).not.toContain('mika');
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    it('dry-run never rewrites fixture bytes for any selector form', async () => {
+      const { env, home } = makeHome();
+      const zenPath = path.join(home, '.shizuha', 'workspaces', 'zen', 'HEARTBEAT.md');
+      const mikaPath = path.join(home, '.shizuha', 'workspaces', 'mika', 'HEARTBEAT.md');
+      try {
+        for (const args of [
+          ['reseed-heartbeat', '--dry-run'],
+          ['reseed-heartbeat', '--dry-run', '--agent', 'zen'],
+          ['reseed-heartbeat', '--dry-run', '-a', ''],
+          ['reseed-heartbeat', '--dry-run', '--agent='],
+        ]) {
+          await runCli(args, { env });
+          expect(fs.readFileSync(zenPath, 'utf8')).toBe('zen-original');
+          expect(fs.readFileSync(mikaPath, 'utf8')).toBe('mika-original');
+        }
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    it('nonexistent selector is rejected, not treated as all', async () => {
+      const { env, home } = makeHome();
+      const { stdout, stderr, exitCode } = await runCli(
+        ['reseed-heartbeat', '--dry-run', '--agent', 'nobody'],
+        { env },
+      );
+      try {
+        const combined = stdout + stderr;
+        expect(exitCode).not.toBe(0);
+        expect(combined).toContain('No workspace found');
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // ── SCLI-395: unknown subcommand must exit nonzero and name the token,
+  //    including when followed by --help (was byte-identical root help + exit 0).
+
+  describe('unknown subcommand rejection (SCLI-395)', () => {
+    it('unknown command + --help exits nonzero and names the token', async () => {
+      const { stdout, stderr, exitCode } = await runCli(['definitely-not-a-real-command', '--help']);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('Unknown command');
+      expect(stderr).toContain('definitely-not-a-real-command');
+      // Must NOT present root help as a successful match.
+      expect(stdout).not.toContain('Usage: shizuha [options] [command]');
+    });
+
+    it('unknown command alone exits nonzero and names the token', async () => {
+      const { stderr, exitCode } = await runCli(['definitely-not-a-real-command']);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('Unknown command');
+      expect(stderr).toContain('definitely-not-a-real-command');
+    });
+
+    it('unknown command with extra args retains the same classification', async () => {
+      const { stderr, exitCode } = await runCli(['definitely-not-a-real-command', 'sentinel']);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('Unknown command');
+      expect(stderr).toContain('definitely-not-a-real-command');
+    });
+
+    it('unadvertised completion --help is rejected consistently', async () => {
+      const { stderr, exitCode } = await runCli(['completion', '--help']);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('Unknown command');
+      expect(stderr).toContain('completion');
+    });
+
+    it('root --help still exits 0', async () => {
+      const { exitCode } = await runCli(['--help']);
+      expect(exitCode).toBe(0);
+    });
+
+    it('a valid command --help still exits 0', async () => {
+      const { exitCode } = await runCli(['auth', '--help']);
+      expect(exitCode).toBe(0);
+    });
+
+    it('an option value is not mistaken for a command', async () => {
+      const { exitCode } = await runCli(['--cwd', '/tmp', 'auth', '--help']);
+      expect(exitCode).toBe(0);
     });
   });
 });

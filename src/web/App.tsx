@@ -14,6 +14,8 @@ import { TaskBoard } from './components/TaskBoard';
 import { WorkflowsView } from './components/WorkflowsView';
 import { useChat } from './hooks/useChat';
 import { useTalkMode } from './hooks/useTalkMode';
+import { useGrokVoiceS2S } from './hooks/useGrokVoiceS2S';
+import { LiveHud } from './components/LiveHud';
 import { useTheme } from './hooks/useTheme';
 import { useNotifications } from './hooks/useNotifications';
 import { useSwipeGesture } from './hooks/useSwipeGesture';
@@ -460,6 +462,12 @@ export default function App() {
       chat.sendMessage(text);
     },
   });
+  const live = useGrokVoiceS2S({
+    agentUsername: selectedAgent?.username,
+    messages: chat.messages,
+    onHeard: (text) => chat.appendLocalMessage('user', text),
+    onReply: (text) => chat.appendLocalMessage('assistant', text),
+  });
 
   // Auto-speak agent responses when talk mode is active
   const lastMessageRef = useRef<string>('');
@@ -880,6 +888,17 @@ export default function App() {
 
           {selectedAgent ? (
             activeView === 'chat' ? (
+              <>
+              <LiveHud
+                callState={live.callState}
+                callError={live.callError}
+                muted={live.muted}
+                lastHeard={live.lastHeard}
+                lastReply={live.lastReply}
+                onMute={live.toggleMute}
+                onEnd={live.endCall}
+                onRetry={live.retryCall}
+              />
               <ChatView
                 ref={chatViewRef}
                 messages={chat.messages}
@@ -889,6 +908,7 @@ export default function App() {
                 reasoningSummaries={chat.reasoningSummaries}
                 highlightMessageId={highlightMsgId}
               />
+              </>
             ) : (
               <ActivityLog agentId={selectedAgent.id} agentName={selectedAgent.name} />
             )
@@ -914,6 +934,12 @@ export default function App() {
               recordingDuration={talk.recordingDuration}
               micSupported={talk.micSupported}
               talkError={talk.error}
+              liveAvailable={live.s2sReady !== false}
+              liveActive={live.callState !== 'idle' && live.callState !== 'error'}
+              onToggleLive={() => {
+                if (live.isCallActive()) live.endCall();
+                else live.startCall();
+              }}
             />
           </div>
         )}

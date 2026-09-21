@@ -1,52 +1,25 @@
-import { beforeAll, describe, expect, it } from 'vitest';
-import { execSync } from 'node:child_process';
+import { beforeAll, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { StateStore } from '../../src/state/store.js';
-
-const projectDir = path.resolve(import.meta.dirname!, '../..');
-
-function shQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-function run(command: string, cwd = projectDir): string {
-  return execSync(command, { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
-}
-
-async function sleepMs(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, ms));
-}
-
-function hasTmux(): boolean {
-  try {
-    run('tmux -V');
-    return true;
-  } catch {
-    return false;
-  }
-}
+import {
+  capture,
+  ensureDistBuilt,
+  killTmux,
+  launchTmux,
+  projectDir,
+  sendKeys,
+  sendLiteral,
+  shQuote,
+  sleepMs,
+  stageProviderCredentials,
+  tmuxE2eDescribe,
+  waitForPattern,
+} from './helpers/tmux-e2e.js';
 
 function countMatches(text: string, pattern: RegExp): number {
   return [...text.matchAll(pattern)].length;
-}
-
-function stageProviderCredentials(tempHome: string): boolean {
-  const srcDir = path.join(os.homedir(), '.shizuha');
-  const dstDir = path.join(tempHome, '.shizuha');
-  const candidates = ['credentials.json', 'auth.json', 'jwt_token', 'config.toml'];
-  let copiedAny = false;
-  for (const file of candidates) {
-    const src = path.join(srcDir, file);
-    const dst = path.join(dstDir, file);
-    if (fs.existsSync(src)) {
-      fs.mkdirSync(path.dirname(dst), { recursive: true });
-      fs.copyFileSync(src, dst);
-      copiedAny = true;
-    }
-  }
-  return copiedAny;
 }
 
 function seedLargeSessions(homeDir: string, cwd: string, count = 140): void {
@@ -71,78 +44,23 @@ function seedLargeSessions(homeDir: string, cwd: string, count = 140): void {
   store.close();
 }
 
-function newSessionName(prefix: string): string {
-  return `${prefix}_${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
-}
-
-function launchTmux(
-  name: string,
-  width: number,
-  height: number,
-  command: string,
-): { session: string; target: string } {
-  const session = newSessionName(name);
-  const target = `${session}:0.0`;
-  run(`tmux new-session -d -x ${width} -y ${height} -s ${shQuote(session)} ${shQuote(command)}`);
-  // Some detached tmux servers ignore new-session -x/-y until a window resize.
-  // Resize explicitly so renderer assertions exercise the requested viewport.
-  run(`tmux resize-window -t ${shQuote(`${session}:0`)} -x ${width} -y ${height}`);
-  return { session, target };
-}
-
-function killTmux(session: string): void {
-  try {
-    run(`tmux kill-session -t ${shQuote(session)}`);
-  } catch {
-    // ignore
-  }
-}
-
-function capture(target: string, startLine = -320): string {
-  return run(`tmux capture-pane -p -t ${shQuote(target)} -S ${startLine}`);
-}
-
-function sendKeys(target: string, ...keys: string[]): void {
-  const normalized = keys.map((key) => key === 'Enter' ? 'C-m' : key);
-  const args = normalized.map(shQuote).join(' ');
-  run(`tmux send-keys -t ${shQuote(target)} ${args}`);
-}
-
-function sendLiteral(target: string, text: string): void {
-  run(`tmux send-keys -t ${shQuote(target)} -l ${shQuote(text)}`);
-}
-
-async function waitForPattern(target: string, pattern: RegExp, timeoutMs: number): Promise<string> {
-  const started = Date.now();
-  let last = '';
-  while (Date.now() - started < timeoutMs) {
-    last = capture(target);
-    if (pattern.test(last)) return last;
-    await sleepMs(80);
-  }
-  throw new Error(`Timeout waiting for ${pattern}. Last capture:\n${last.slice(-2000)}`);
-}
-
-const runTmuxEdgeSuite = hasTmux() && process.env['SHIZUHA_RUN_TMUX_EDGE_E2E'] === '1';
-const tmuxDescribe = runTmuxEdgeSuite ? describe : describe.skip;
-
-tmuxDescribe('TUI tmux edge-case rendering tests', () => {
+tmuxE2eDescribe('TUI tmux edge-case rendering tests', () => {
   beforeAll(() => {
-    run('npm run build');
-  }, 35000);
+    ensureDistBuilt();
+  }, 60000);
 
   it('keeps /resume picker structurally stable with large session content', async () => {
     const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'shizuha-tmux-resume-'));
     stageProviderCredentials(tempHome);
     seedLargeSessions(tempHome, projectDir, 120);
 
-    const launchCommand = `cd ${shQuote(projectDir)} && HOME=${shQuote(tempHome)} FORCE_COLOR=0 node dist/shizuha.js --model claude-opus-4-6`;
+    const launchCommand = `cd ${shQuote(projectDir)} && HOME=${shQuote(tempHome)} SHIZUHA_DISABLE_MCP_JSON=1 FORCE_COLOR=0 node dist/shizuha.js --model test-model`;
     const { session, target } = launchTmux('resume_stability', 76, 42, launchCommand);
 
     try {
       await waitForPattern(target, /Type a message|❯/, 15_000);
       sendKeys(target, '/resume');
-      await sleepMs(60);
+      await waitForPattern(target, /❯\s*\/resume/, 15_000);
       sendKeys(target, 'C-m');
       await waitForPattern(target, /Sessions|☰ Sessions/, 15_000);
 
@@ -194,7 +112,7 @@ tmuxDescribe('TUI tmux edge-case rendering tests', () => {
     const hasCreds = stageProviderCredentials(tempHome);
     if (!hasCreds) return;
     const prefill = 'for i in $(seq 1 260); do printf "prefill-%03d\\n" "$i"; done';
-    const launchCommand = `cd ${shQuote(projectDir)} && ${prefill} && HOME=${shQuote(tempHome)} FORCE_COLOR=0 node dist/shizuha.js --model claude-opus-4-6`;
+    const launchCommand = `cd ${shQuote(projectDir)} && ${prefill} && HOME=${shQuote(tempHome)} SHIZUHA_DISABLE_MCP_JSON=1 FORCE_COLOR=0 node dist/shizuha.js --model test-model`;
     const { session, target } = launchTmux('bottom_launch', 72, 40, launchCommand);
 
     try {
@@ -228,6 +146,31 @@ tmuxDescribe('TUI tmux edge-case rendering tests', () => {
       expect(clearedFrame).toContain('Type a message');
       expect(clearedFrame).not.toContain(marker);
       expect(clearedFrame).toContain('| sup |');
+    } finally {
+      killTmux(session);
+      fs.rmSync(tempHome, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it('opens /mcp overlay and Esc does not leave pager/listing ghosts', async () => {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'shizuha-tmux-mcp-'));
+    stageProviderCredentials(tempHome);
+    const launchCommand = `cd ${shQuote(projectDir)} && HOME=${shQuote(tempHome)} SHIZUHA_DISABLE_MCP_JSON=1 FORCE_COLOR=0 node dist/shizuha.js --model test-model`;
+    const { session, target } = launchTmux('mcp_overlay', 80, 35, launchCommand);
+    try {
+      const before = await waitForPattern(target, /Type a message|❯/, 15_000);
+      sendLiteral(target, '/mcp');
+      await waitForPattern(target, /❯\s*\/mcp/, 15_000);
+      sendKeys(target, 'C-m');
+      const openFrame = await waitForPattern(target, /MCP servers/, 15_000);
+      expect(openFrame).not.toBe(before);
+      expect(openFrame).toMatch(/space\/enter toggle|persisted/i);
+      expect(openFrame).not.toMatch(/Transcript\s+·\s+line/);
+      sendKeys(target, 'Escape');
+      const after = await waitForPattern(target, /Type a message|❯/, 15_000);
+      expect(after).not.toMatch(/space\/enter toggle/);
+      expect(after).not.toMatch(/ MCP servers /);
+      expect(after).not.toMatch(/Transcript\s+·\s+line \d+/);
     } finally {
       killTmux(session);
       fs.rmSync(tempHome, { recursive: true, force: true });

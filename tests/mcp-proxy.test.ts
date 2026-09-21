@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   parseExtraHeaders,
+  validateUpstreamUrl,
   resolveProxyConfig,
   buildUpstreamHeaders,
   resolveUpstreamBearer,
@@ -33,9 +34,15 @@ describe('mcp-proxy: parseExtraHeaders', () => {
     });
   });
 
-  it('skips blank / malformed entries and tolerates undefined', () => {
+  it('tolerates undefined and blank entries', () => {
     expect(parseExtraHeaders(undefined)).toEqual({});
-    expect(parseExtraHeaders(['', 'no-separator', '  '])).toEqual({});
+    expect(parseExtraHeaders(['', '  '])).toEqual({});
+  });
+
+  it('rejects malformed entries with a bounded diagnostic (SCLI-403)', () => {
+    for (const bad of ['no-separator', ': no-key', 'Bad Key: v', 'X-Foo', 'X Foo: v']) {
+      expect(() => parseExtraHeaders([bad])).toThrow(/invalid --header/);
+    }
   });
 
   it('keeps colons inside the value (e.g. URLs)', () => {
@@ -43,9 +50,28 @@ describe('mcp-proxy: parseExtraHeaders', () => {
   });
 });
 
+describe('mcp-proxy: validateUpstreamUrl (SCLI-403)', () => {
+  it('accepts absolute http:/https: endpoints', () => {
+    expect(validateUpstreamUrl('http://127.0.0.1:9/mcp')).toMatch(/^http:\/\//);
+    expect(validateUpstreamUrl('https://host/mcp/pulse/mcp')).toMatch(/^https:\/\//);
+  });
+
+  it('rejects malformed / non-HTTP / relative URLs with a bounded diagnostic', () => {
+    for (const bad of ['not-a-url', 'file:///etc/passwd', 'javascript:alert(1)', 'data:text/plain,x', '/relative/path', 'http://']) {
+      expect(() => validateUpstreamUrl(bad)).toThrow(/invalid --upstream-url/);
+    }
+  });
+});
+
 describe('mcp-proxy: resolveProxyConfig', () => {
   it('requires an upstream URL', () => {
     expect(() => resolveProxyConfig({ name: 'pulse' }, {})).toThrow(/upstream-url/);
+  });
+
+  it('rejects non-HTTP upstream URLs (SCLI-403)', () => {
+    for (const bad of ['not-a-url', 'file:///etc/passwd', 'javascript:alert(1)']) {
+      expect(() => resolveProxyConfig({ name: 'pulse', upstreamUrl: bad }, {})).toThrow(/invalid --upstream-url/);
+    }
   });
 
   it('materialises MCP_UPSTREAM_ORG into an X-Organization-ID header', () => {

@@ -6,6 +6,8 @@ import * as path from 'node:path';
 import {
   getHeartbeatTemplate,
   seedHeartbeatTemplate,
+  upgradeStaleHeartbeatTemplate,
+  isStaleHeartbeatTemplate,
 } from '../../src/daemon/heartbeat-template.js';
 
 // SCLI-82: the workspace HEARTBEAT.md template must mirror the SCLI-76 anti-churn
@@ -43,5 +45,42 @@ describe('HEARTBEAT.md template — SCLI-76 anti-churn rule', () => {
     fs.writeFileSync(target, 'operator-customized content', 'utf-8');
     seedHeartbeatTemplate(ws);
     expect(fs.readFileSync(target, 'utf-8')).toBe('operator-customized content');
+  });
+
+  it('classifies the Aoi 2026-09-10 8-line checklist as stale', () => {
+    const aoi = `# HEARTBEAT
+
+## Checklist
+
+- [ ] Review pending items in todo list
+- [ ] Check for unresolved alerts or blockers
+- [ ] Confirm no scheduled jobs need attention
+- [ ] Report status if any action was taken
+`;
+    expect(isStaleHeartbeatTemplate(aoi)).toBe(true);
+    expect(isStaleHeartbeatTemplate(getHeartbeatTemplate())).toBe(false);
+  });
+
+  it('upgrades a stale HEARTBEAT.md and leaves a Pulse-pair customization', () => {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'hb-upgrade-'));
+    tmpDirs.push(ws);
+    const target = path.join(ws, 'HEARTBEAT.md');
+
+    expect(upgradeStaleHeartbeatTemplate(ws)).toBe('absent');
+
+    fs.writeFileSync(target, '# HEARTBEAT\n- [ ] Report status if any action was taken\n', 'utf-8');
+    expect(upgradeStaleHeartbeatTemplate(ws)).toBe('upgraded');
+    const upgraded = fs.readFileSync(target, 'utf-8');
+    expect(upgraded).toContain('pulse_get_my_work');
+    expect(upgraded).toContain('SCLI-76');
+    expect(upgradeStaleHeartbeatTemplate(ws)).toBe('kept');
+
+    fs.writeFileSync(
+      target,
+      'custom: call pulse_get_my_alerts then pulse_get_my_tasks\n',
+      'utf-8',
+    );
+    expect(upgradeStaleHeartbeatTemplate(ws)).toBe('kept');
+    expect(fs.readFileSync(target, 'utf-8')).toContain('custom:');
   });
 });

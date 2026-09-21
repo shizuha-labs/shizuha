@@ -100,6 +100,39 @@ describe('PLAT-1062 P4b — runtime desired-state writes use AgentStateStore', (
     store.close();
   });
 
+  it('persists hibernation without setting the operator kill-switch', () => {
+    const store = new AgentStateStore(':memory:');
+    __setAgentStateStoreForTest(store);
+    writeAgents([baseAgent()]);
+    // Legacy automatic hibernation was persisted as an operator stop.  The
+    // first typed Hive reconcile must safely migrate that collapsed state.
+    expect(setAgentDesiredRuntimeState('agent-1', false, {
+      actor: 'legacy-hibernate',
+    }).ok).toBe(true);
+    expect(store.getAgent('agent-1')?.operator_disabled).toBe(1);
+
+    const result = setAgentDesiredRuntimeState('agent-1', false, {
+      actor: 'hive-on-demand',
+      lifecycleState: 'hibernated',
+    });
+
+    expect(result.ok).toBe(true);
+    expect(store.getAgent('agent-1')).toMatchObject({
+      desired_enabled: 0,
+      operator_disabled: 0,
+      desired_status: 'hibernated',
+    });
+    expect(readEnabledAgents().has('agent-1')).toBe(false);
+    expect(readDisabledAgents().has('agent-1')).toBe(false);
+    const eventCount = store.listEvents('agent-1').length;
+    expect(setAgentDesiredRuntimeState('agent-1', false, {
+      actor: 'hive-on-demand',
+      lifecycleState: 'hibernated',
+    }).ok).toBe(true);
+    expect(store.listEvents('agent-1')).toHaveLength(eventCount);
+    store.close();
+  });
+
   it('does not mirror enabled state when the authoritative store is unavailable', () => {
     __setAgentStateStoreForTest(null);
     writeAgents([baseAgent()]);

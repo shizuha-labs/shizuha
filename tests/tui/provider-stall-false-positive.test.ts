@@ -69,9 +69,36 @@ describe('provider-status stall writers keep prevStalledRef in sync', () => {
     expect(listener).toContain('isProviderRecoverySignal(event)');
     expect(listener).toContain('providerWaitNoticeActiveRef.current');
     expect(listener).toContain('setRetryNotice(null);');
+    expect(listener).toContain('setError(null);');
     expect(listener).toContain('setStalledMs(0);');
     expect(listener).toContain('stalledMsRef.current = 0;');
     expect(listener).toContain('prevStalledRef.current = 0;');
+  });
+});
+
+describe('retryable API errors do not pin the red header chrome', () => {
+  it('leaves setError for terminal failures only', () => {
+    const errorCase = hookSrc.slice(
+      hookSrc.indexOf("case 'error':"),
+      hookSrc.indexOf("case 'complete':"),
+    );
+    const retryBranch = errorCase.slice(0, errorCase.indexOf('} else {'));
+    expect(retryBranch).toContain('setRetryNotice(');
+    expect(
+      retryBranch,
+      'in-flight 429/ECONNRESET retries must not call setError — that is the red ✗ banner above the header',
+    ).not.toMatch(/setError\(event\.error\)/);
+    expect(errorCase.slice(errorCase.indexOf('} else {'))).toContain('setError(event.error);');
+  });
+
+  it('idle watchdog does not treat a running tool as a provider stall', () => {
+    const tick = hookSrc.slice(
+      hookSrc.indexOf('const waitFresh = providerWaitActiveRef.current'),
+      hookSrc.indexOf('if (nextStall > 0 && !stallAnnouncedRef.current)'),
+    );
+    expect(tick).toContain("const toolsRunning = currentToolsRef.current.some((tool) => tool.status === 'running')");
+    expect(tick).toContain('const nextStall = toolsRunning');
+    expect(tick).toContain('? 0');
   });
 });
 
@@ -139,26 +166,64 @@ describe('provider retry notice follows the live provider state', () => {
   });
 });
 
-describe('idle watchdog clear path is authoritative (no stale-ref gate)', () => {
+describe('idle watchdog: authoritative clear, hold while keepalives fresh (SCLI-522)', () => {
   const tick = hookSrc.slice(
-    hookSrc.indexOf('const nextStall = longWaitDisplayMs(idleMs, STALL_WARN_MS);'),
+    hookSrc.indexOf('const waitFresh = providerWaitActiveRef.current'),
     hookSrc.indexOf('if (nextStall > 0 && !stallAnnouncedRef.current)'),
   );
 
+  it("holds the direct writers' banner while provider keepalives are fresh", () => {
+    // Keepalives deliberately do NOT refresh lastAgentEventAtRef (SCLI-388 —
+    // the idle watchdog must still catch a hang masked by fake keepalives), so
+    // clearing on `idleMs < STALL_WARN_MS` erased the direct writers' 30s card
+    // within a second of every keepalive: QA reconfirmation 2026-09-14 measured
+    // the card invisible on the cortex/ollama lanes. While the wait is live and
+    // fresh the watchdog must HOLD the direct writer's value instead.
+    expect(tick).toContain('const waitFresh = providerWaitActiveRef.current');
+    expect(tick).toContain('Date.now() - lastProviderWaitAtRef.current < PROVIDER_WAIT_FRESH_MS');
+    expect(tick).toContain(
+      '? Math.max(stalledMsRef.current, longWaitDisplayMs(idleMs, STALL_WARN_MS))',
+    );
+  });
+
   it('reconciles the clear whenever nextStall is 0 and either stall source is showing', () => {
     // The actual state ref is the fail-safe if a future direct writer forgets
-    // to sync prevStalledRef. The watchdog remains the authoritative clear.
+    // to sync prevStalledRef. The watchdog remains the authoritative clear —
+    // once keepalives stop being fresh, the idle clock decides again.
     expect(tick).toContain(
       "const changed = nextStall === 0\n          ? prevStalledRef.current !== 0 || stalledMsRef.current !== 0",
     );
   });
 
-  it('still escalates a fresh real stall from the idle path', () => {
+  it('still escalates a fresh real stall from the idle path once keepalives stop', () => {
     // When no direct writer set a stall, prevStalledRef stays 0 and a real
     // idle stall (no agent events for >STALL_WARN_MS) must still fire.
     expect(tick).toContain(
       ": prevStalledRef.current === 0\n            ? nextStall > 0",
     );
+  });
+
+  it('stamps keepalive freshness in the request_wait/request_start handler', () => {
+    const block = hookSrc.slice(
+      hookSrc.indexOf("if (statusCode === 'request_wait' || statusCode === 'request_start')"),
+    );
+    const handler = block.slice(0, block.indexOf('const stallMs = longWaitDisplayMs'));
+    expect(handler).toContain('providerWaitActiveRef.current = true;');
+    expect(handler).toContain('lastProviderWaitAtRef.current = Date.now();');
+  });
+
+  it('ends the hold on recovery evidence and at turn boundaries', () => {
+    const listenerStart = hookSrc.indexOf("s.on('agent_event', (event: AgentEvent) =>");
+    const listener = hookSrc.slice(listenerStart, listenerStart + 4000);
+    expect(
+      listener,
+      'the recovery-signal block must end the keepalive hold',
+    ).toContain('providerWaitActiveRef.current = false;');
+    const turnStart = hookSrc.slice(
+      hookSrc.indexOf("case 'turn_start':"),
+      hookSrc.indexOf("case 'background_task'"),
+    );
+    expect(turnStart).toContain('providerWaitActiveRef.current = false;');
   });
 
   it('does not persist soft wait warnings into transcript history', () => {

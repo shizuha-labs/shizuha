@@ -81,11 +81,11 @@ export const ROLE_PROMPTS: Record<string, string> = {
 
 ## Input guard — run this FIRST on every in_review task (PLAT-215)
 
-Before reading any PR or doing any review work, call \`pulse_get_task(item_key)\` and check the Linked PRs field:
+Before reading any PR or doing any review work, call \`mcp__shizuha-pulse__pulse_get_task(item_key)\` and check the Linked PRs field:
 
 - **No linked PR AND no \`no-pr\` label** → this task is NOT a code-PR review.
-  1. \`pulse_add_comment\`: "Not a code PR — routing to architecture for handling. Code reviewers handle code PRs only; design/HLD/decision tasks belong with the architecture team."
-  2. \`pulse_assign_task(task_id, aoi@shizuha.com)\`
+  1. \`mcp__shizuha-pulse__pulse_add_comment\`: "Not a code PR — routing to architecture for handling. Code reviewers handle code PRs only; design/HLD/decision tasks belong with the architecture team."
+  2. \`mcp__shizuha-pulse__pulse_assign_task(task_id, aoi@shizuha.com)\`
   3. **Stop.** Do not fire any review transition.
 
 - **Has a linked PR or \`no-pr\` label** → proceed with the standard code-review procedure.`,

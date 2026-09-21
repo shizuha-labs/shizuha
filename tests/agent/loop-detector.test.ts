@@ -103,6 +103,27 @@ describe('LoopDetector', () => {
       expect(result).toBe('ok');
     });
 
+    it('treats pulse_get_my_work {} vs {limit:40} as the same listing (Ryo 2026-09-11)', () => {
+      const name = 'mcp__shizuha-pulse__pulse_get_my_work';
+      expect(detector.record(name, {})).toBe('ok');
+      expect(detector.record(name, { limit: 40 })).toBe('ok');
+      expect(detector.record(name, {})).toBe('warning');
+      expect(detector.record(name, { limit: 40 })).toBe('warning');
+      expect(detector.record(name, {})).toBe('break');
+      // get_task keys must stay distinct — that is real work, not a listing loop.
+      const next = new LoopDetector();
+      expect(next.record('mcp__shizuha-pulse__pulse_get_task', { task_id: 'PLAT-1' })).toBe('ok');
+      expect(next.record('mcp__shizuha-pulse__pulse_get_task', { task_id: 'PLAT-2' })).toBe('ok');
+      expect(next.record('mcp__shizuha-pulse__pulse_get_task', { task_id: 'PLAT-1' })).toBe('ok');
+    });
+
+    it('collapses GLM garbled tool names so wrap-up spam breaks (Shion 2026-09-15)', () => {
+      const d = new LoopDetector({ warningThreshold: 2, breakThreshold: 3 });
+      expect(d.record('message_user()()={"content": "pong"}audit_user', {})).toBe('ok');
+      expect(d.record('audit_audit_audit_audit', {})).toBe('warning');
+      expect(d.record('message_user()()()()()()()()()()()()', {})).toBe('break');
+    });
+
     it('interleaving a different call resets the streak', () => {
       detector.record('read', { file_path: '/tmp/x' });
       detector.record('read', { file_path: '/tmp/x' });
@@ -149,7 +170,41 @@ describe('LoopDetector', () => {
       detector.record('read', { file_path: '/tmp/x' });
       detector.record('read', { file_path: '/tmp/x' });
       // This triggers exact repeat detection (warning/break), not ping-pong
-      // The ping-pong check returns 0 because the last two have the same tool name
+      // Identical (tool, input) is exact-repeat; ping-pong requires two signatures.
+    });
+
+    it('detects same-tool two-argument ABAB (revi pulse_get_task loop)', () => {
+      const a = { task_key: 'HIVE-1953' };
+      const b = { task_key: 'PLS-986' };
+      detector.record('mcp__shizuha-pulse__pulse_get_task', a);
+      detector.record('mcp__shizuha-pulse__pulse_get_task', b);
+      detector.record('mcp__shizuha-pulse__pulse_get_task', a);
+      detector.record('mcp__shizuha-pulse__pulse_get_task', b);
+      detector.record('mcp__shizuha-pulse__pulse_get_task', a);
+      expect(detector.record('mcp__shizuha-pulse__pulse_get_task', b)).toBe('warning');
+    });
+
+    it('breaks same-tool ABAB at threshold (5 pairs)', () => {
+      const a = { task_key: 'HIVE-1953' };
+      const b = { task_key: 'PLS-986' };
+      for (let i = 0; i < 4; i++) {
+        detector.record('mcp__shizuha-pulse__pulse_get_task', a);
+        detector.record('mcp__shizuha-pulse__pulse_get_task', b);
+      }
+      detector.record('mcp__shizuha-pulse__pulse_get_task', a);
+      expect(detector.record('mcp__shizuha-pulse__pulse_get_task', b)).toBe('break');
+    });
+
+    it('accumulates same-tool ABAB across heartbeat-sized batches without reset', () => {
+      const a = { task_key: 'HIVE-1953' };
+      const b = { task_key: 'PLS-986' };
+      // Three heartbeats of two get_tasks each, detector not reset.
+      for (let beat = 0; beat < 2; beat++) {
+        expect(detector.record('mcp__shizuha-pulse__pulse_get_task', a)).toBe('ok');
+        expect(detector.record('mcp__shizuha-pulse__pulse_get_task', b)).toBe('ok');
+      }
+      expect(detector.record('mcp__shizuha-pulse__pulse_get_task', a)).toBe('ok');
+      expect(detector.record('mcp__shizuha-pulse__pulse_get_task', b)).toBe('warning');
     });
 
     it('requires at least 4 entries for ping-pong detection', () => {
@@ -250,5 +305,48 @@ describe('LoopDetector', () => {
       const result = detector.record('read', {});
       expect(result).toBe('warning');
     });
+  });
+});
+
+describe('PLAT-8991: clean-beat boundary reset', () => {
+  let detector: InstanceType<typeof LoopDetector>;
+
+  beforeEach(() => {
+    detector = new LoopDetector();
+  });
+
+  it('resets the probe streak after a contract-correct drained beat (no writes)', () => {
+    // Simulate the 90s fleet cadence: many drained beats, each one
+    // pulse_get_my_work probe. Without the boundary reset the streak
+    // false-positives within the hour.
+    for (let beat = 0; beat < 10; beat++) {
+      detector.record('mcp__shizuha-pulse__pulse_get_my_work', {});
+      detector.resetIfNoWrites([{ name: 'mcp__shizuha-pulse__pulse_get_my_work', input: {} }]);
+    }
+    expect(detector.record('mcp__shizuha-pulse__pulse_get_my_work', {})).toBe('ok');
+  });
+
+  it('keeps the history when the beat was dirty (a write-class call ran)', () => {
+    for (let i = 0; i < 4; i++) {
+      detector.record('mcp__shizuha-pulse__pulse_get_my_work', {});
+    }
+    // A dirty beat (write-class call ran) must NOT reset the history — the
+    // next identical probe still crosses the break threshold. (The streak
+    // counters are trailing-window: interleaved writes break the trailing
+    // run, but the accumulated history is preserved for the threshold.)
+    // `edit` is write-class per WRITE_TOOL_NAMES (Pulse mutations are not —
+    // a beat that did real Pulse work made progress and legitimately resets).
+    detector.resetIfNoWrites([
+      { name: 'mcp__shizuha-pulse__pulse_get_my_work', input: {} },
+      { name: 'edit', input: { file_path: '/tmp/x', old_string: 'a', new_string: 'b' } },
+    ]);
+    expect(detector.record('mcp__shizuha-pulse__pulse_get_my_work', {})).toBe('break');
+  });
+
+  it('still breaks on a within-turn ABAB fetch loop (persistence preserved for dirty turns)', () => {
+    for (let i = 0; i < 5; i++) {
+      detector.record('mcp__shizuha-pulse__pulse_get_my_work', {});
+    }
+    expect(detector.record('mcp__shizuha-pulse__pulse_get_my_work', {})).toBe('break');
   });
 });

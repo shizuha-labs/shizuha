@@ -14,8 +14,8 @@ import {
   CLAUDE_HEARTBEAT_OBSERVATION_RETRY_TRIGGER,
 } from '../../src/claude-bridge/index.js';
 
-describe('heartbeat cross-inbox priority contract', () => {
-  it('keeps every runtime prompt on priority-first arbitration with alert tie-breaks', () => {
+describe('heartbeat combined-inbox contract', () => {
+  it('keeps every runtime prompt on pulse_get_my_work with agent choice, not harness order', () => {
     const providerProfiles = fs.readFileSync(
       path.resolve('src/provider/model-profile.ts'),
       'utf8',
@@ -39,11 +39,19 @@ describe('heartbeat cross-inbox priority contract', () => {
       gateway,
       bundledSkill,
     ]) {
-      expect(surface).toContain('highest-priority');
-      expect(surface).toContain('alerts win ties');
-      expect(surface).toContain('never preempt higher-priority task WIP');
+      expect(surface).toContain('pulse_get_my_work');
+      expect(surface).not.toContain('alerts win ties');
       expect(surface).not.toContain('Alerts outrank tasks');
-      expect(surface).not.toContain('active alert before ordinary');
+      expect(surface).not.toContain('ordered alert-then-task pair is MANDATORY');
     }
+    expect(bundledSkill).toContain('critical: true');
+    expect(bundledSkill).toContain('agents_md: true');
+    expect(bundledSkill).toContain('You choose');
+    expect(bundledSkill).toContain('Floor skill');
+    expect(AGENT_BASE_INSTRUCTIONS).toContain('the harness does not pick an item');
+    expect(HEARTBEAT_TRIGGER).toContain('Call `mcp__shizuha-pulse__pulse_get_my_work` once');
+    expect(HEARTBEAT_TRIGGER).toContain('stop with no text');
+    expect(HEARTBEAT_TRIGGER).toContain('will not fetch Pulse');
+    expect(HEARTBEAT_TRIGGER).not.toMatch(/If you have ready Pulse work, call/);
   });
 });

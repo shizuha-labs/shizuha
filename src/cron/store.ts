@@ -37,6 +37,47 @@ export interface CronDelivery {
 
 export const DEFAULT_WAKEUP_COOLDOWN_MS = 60_000;
 export const HARD_WAKEUP_RUNAWAY_CAP = 50;
+/** Interval `schedule_job` ("every 10m") is a poll. Wakeup loops already cap
+ *  at 50; interval jobs used `repeat.times = null` (forever). Aoi 2026-09-09:
+ *  two watches ran 380 / 199 ticks, wrote curl transcripts into the eternal
+ *  session, and GLM self-reported a degraded 300k state. Calendar crons
+ *  (`0 9 * * *`) stay unbounded. */
+export const HARD_INTERVAL_RUNAWAY_CAP = 50;
+
+const FORBIDDEN_INTERVAL_POLL_NEEDLES = [
+  'merge-on-green',
+  'merge watch',
+  're-anchor',
+  'commit status',
+  'until merged',
+  'until green',
+  '/pulls/',
+  '/api/v1/repos/',
+  'origin.shizuha.com/api',
+  'serving watchdog',
+  'approval watch',
+];
+
+/** Interval `schedule_job` recipes that curl PRs/CI/serving into the eternal
+ *  session. One-shot delays and calendar crons are not this class. Wakeup
+ *  loops have their own cap. */
+export function isForbiddenIntervalPoll(name: string, prompt: string): boolean {
+  const blob = `${name}\n${prompt}`.toLowerCase();
+  return FORBIDDEN_INTERVAL_POLL_NEEDLES.some((needle) => blob.includes(needle));
+}
+
+function defaultRepeatTimes(
+  scheduleKind: CronSchedule['kind'],
+  explicit?: number | null,
+): number | null {
+  if (explicit !== undefined && explicit !== null) {
+    if (scheduleKind === 'interval') return Math.min(explicit, HARD_INTERVAL_RUNAWAY_CAP);
+    return explicit;
+  }
+  if (scheduleKind === 'delay') return 1;
+  if (scheduleKind === 'interval') return HARD_INTERVAL_RUNAWAY_CAP;
+  return null;
+}
 
 export type CronJobKind = 'job' | 'wakeup';
 export type WakeupLoopMode = 'dynamic' | 'fixed';
@@ -199,6 +240,49 @@ export class CronStore {
     } catch {
       this.jobs = [];
     }
+    if (this.disableRunawayIntervalJobs()) {
+      await this.save();
+    }
+  }
+
+  /** Disable interval polls that already exceeded the runaway cap, bound
+   *  remaining `times: null` interval jobs so they cannot run forever, and
+   *  disable PR/CI/serving watches even before they hit the cap. */
+  disableRunawayIntervalJobs(): boolean {
+    let changed = false;
+    for (const job of this.jobs) {
+      if (!job.enabled) continue;
+      if (job.kind === 'wakeup') continue;
+      if (job.schedule?.kind !== 'interval') continue;
+      const completed = job.repeat?.completed ?? 0;
+      if (job.repeat.times === null || job.repeat.times > HARD_INTERVAL_RUNAWAY_CAP) {
+        job.repeat.times = HARD_INTERVAL_RUNAWAY_CAP;
+        changed = true;
+      }
+      if (isForbiddenIntervalPoll(job.name, job.prompt)) {
+        job.enabled = false;
+        job.lastError = 'forbidden interval PR/CI/serving watch — context-poisoning';
+        logger.warn({
+          jobId: job.id,
+          name: job.name,
+          completed,
+        }, 'Disabled forbidden interval poll — polling watches poison the eternal session');
+        changed = true;
+        continue;
+      }
+      if (completed >= HARD_INTERVAL_RUNAWAY_CAP) {
+        job.enabled = false;
+        job.lastError = `interval runaway cap (${HARD_INTERVAL_RUNAWAY_CAP}) reached`;
+        logger.warn({
+          jobId: job.id,
+          name: job.name,
+          completed,
+          cap: HARD_INTERVAL_RUNAWAY_CAP,
+        }, 'Disabled interval cron job at runaway cap — polling watches poison the eternal session');
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   private async save(): Promise<void> {
@@ -221,6 +305,17 @@ export class CronStore {
     if (opts.loop) {
       this.assertLoopCanBeScheduled(opts.loop);
     }
+    if (
+      opts.schedule.kind === 'interval'
+      && (opts.kind ?? 'job') !== 'wakeup'
+      && isForbiddenIntervalPoll(opts.name, opts.prompt)
+    ) {
+      throw new Error(
+        'Refused: interval PR/CI/serving watches poison the eternal session (skill context-poisoning). '
+        + 'Hook the event (Forgejo webhook, Pulse transition, CI status, Cortex health) instead of polling with schedule_job. '
+        + 'One-shot delays and calendar crons are still allowed.',
+      );
+    }
 
     const job: CronJob = {
       id: crypto.randomBytes(6).toString('hex'),
@@ -232,7 +327,7 @@ export class CronStore {
       createdAt: new Date().toISOString(),
       nextRunAt: computeNextRun(opts.schedule),
       repeat: {
-        times: opts.repeatTimes !== undefined ? opts.repeatTimes : (opts.schedule.kind === 'delay' ? 1 : null),
+        times: defaultRepeatTimes(opts.schedule.kind, opts.repeatTimes),
         completed: 0,
       },
       deliver: opts.deliver,
@@ -288,11 +383,15 @@ export class CronStore {
     job.claimedAt = undefined;
     job.repeat.completed++;
 
-    // Check if completed
-    if (job.repeat.times !== null && job.repeat.completed >= job.repeat.times) {
+    // Check if completed. Interval polls also hit the runaway cap when
+    // times was persisted as null by an older harness.
+    const intervalCap = job.kind !== 'wakeup' && job.schedule.kind === 'interval'
+      ? HARD_INTERVAL_RUNAWAY_CAP
+      : null;
+    const limit = job.repeat.times ?? intervalCap;
+    if (limit !== null && job.repeat.completed >= limit) {
       job.enabled = false;
     } else {
-      // Compute next run
       job.nextRunAt = computeNextRun(job.schedule);
     }
     await this.save();

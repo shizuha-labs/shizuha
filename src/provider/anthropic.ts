@@ -56,6 +56,16 @@ function toAnthropicMessages(messages: ChatMessage[]): Anthropic.MessageParam[] 
             signature: b.signature,
           };
         }
+        if (b.type === 'image') {
+          return {
+            type: 'image' as const,
+            source: {
+              type: 'base64' as const,
+              data: b.source.data,
+              media_type: b.source.media_type as 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp',
+            },
+          };
+        }
         if (b.type === 'tool_result') {
           // If tool result contains an image, send as image content block
           const hasImage = !!(b as any).image;

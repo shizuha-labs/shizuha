@@ -8,6 +8,8 @@ import {
   CronStore,
   parseSchedule,
   computeNextRun,
+  HARD_INTERVAL_RUNAWAY_CAP,
+  isForbiddenIntervalPoll,
   type CronSchedule,
   type CronDelivery,
   type CronJob,
@@ -391,15 +393,47 @@ describe('CronStore', () => {
       expect(job.repeat.completed).toBe(0);
     });
 
-    it('interval jobs get repeat.times = null (infinite)', async () => {
+    it('interval jobs are bounded by HARD_INTERVAL_RUNAWAY_CAP, not forever', async () => {
       const job = await store.addJob({
         name: 'Repeat',
         prompt: 'repeat',
         schedule: parseSchedule('every 30m'),
         deliver: delivery(),
       });
-      expect(job.repeat.times).toBeNull();
+      expect(job.repeat.times).toBe(HARD_INTERVAL_RUNAWAY_CAP);
       expect(job.repeat.completed).toBe(0);
+    });
+
+    it('refuses interval PR/CI merge watches (Aoi/Kei/Ryo 2026-09-09)', async () => {
+      await expect(store.addJob({
+        name: 'cortex#160 merge watch v2 (PLAT-7319)',
+        prompt: 'GET https://origin.shizuha.com/api/v1/repos/shizuha-labs/cortex/pulls/160',
+        schedule: parseSchedule('every 15m'),
+        deliver: delivery(),
+      })).rejects.toThrow(/context-poisoning/);
+    });
+
+    it('still allows a one-shot delay that mentions a PR', async () => {
+      const job = await store.addJob({
+        name: 'cortex#160 merge watch v2 (PLAT-7319)',
+        prompt: 'GET https://origin.shizuha.com/api/v1/repos/shizuha-labs/cortex/pulls/160',
+        schedule: parseSchedule('30m'),
+        deliver: delivery(),
+      });
+      expect(job.enabled).toBe(true);
+      expect(job.repeat.times).toBe(1);
+    });
+
+    it('classifies Aoi/Kai/Kei poll recipes as forbidden', () => {
+      expect(isForbiddenIntervalPoll(
+        'cortex#160 re-anchor watch (aoi co-sign)',
+        'curl PR 160; if already approved at HEAD, nothing to do this tick',
+      )).toBe(true);
+      expect(isForbiddenIntervalPoll(
+        'GLM serving watchdog (PLAT-7413, 15m)',
+        'PLAT-7413 serving watchdog tick (15m cadence)',
+      )).toBe(true);
+      expect(isForbiddenIntervalPoll('Morning Summary', 'Summarize unread mail')).toBe(false);
     });
 
     it('wakeup loops can carry explicit iteration caps and metadata', async () => {
@@ -506,7 +540,7 @@ describe('CronStore', () => {
       expect(updated.lastStatus).toBe('ok');
       expect(updated.lastRunAt).toBeDefined();
       expect(updated.repeat.completed).toBe(1);
-      expect(updated.enabled).toBe(true); // infinite repeat, still enabled
+      expect(updated.enabled).toBe(true); // 1 of HARD_INTERVAL_RUNAWAY_CAP
     });
 
     it('marks error status with error message', async () => {
@@ -694,6 +728,59 @@ describe('CronStore', () => {
       const freshStore = new CronStore(stateDir);
       await freshStore.load();
       expect(freshStore.listJobs()).toEqual([]);
+    });
+
+    it('load disables interval jobs that already exceeded the runaway cap (aoi 2026-09-09)', async () => {
+      const cronDir = path.join(stateDir, 'cron');
+      await fs.mkdir(cronDir, { recursive: true });
+      await fs.writeFile(path.join(cronDir, 'jobs.json'), JSON.stringify({
+        jobs: [{
+          id: 'e5142b3e35f7',
+          name: 'generic interval ping',
+          prompt: 'ping health',
+          schedule: { kind: 'interval', ms: 600000, display: 'every 10m' },
+          enabled: true,
+          kind: 'job',
+          createdAt: '2026-09-07T00:00:00.000Z',
+          nextRunAt: '2026-09-09T17:30:00.000Z',
+          repeat: { times: null, completed: 380 },
+          deliver: delivery(),
+        }],
+      }), 'utf-8');
+
+      const freshStore = new CronStore(stateDir);
+      await freshStore.load();
+      expect(freshStore.listJobs()).toHaveLength(0);
+      const all = freshStore.listJobs(true);
+      expect(all).toHaveLength(1);
+      expect(all[0]!.enabled).toBe(false);
+      expect(all[0]!.repeat.times).toBe(HARD_INTERVAL_RUNAWAY_CAP);
+      expect(all[0]!.lastError).toMatch(/runaway cap/);
+    });
+
+    it('load disables a forbidden interval poll even before the cap', async () => {
+      const cronDir = path.join(stateDir, 'cron');
+      await fs.mkdir(cronDir, { recursive: true });
+      await fs.writeFile(path.join(cronDir, 'jobs.json'), JSON.stringify({
+        jobs: [{
+          id: '338593728e10',
+          name: 'DOJO-124 #46 merge watch',
+          prompt: 'GET https://origin.shizuha.com/api/v1/repos/shizuha-labs/home/pulls/46',
+          schedule: { kind: 'interval', ms: 1_800_000, display: 'every 30m' },
+          enabled: true,
+          kind: 'job',
+          createdAt: '2026-09-09T00:00:00.000Z',
+          nextRunAt: '2026-09-09T18:00:00.000Z',
+          repeat: { times: null, completed: 8 },
+          deliver: delivery(),
+        }],
+      }), 'utf-8');
+
+      const freshStore = new CronStore(stateDir);
+      await freshStore.load();
+      const all = freshStore.listJobs(true);
+      expect(all[0]!.enabled).toBe(false);
+      expect(all[0]!.lastError).toMatch(/forbidden interval/);
     });
   });
 });

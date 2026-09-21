@@ -13,6 +13,25 @@ const MODEL_CONTEXT: Record<string, number> = {
 
 const DEFAULT_CONTEXT = 128000;
 
+/**
+ * SCLI-522: interactive soft-stall threshold for the no-header wait.
+ *
+ * 1ad759e83 pushed the vLLM lane's interactive threshold 30s -> 300s and
+ * regressed SCLI-388's bounded no-header recovery; the ollama lane never had
+ * the keepalive contract at all (QA reconfirmation 2026-09-14: all four
+ * SCLI-522 acceptance criteria fail on this lane with the TUI-side fix code
+ * present, because nothing on this wire path emits `request_wait`). Mirror the
+ * vLLM lane's bounded semantics: 30s interactive, 60s non-interactive floor.
+ */
+export const DEFAULT_INTERACTIVE_SOFT_STALL_MS = 30_000;
+
+function parseTimeoutMs(envName: string, defaultMs: number): number {
+  const raw = process.env[envName]?.trim();
+  if (!raw) return defaultMs;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultMs;
+}
+
 /** Look up context window for a model, checking base name (before ':' tag). */
 function getModelContext(model: string): number {
   if (MODEL_CONTEXT[model]) return MODEL_CONTEXT[model]!;
@@ -126,13 +145,69 @@ export class OllamaProvider implements LLMProvider {
       (body['options'] as Record<string, unknown>)['stop'] = options.stopSequences;
     }
 
+    // SCLI-522: emit the same header-wait keepalive contract as the vLLM lane
+    // (request_start + periodic request_wait with elapsedMs) so the TUI's
+    // bounded soft-stall card and queue-paused composer fire on this lane too.
+    // The previous bare `await fetch` left the TUI on a passive spinner for the
+    // whole no-header wait — the keepalive generator existed only in the TUI
+    // consumer, unreachable from this wire path.
+    const interactiveTui = process.env['SHIZUHA_INTERACTIVE_TUI'] === '1';
+    const softStallMs = parseTimeoutMs(
+      'OLLAMA_SOFT_STALL_MS',
+      interactiveTui ? DEFAULT_INTERACTIVE_SOFT_STALL_MS : 60_000,
+    );
+    const statusIntervalMs = parseTimeoutMs(
+      'OLLAMA_REQUEST_STATUS_INTERVAL_MS',
+      interactiveTui ? 5_000 : 15_000,
+    );
+    const requestStartedAt = Date.now();
+    yield {
+      type: 'status',
+      level: 'info',
+      provider: this.name,
+      code: 'request_start',
+      sessionId: options.sessionId,
+      waitPhase: 'headers',
+      elapsedMs: 0,
+      message: 'Waiting for model response...',
+    };
+
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}/api/chat`, {
+      const fetchResult = fetch(`${this.baseUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-      });
+      }).then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+      let settled = await Promise.race([
+        fetchResult,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), statusIntervalMs)),
+      ]);
+      while (!settled) {
+        const elapsedMs = Date.now() - requestStartedAt;
+        const pastSoft = elapsedMs >= softStallMs;
+        yield {
+          type: 'status',
+          level: pastSoft ? 'warning' : 'info',
+          provider: this.name,
+          code: 'request_wait',
+          sessionId: options.sessionId,
+          waitPhase: 'headers',
+          elapsedMs,
+          message: pastSoft
+            ? `Waiting for model response (${Math.round(elapsedMs / 1000)}s) · Esc to cancel · /model to switch`
+            : 'Waiting for model response...',
+        };
+        settled = await Promise.race([
+          fetchResult,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), statusIntervalMs)),
+        ]);
+      }
+      if ('error' in settled) throw settled.error;
+      response = settled.value;
     } catch (err) {
       const msg = (err as Error).message;
       if (msg.includes('fetch failed') || msg.includes('ECONNREFUSED')) {

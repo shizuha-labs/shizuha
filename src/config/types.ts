@@ -2,6 +2,7 @@ import type { PermissionMode, PermissionRule } from '../permissions/types.js';
 import type { MCPServerConfig } from '../agent/types.js';
 import type { HookConfig } from '../hooks/types.js';
 import type { SandboxMode } from '../sandbox/types.js';
+import type { BrowserSection } from './browser-policy.js';
 
 export interface AutoReplyRuleConfig {
   pattern: string;
@@ -27,6 +28,7 @@ export interface ShizuhaConfig {
   sandbox: SandboxSection;
   logging: LoggingSection;
   autoReply: AutoReplySection;
+  browser: BrowserSection;
 }
 
 export interface HooksSection {

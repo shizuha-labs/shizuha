@@ -83,7 +83,7 @@ describe('ToolSearch family co-activation', () => {
   it('keyword search explains immediate in-message activation', async () => {
     setup(['mcp__wiki__wiki_upload_attachment', 'mcp__wiki__wiki_download_attachment']);
     const res = await toolSearchTool.execute({ query: 'attachment' }, ctx);
-    expect(String(res.content)).toContain('select:');
+    expect(String(res.content)).toContain('"inputSchema"');
     // Append-only activation: selected tools are usable directly from the
     // returned schema — no prompt-head mutation, so no batching pressure.
     expect(String(res.content)).toContain('ACTIVE immediately');

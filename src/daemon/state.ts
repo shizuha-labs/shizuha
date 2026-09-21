@@ -7,6 +7,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import type { DaemonState, DaemonAgentState } from './types.js';
+import type { AgentLifecycleState } from './agent-state-store.js';
 import {
   agentInfoPatchToStorePatch,
   agentInfoToCreateSpec,
@@ -158,6 +159,24 @@ export interface AgentPersistenceResult {
   error?: string;
 }
 
+/** Typed lifecycle states exported to Pulse. Missing/legacy rows fail closed. */
+export function readAgentLifecycleStates(): Map<string, AgentLifecycleState> {
+  const states = new Map<string, AgentLifecycleState>();
+  const store = getAgentStateStore();
+  if (!store) return states;
+  try {
+    for (const row of store.listAgents()) {
+      if (row.operator_disabled === 1) states.set(row.id, 'operator_stopped');
+      else if (row.desired_enabled === 1) states.set(row.id, 'enabled');
+      else if (row.desired_status === 'hibernated') states.set(row.id, 'hibernated');
+      else states.set(row.id, 'operator_stopped');
+    }
+  } catch {
+    return new Map();
+  }
+  return states;
+}
+
 /**
  * PLAT-1062 P4b: persist runtime enable/disable intent through the
  * AgentStateStore first, then mirror the legacy enabled/disabled JSON files.
@@ -167,7 +186,11 @@ export interface AgentPersistenceResult {
 export function setAgentDesiredRuntimeState(
   agentId: string,
   enabled: boolean,
-  opts: { actor?: string; overrideKillSwitch?: boolean } = {},
+  opts: {
+    actor?: string;
+    overrideKillSwitch?: boolean;
+    lifecycleState?: Exclude<AgentLifecycleState, 'enabled'>;
+  } = {},
 ): AgentDesiredRuntimeStateResult {
   const actor = opts.actor ?? 'setAgentDesiredRuntimeState';
   const agents = readAgents();
@@ -182,18 +205,12 @@ export function setAgentDesiredRuntimeState(
     const current = store.getAgent(agent.id);
     if (!current) return { ok: false, error: 'AgentStateStore row missing after seed' };
 
-    if (enabled) {
-      if (current.operator_disabled === 1 && !opts.overrideKillSwitch) {
-        return { ok: false, error: 'agent is operator-disabled (kill-switch active); not started' };
-      }
-      const row = store.setDesiredEnabled(actor, agent.id, true, { overrideKillSwitch: opts.overrideKillSwitch });
-      if (row.operator_disabled === 1) {
-        return { ok: false, error: 'agent is operator-disabled (kill-switch active); not started' };
-      }
-    } else {
-      store.setDesiredEnabled(actor, agent.id, false);
-      store.setOperatorDisabled(actor, agent.id, true, 'operator-kill-switch');
-    }
+    store.setLifecycleState(
+      actor,
+      agent.id,
+      enabled ? 'enabled' : (opts.lifecycleState ?? 'operator_stopped'),
+      { overrideKillSwitch: opts.overrideKillSwitch },
+    );
   } catch (err) {
     warnAgentStateCutover(`runtime desired-state write failed for ${agent.id}; refusing compat file write`, err);
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -203,6 +220,11 @@ export function setAgentDesiredRuntimeState(
   const disabledIds = readDisabledAgents();
   if (enabled) {
     enabledIds.add(agent.id);
+    disabledIds.delete(agent.id);
+    disabledIds.delete(agent.username);
+  } else if (opts.lifecycleState === 'hibernated') {
+    enabledIds.delete(agent.id);
+    enabledIds.delete(agent.username);
     disabledIds.delete(agent.id);
     disabledIds.delete(agent.username);
   } else {

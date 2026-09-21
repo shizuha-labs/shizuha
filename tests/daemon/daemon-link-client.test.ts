@@ -5,6 +5,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { DaemonLinkClient, resolveDaemonLinkUrl } from '../../src/daemon/daemon-link-client.js';
+import {
+  executeRecoveryAction,
+  GATED_RECOVERY_ACTIONS,
+  looksLikeSecret,
+  sanitizeSummary,
+  type RecoveryActionFrame,
+} from '../../src/daemon/recovery-actions.js';
 import type { AgentInfo, DaemonState } from '../../src/daemon/types.js';
 import {
   clearHeartbeatQueueDrainOutcomesForTests,
@@ -73,8 +80,31 @@ function makeAgent(overrides: Partial<AgentInfo> = {}): AgentInfo {
     personalityTraits: {},
     skills: ['pulse-core'],
     eagerSkills: ['connect-messaging'],
+    credentialGrantScopes: ['github', 'kubeconfig'],
     ...overrides,
   } as AgentInfo;
+}
+
+function recoveryFrame(overrides: Partial<RecoveryActionFrame> = {}): RecoveryActionFrame {
+  return {
+    type: 'recovery_action',
+    seq: 44,
+    action_id: 'action-1',
+    correlation_id: 'correlation-1',
+    action_type: 'pull_desired_state_now',
+    mode: 'dry_run',
+    target_runtime_id: 'agent-1',
+    params: {},
+    ...overrides,
+  };
+}
+
+function recoveryDeps(agents: AgentInfo[] = [makeAgent()]) {
+  return {
+    findAgent: (key: string) => agents.find((agent) =>
+      agent.id === key || agent.username === key || `shizuha-agent-${agent.username}` === key
+    ) ?? null,
+  };
 }
 
 function makeState(): DaemonState {
@@ -148,6 +178,7 @@ describe('DaemonLinkClient', () => {
       token: 'daemon-secret',
       getAgents: () => [makeAgent()],
       getDaemonState: () => makeState(),
+      getLifecycleStates: () => new Map([['agent-1', 'enabled']]),
       getLastActiveAt: () => '2026-07-13T09:10:11.000Z',
     });
     clients.push(client);
@@ -164,6 +195,7 @@ describe('DaemonLinkClient', () => {
       agent_id: 'agent-1',
       agent_username: 'nagi',
       enabled: true,
+      lifecycle_state: 'enabled',
       status: 'running',
       last_active_at: '2026-07-13T09:10:11.000Z',
     });
@@ -181,6 +213,78 @@ describe('DaemonLinkClient', () => {
 
     const complete = await waitForMessage(server.messages, (message) => message.type === 'state_snapshot_complete');
     expect(complete.child_count).toBe(1);
+  });
+
+  it('round-trips one correlated recovery_result for an authenticated recovery_action frame', async () => {
+    const server = await withServer({ seedRequired: false });
+    const client = new DaemonLinkClient({
+      platformUrl: 'https://platform.example',
+      url: server.url,
+      daemonId: 'daemon-test',
+      token: 'daemon-secret',
+      heartbeatIntervalMs: 60_000,
+      getAgents: () => [makeAgent()],
+    });
+    clients.push(client);
+    client.start();
+
+    await waitForMessage(server.messages, (message) => message.type === 'register');
+    server.socket()?.send(JSON.stringify(recoveryFrame()));
+
+    const result = await waitForMessage(
+      server.messages,
+      (message) => message.type === 'recovery_result' && message.action_id === 'action-1',
+    );
+    expect(result).toMatchObject({
+      type: 'recovery_result',
+      ack_seq: 44,
+      action_id: 'action-1',
+      correlation_id: 'correlation-1',
+      action_type: 'pull_desired_state_now',
+      mode: 'dry_run',
+      result: 'would_apply',
+    });
+    expect(server.messages.filter((message) => message.type === 'recovery_result')).toHaveLength(1);
+  });
+
+  it('returns explicit terminal results for unsupported and malformed recovery frames', async () => {
+    const server = await withServer({ seedRequired: false });
+    const client = new DaemonLinkClient({
+      platformUrl: 'https://platform.example', url: server.url, token: 'daemon-secret',
+      heartbeatIntervalMs: 60_000, getAgents: () => [makeAgent()],
+    });
+    clients.push(client);
+    client.start();
+    await waitForMessage(server.messages, (message) => message.type === 'register');
+
+    server.socket()?.send(JSON.stringify(recoveryFrame({
+      seq: 51, action_id: 'unsupported', correlation_id: 'corr-unsupported', action_type: 'reformat_disk',
+    })));
+    server.socket()?.send(JSON.stringify(recoveryFrame({
+      seq: 52, action_id: 'malformed', correlation_id: 'corr-malformed', params: ['not-an-object'],
+    })));
+    const unsupported = await waitForMessage(server.messages, (message) => message.action_id === 'unsupported');
+    const malformed = await waitForMessage(server.messages, (message) => message.action_id === 'malformed');
+    expect(unsupported).toMatchObject({ result: 'denied', ack_seq: 51 });
+    expect(malformed).toMatchObject({ result: 'failed', ack_seq: 52 });
+  });
+
+  it('drops a recovery result when its source socket loses ownership during evaluation', async () => {
+    const server = await withServer({ seedRequired: false });
+    const client = new DaemonLinkClient({
+      platformUrl: 'https://platform.example', url: server.url, token: 'daemon-secret',
+      heartbeatIntervalMs: 60_000,
+      getAgents: () => {
+        client.stop();
+        return [makeAgent()];
+      },
+    });
+    clients.push(client);
+    client.start();
+    await waitForMessage(server.messages, (message) => message.type === 'register');
+    server.socket()?.send(JSON.stringify(recoveryFrame({ action_id: 'stale-action' })));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(server.messages.some((message) => message.action_id === 'stale-action')).toBe(false);
   });
 
   it('refreshes the harness report on heartbeats without reconnecting', async () => {
@@ -754,5 +858,109 @@ describe('DaemonLinkClient', () => {
     expect(data.needs_help).toBe(false);
     expect(data.needs_help_reason).toBe('');
     expect(data.heartbeat_outcome).toBe('queue_empty');
+  });
+});
+
+describe('recovery_action v1 policy', () => {
+  it('denies apply, every unsafe action, and broad restart targets', async () => {
+    expect((await executeRecoveryAction(recoveryFrame({ mode: 'apply' }), recoveryDeps())).result).toBe('denied');
+    for (const actionType of GATED_RECOVERY_ACTIONS) {
+      const result = await executeRecoveryAction(
+        recoveryFrame({ action_type: actionType }),
+        recoveryDeps(),
+      );
+      expect(result.result, actionType).toBe('denied');
+    }
+    for (const target of ['', '*', 'all', 'fleet', 'daemon']) {
+      const result = await executeRecoveryAction(
+        recoveryFrame({ action_type: 'restart_agent', target_runtime_id: target, agent_username: '' }),
+        recoveryDeps(),
+      );
+      expect(result.result, `target=${JSON.stringify(target)}`).toBe('denied');
+    }
+  });
+
+  it('preserves dry-run identity/capability behavior without privilege expansion', async () => {
+    const alias = await executeRecoveryAction(recoveryFrame({
+      action_type: 'reconcile_identity_alias',
+      params: {
+        canonical_email: 'nagi@agents.shizuha.io',
+        canonical_platform_user_id: 'user-1',
+        same_platform_user: true,
+      },
+    }), recoveryDeps());
+    expect(alias).toMatchObject({
+      result: 'would_apply',
+      before_summary: { runtime_email: 'nagi@shizuha.com' },
+      after_summary: { canonical_email: 'nagi@agents.shizuha.io', platform_user_id: 'user-1' },
+    });
+
+    const internalRefresh = await executeRecoveryAction(recoveryFrame({
+      action_type: 'refresh_credential_grants',
+      params: { grant_scopes: ['github'] },
+    }), recoveryDeps());
+    expect(internalRefresh.result).toBe('would_apply');
+
+    const externalRefresh = await executeRecoveryAction(recoveryFrame({
+      action_type: 'refresh_credential_grants',
+      params: { grant_scopes: ['stripe-billing'] },
+    }), recoveryDeps());
+    expect(externalRefresh.result).toBe('denied');
+
+    const scopeExpansion = await executeRecoveryAction(recoveryFrame({
+      action_type: 'refresh_credential_grants',
+      params: { grant_scopes: ['vault-token'] },
+    }), recoveryDeps());
+    expect(scopeExpansion.result).toBe('denied');
+
+    const safeConfig = await executeRecoveryAction(recoveryFrame({
+      action_type: 'apply_effective_runtime_config',
+      params: { desired: { skills: ['engineering-core'], mcp_servers: ['pulse'] }, desired_generation: 7 },
+    }), recoveryDeps());
+    expect(safeConfig).toMatchObject({ result: 'would_apply', after_summary: { desired_generation: 7 } });
+
+    const privilegeExpansion = await executeRecoveryAction(recoveryFrame({
+      action_type: 'apply_effective_runtime_config',
+      params: { desired: { sensitive_access_flags: ['host_exec'] } },
+    }), recoveryDeps());
+    expect(privilegeExpansion.result).toBe('denied');
+  });
+
+  it('returns skipped/failed for expiry, missing targets, malformed evidence, and dependency errors', async () => {
+    const expired = await executeRecoveryAction(recoveryFrame({
+      expires_at: new Date(Date.now() - 60_000).toISOString(),
+    }), recoveryDeps());
+    expect(expired.result).toBe('skipped');
+
+    const missing = await executeRecoveryAction(recoveryFrame({ target_runtime_id: 'ghost' }), recoveryDeps());
+    expect(missing.result).toBe('skipped');
+
+    const malformedAlias = await executeRecoveryAction(recoveryFrame({
+      action_type: 'reconcile_identity_alias', params: { canonical_email: 'nagi@agents.shizuha.io' },
+    }), recoveryDeps());
+    expect(malformedAlias.result).toBe('denied');
+
+    const failed = await executeRecoveryAction(recoveryFrame(), {
+      findAgent: () => { throw new Error('lookup exploded'); },
+    });
+    expect(failed).toMatchObject({ result: 'failed' });
+    expect(failed.reason).toContain('lookup exploded');
+  });
+
+  it('redacts whole and embedded secret-looking values while preserving digests and URLs', () => {
+    expect(looksLikeSecret('ghp_abcdefghijklmnopqrstuvwxyz0123456789')).toBe(true);
+    expect(looksLikeSecret('0123456789abcdef'.repeat(4))).toBe(false);
+    const sanitized = sanitizeSummary({
+      token: 'ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+      message: 'upstream failed with sk-abcdefghijklmnopqrstuvwxyz012345',
+      url: 'https://origin.shizuha.com/shizuha-labs/shizuha-beta',
+      hash: '0123456789abcdef'.repeat(4),
+    });
+    expect(sanitized).toEqual({
+      token: '[redacted-secret]',
+      message: 'upstream failed with [redacted-secret]',
+      url: 'https://origin.shizuha.com/shizuha-labs/shizuha-beta',
+      hash: '0123456789abcdef'.repeat(4),
+    });
   });
 });

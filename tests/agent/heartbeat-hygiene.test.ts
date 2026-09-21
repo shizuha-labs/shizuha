@@ -4,6 +4,7 @@ import {
   classifyPromptSource,
   estimatePromptTokenBudget,
   heartbeatBudgetConfig,
+  keepHeartbeatNudgeOnly,
   resolveContextPreflightGuardTokens,
   resolveInteractivePreflightCeilingTokens,
 } from '../../src/agent/heartbeat-hygiene.js';
@@ -14,18 +15,49 @@ function msg(role: 'user' | 'assistant', content: string): Message {
 }
 
 describe('heartbeat context hygiene', () => {
+  it('keeps only the current heartbeat nudge when a hard-budget reset fires', () => {
+    const heartbeat = msg('user', '[HEARTBEAT] You have been idle. Call pulse_get_my_alerts');
+    const history = [
+      msg('user', 'please explain this code'),
+      msg('assistant', 'sure'),
+      heartbeat,
+    ];
+    expect(keepHeartbeatNudgeOnly(history)).toEqual([heartbeat]);
+    expect(keepHeartbeatNudgeOnly([msg('user', 'please explain this code')])).toEqual([]);
+    expect(keepHeartbeatNudgeOnly([])).toEqual([]);
+  });
+
   it('classifies scheduler heartbeat prompts separately from user turns', () => {
     expect(classifyPromptSource([msg('user', '[HEARTBEAT] Automatic sync')])).toBe('heartbeat');
     expect(classifyPromptSource([msg('user', 'please explain this code')])).toBe('user');
   });
 
-  it('uses fractional budgets of the announced window when known', () => {
-    // 512K DeepSeek: soft 0.70 / hard 0.85 — not fixed 80k/100k.
-    expect(heartbeatBudgetConfig(524_288, {} as NodeJS.ProcessEnv)).toEqual({
+  it('defaults to bounded ABSOLUTE budgets when the window is known (PLAT-9203)', () => {
+    // PLAT-9203: the fraction default let eternal sessions ratchet below the
+    // window-proportional thresholds (aoi 173K→187K on a 272K model — soft
+    // 0.70×272K≈190K, trigger 0.75×272K≈204K, compaction never engaged).
+    // The default posture is now bounded absolute: soft 120K / hard 160K.
+    expect(heartbeatBudgetConfig(272_000, {} as NodeJS.ProcessEnv)).toEqual({
+      softBudgetTokens: 120_000,
+      hardBudgetTokens: 160_000,
+    });
+    // Env token overrides still win over the eternal defaults.
+    expect(heartbeatBudgetConfig(272_000, {
+      SHIZUHA_HEARTBEAT_CONTEXT_SOFT_TOKENS: '80000',
+      SHIZUHA_HEARTBEAT_CONTEXT_HARD_TOKENS: '100000',
+    } as unknown as NodeJS.ProcessEnv)).toEqual({ softBudgetTokens: 80_000, hardBudgetTokens: 100_000 });
+  });
+
+  it('restores window-fraction budgets only via mode=proportional', () => {
+    // Legacy opt-in: 512K DeepSeek soft 0.70 / hard 0.85.
+    expect(heartbeatBudgetConfig(524_288, {
+      SHIZUHA_HEARTBEAT_CONTEXT_BUDGET_MODE: 'proportional',
+    } as unknown as NodeJS.ProcessEnv)).toEqual({
       softBudgetTokens: Math.floor(524_288 * 0.70),
       hardBudgetTokens: Math.floor(524_288 * 0.85),
     });
     expect(heartbeatBudgetConfig(524_288, {
+      SHIZUHA_HEARTBEAT_CONTEXT_BUDGET_MODE: 'proportional',
       SHIZUHA_HEARTBEAT_CONTEXT_SOFT_FRACTION: '0.6',
       SHIZUHA_HEARTBEAT_CONTEXT_HARD_FRACTION: '0.9',
     } as unknown as NodeJS.ProcessEnv)).toEqual({
@@ -34,7 +66,22 @@ describe('heartbeat context hygiene', () => {
     });
   });
 
-  it('honors explicit absolute token budgets even when the window is known', () => {
+  it('proportional mode ignores leftover 80k/100k token pins (legacy parity)', () => {
+    // Live fleet daemon + Hive pods set BOTH fractions and 80k/100k tokens.
+    // In proportional mode the fractions still win (2026-08-17 parity).
+    expect(heartbeatBudgetConfig(524_288, {
+      SHIZUHA_HEARTBEAT_CONTEXT_BUDGET_MODE: 'proportional',
+      SHIZUHA_HEARTBEAT_CONTEXT_SOFT_FRACTION: '0.70',
+      SHIZUHA_HEARTBEAT_CONTEXT_HARD_FRACTION: '0.85',
+      SHIZUHA_HEARTBEAT_CONTEXT_SOFT_TOKENS: '80000',
+      SHIZUHA_HEARTBEAT_CONTEXT_HARD_TOKENS: '100000',
+    } as unknown as NodeJS.ProcessEnv)).toEqual({
+      softBudgetTokens: Math.floor(524_288 * 0.70),
+      hardBudgetTokens: Math.floor(524_288 * 0.85),
+    });
+  });
+
+  it('uses the audited 30K/45K absolute fallbacks when the window is unknown', () => {
     expect(heartbeatBudgetConfig(undefined, {} as NodeJS.ProcessEnv)).toEqual({
       softBudgetTokens: 30_000,
       hardBudgetTokens: 45_000,
@@ -43,12 +90,7 @@ describe('heartbeat context hygiene', () => {
       SHIZUHA_HEARTBEAT_CONTEXT_SOFT_TOKENS: '10',
       SHIZUHA_HEARTBEAT_CONTEXT_HARD_TOKENS: '5',
     } as unknown as NodeJS.ProcessEnv)).toEqual({ softBudgetTokens: 10, hardBudgetTokens: 10 });
-    expect(heartbeatBudgetConfig(524_288, {
-      SHIZUHA_HEARTBEAT_CONTEXT_SOFT_TOKENS: '80000',
-      SHIZUHA_HEARTBEAT_CONTEXT_HARD_TOKENS: '100000',
-    } as unknown as NodeJS.ProcessEnv)).toEqual({ softBudgetTokens: 80_000, hardBudgetTokens: 100_000 });
     expect(heartbeatBudgetConfig(100_000, {
-      SHIZUHA_HEARTBEAT_CONTEXT_BUDGET_MODE: 'absolute',
       SHIZUHA_HEARTBEAT_CONTEXT_SOFT_TOKENS: '80000',
       SHIZUHA_HEARTBEAT_CONTEXT_HARD_TOKENS: '100000',
     } as unknown as NodeJS.ProcessEnv)).toEqual({ softBudgetTokens: 80_000, hardBudgetTokens: 100_000 });

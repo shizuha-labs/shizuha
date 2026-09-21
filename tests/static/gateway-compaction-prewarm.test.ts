@@ -120,7 +120,7 @@ describe('gateway cache-breaking history rewrite contract', () => {
       "logger.info({ reason, ms: Date.now() - started }, 'Cortex prefix cache pre-warm complete');",
     );
 
-    expect(block).toContain('const providerToolDefs = toolDefinitionsForProvider(this.toolDefs, provider);');
+    expect(block).toContain('this.toolRegistry?.definitions?.() ?? this.toolDefs');
     expect(block).toContain('const prewarmPrefixSnapshot = buildProviderPrefixSnapshot({');
     expect(block).toContain('tools: providerToolDefs,');
     expect(block).toContain('tools: providerToolDefs.length > 0 ? providerToolDefs : undefined,');
@@ -148,11 +148,12 @@ describe('gateway cache-breaking history rewrite contract', () => {
 
     expect(turn).toContain('() => { cortexRehomeRequired = true; }');
     expect(source).toContain('if (rehomeRequiredForAttempt) onCortexRehomeRequired?.();');
-    expect(turn).toContain('this.messages.push(result.assistantMessage);');
+    expect(turn).toContain('turnMessages.push(result.assistantMessage);');
+    expect(turn).toContain('this.messages.push(...this.store.finalizeToolTurn(result.toolAttemptIdentity, turnMessages));');
     expect(turn).toContain("reason: 'soft_drain_rehome'");
     expect(turn).toContain('rehomeIntent: true');
     expect(turn.indexOf("reason: 'soft_drain_rehome'")).toBeGreaterThan(
-      turn.indexOf('this.messages.push(result.assistantMessage);'),
+      turn.indexOf('this.messages.push(...this.store.finalizeToolTurn(result.toolAttemptIdentity, turnMessages));'),
     );
     expect(turn.indexOf('checkpointRuntimeRollAfterTurn')).toBeGreaterThan(
       turn.indexOf("reason: 'soft_drain_rehome'"),
@@ -179,7 +180,7 @@ describe('gateway context-anchor persistence (agent-ryo 2026-08-08)', () => {
     expect(source).toContain('saveContextTokenAnchor?.(this.sessionId');
     // Baseline must be captured BEFORE the assistant response is appended.
     const captureIdx = source.indexOf('this.lastReportedRawEstimateTokens = estimateTokens(this.messages, activeModel)');
-    const appendIdx = source.indexOf('this.messages.push(result.assistantMessage)');
+    const appendIdx = source.indexOf('this.messages.push(...this.store.finalizeToolTurn(result.toolAttemptIdentity, turnMessages))');
     expect(captureIdx).toBeGreaterThan(0);
     expect(appendIdx).toBeGreaterThan(captureIdx);
   });

@@ -2,8 +2,14 @@
  * Stable-priority message inbox for the agent process.
  *
  * Messages are still processed one at a time. Direct/control traffic stays
- * ahead of autonomous scheduling, while a pending scheduler checkpoint runs
- * before routine task-notification hints. Ordering is FIFO within each class.
+ * ahead of autonomous scheduling. A pending scheduler checkpoint (heartbeat)
+ * runs before interval cron watches, and both run before routine
+ * task-notification hints. Ordering is FIFO within each class.
+ *
+ * Cron must not share the direct-control class. Aoi 2026-09-09: two forever
+ * interval watches (`every 10m` / `every 20m`) classified as user traffic,
+ * outranked Pulse heartbeats for hours, and wrote curl transcripts into the
+ * eternal session until GLM self-reported a degraded 300k state.
  *
  * Pulse `[Task Assigned]` / `[Task Update]` DMs are notifications of state
  * Pulse already holds. They must not start a model turn while the agent is
@@ -15,22 +21,43 @@
 import { logger } from '../utils/logger.js';
 import type { InboundMessage, Inbox as InboxInterface } from './types.js';
 
-export type GatewayInboxClass = 'direct-control' | 'heartbeat' | 'routine-task';
+export type GatewayInboxClass = 'direct-control' | 'heartbeat' | 'cron' | 'routine-task';
+
+/** QA/liveness probes must not become a production-agent LLM turn. */
+export function isProbeOrLivenessContent(content: unknown): boolean {
+  if (typeof content !== 'string') return false;
+  const text = content.trim();
+  if (/^(replied|done|sent|ok|noted|pong( sent)?|ping)[.!]?$/i.test(text)) return true;
+  if (/^test message\b/i.test(text)) return true;
+  if (/please confirm you can see this/i.test(text)) return true;
+  if (/^i['’]m here\b.{0,80}what would you like me to do/i.test(text)) return true;
+  if (/^i['’]m stuck in a loop\b/i.test(text) && !/\b[A-Z]{2,}-\d+\b/.test(text)) return true;
+  return false;
+}
 
 export function isRoutineTaskNotificationContent(content: unknown): boolean {
   return typeof content === 'string'
-    && /^\s*\[system\]\s+(?:\[Task (?:Assigned|Update)\]|\[(?:Review Seat Starvation|Routability Hold)\])/i.test(content);
+    && (/^\s*\[system\]\s+(?:\[Task (?:Assigned|Update)\]|\[(?:Review Seat Starvation|Routability Hold)\])/i.test(content)
+      || isConnectAlertNotificationContent(content));
+}
+
+/** Pulse/Alertmanager Connect DMs. SoT is Pulse alerts, not the DM text. */
+export function isConnectAlertNotificationContent(content: unknown): boolean {
+  return typeof content === 'string'
+    && /^\s*(?:\[system\]\s+)?\[Alert(?: Resolved)?\]/i.test(content);
 }
 
 /** Low-priority Pulse notices — hold during a work session. */
 export function isWorkingDeferredTaskNotification(message: InboundMessage): boolean {
   if (message.source === 'heartbeat') return false;
   const content = typeof message.content === 'string' ? message.content : '';
-  return /^\s*\[system\]\s+\[Task (?:Assigned|Update)\]/i.test(content);
+  return /^\s*\[system\]\s+\[Task (?:Assigned|Update)\]/i.test(content)
+    || isConnectAlertNotificationContent(content);
 }
 
 export function gatewayInboxClass(message: InboundMessage): GatewayInboxClass {
   if (message.source === 'heartbeat') return 'heartbeat';
+  if (message.source === 'cron') return 'cron';
   if (message.metadata?.['schedulerClass'] === 'routine-task'
       || isRoutineTaskNotificationContent(message.content)) {
     return 'routine-task';
@@ -43,6 +70,9 @@ export function gatewayTaskNotificationKey(message: InboundMessage): string | nu
   const explicit = message.metadata?.['schedulerTaskKey'];
   if (typeof explicit === 'string' && explicit.trim()) return explicit.trim().toUpperCase();
   if (typeof message.content !== 'string') return null;
+  const alertName = message.content.match(/\balertname=([A-Za-z0-9_]+)/i)?.[1]
+    || message.content.match(/\[Alert(?: Resolved)?\][^\n]*\b([A-Z][A-Za-z0-9]{8,})\b/)?.[1];
+  if (alertName) return `ALERT:${alertName.toUpperCase()}`;
   return message.content.match(/\b[A-Z][A-Z0-9]*-\d+\b/i)?.[0]?.toUpperCase() ?? null;
 }
 
@@ -50,7 +80,8 @@ function gatewayInboxPriority(message: InboundMessage): number {
   const cls = gatewayInboxClass(message);
   if (cls === 'direct-control') return 0;
   if (cls === 'heartbeat') return 1;
-  return 2;
+  if (cls === 'cron') return 2;
+  return 3;
 }
 
 export class Inbox implements InboxInterface {
@@ -90,7 +121,15 @@ export class Inbox implements InboxInterface {
     // coalesce. Never resolve the waiter with a raw mid-work notice.
     if (isWorkingDeferredTaskNotification(msg)) {
       this.enqueueMessage(msg);
-      if (this.resolver && !this.workSessionActive) {
+      // Task Assigned may wake an idle seat. Connect [Alert] DMs must not —
+      // Pulse get_my_alerts on the next heartbeat is SoT. San 2026-08-17
+      // spent 120 DeepSeek turns on resolved Cortex alerts because each
+      // distinct alertname became a user turn.
+      if (
+        this.resolver
+        && !this.workSessionActive
+        && !isConnectAlertNotificationContent(msg.content)
+      ) {
         const admitted = this.takeWorkingDeferredAdmission();
         if (admitted) {
           const resolve = this.resolver;
@@ -166,9 +205,12 @@ export class Inbox implements InboxInterface {
   }
 
   private takeWorkingDeferredAdmission(): InboundMessage | null {
-    const held = this.queue.filter((row) => isWorkingDeferredTaskNotification(row));
+    const held = this.queue.filter((row) => (
+      isWorkingDeferredTaskNotification(row)
+      && !isConnectAlertNotificationContent(row.content)
+    ));
     if (held.length === 0) return null;
-    this.queue = this.queue.filter((row) => !isWorkingDeferredTaskNotification(row));
+    this.queue = this.queue.filter((row) => !held.includes(row));
     if (held.length === 1) return held[0]!;
     const keys = [...new Set(
       held.map((row) => gatewayTaskNotificationKey(row)).filter((key): key is string => Boolean(key)),
@@ -180,7 +222,7 @@ export class Inbox implements InboxInterface {
       content: `[system] [Task notifications] ${held.length} Pulse assignment/update `
         + `notice${held.length === 1 ? '' : 's'} arrived while idle`
         + `${keys.length ? `: ${keys.join(', ')}` : ''}. `
-        + 'They are already on your Pulse queue — call pulse_get_my_tasks. '
+        + 'They are already on your Pulse queue — call mcp__shizuha-pulse__pulse_get_my_tasks. '
         + 'Do not abandon in-progress work to chase these.',
       timestamp: Date.now(),
       metadata: {
@@ -194,11 +236,12 @@ export class Inbox implements InboxInterface {
   }
 
   private takeAdmissible(): InboundMessage | null {
-    // Queue is already priority-sorted (direct-control, heartbeat, routine).
+    // Queue is already priority-sorted (direct-control, heartbeat, cron, routine).
     for (let i = 0; i < this.queue.length; i++) {
       const row = this.queue[i]!;
       if (isWorkingDeferredTaskNotification(row)) {
         if (this.workSessionActive) continue;
+        if (isConnectAlertNotificationContent(row.content)) continue;
         return this.takeWorkingDeferredAdmission();
       }
       this.queue.splice(i, 1);

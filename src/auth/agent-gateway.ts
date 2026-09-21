@@ -28,8 +28,22 @@ interface JsonResponse {
   data: unknown;
 }
 
-const DAEMON_PORT = parseInt(process.env['DAEMON_PORT'] || '8015', 10);
-const DAEMON_HOST = process.env['DAEMON_HOST'] || '127.0.0.1';
+// PLAT-7611: the people-ops primitives (list_agents/resume_agent/pause_agent)
+// must target the port the local gateway ACTUALLY listens on. Every managed
+// agent runtime — container (k8s per-agent Deployment) and bare-metal alike —
+// is started with an explicit `--port 8080` (daemon/manager.ts
+// CONTAINER_INTERNAL_PORT = 8080), so 8080 is the canonical in-pod endpoint.
+// The old 8015 default predated the container-port unification and left fleet
+// seats with no listener on 8015 (ECONNREFUSED on every people-ops call).
+// Dev runs that start `shizuha up` without --port still bind 8015; set
+// DAEMON_PORT=8015 explicitly in that environment.
+export function daemonEndpoint(): { host: string; port: number } {
+  return {
+    host: process.env['DAEMON_HOST'] || '127.0.0.1',
+    port: parseInt(process.env['DAEMON_PORT'] || '8080', 10),
+  };
+}
+
 const AGENT_ID = process.env['AGENT_ID'] || '';
 const AGENT_USERNAME = process.env['AGENT_USERNAME'] || '';
 const WORKSPACE_DIR = process.env['WORKSPACE'] || process.cwd();
@@ -46,9 +60,10 @@ function requestJson(
 ): Promise<JsonResponse> {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? '' : JSON.stringify(body);
+    const endpoint = daemonEndpoint();
     const req = http.request({
-      hostname: DAEMON_HOST,
-      port: DAEMON_PORT,
+      hostname: endpoint.host,
+      port: endpoint.port,
       path: urlPath,
       method,
       headers: {

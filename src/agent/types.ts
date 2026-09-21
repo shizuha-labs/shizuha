@@ -26,6 +26,16 @@ export interface ToolResultContent {
   image?: ImageData;
 }
 
+/** User-pasted / TUI-attached image (Anthropic-style source block). */
+export interface ImageContent {
+  type: 'image';
+  source: {
+    type: 'base64';
+    data: string;
+    media_type: string;
+  };
+}
+
 /** Opaque thinking/reasoning block — roundtripped for prompt caching.
  * For Anthropic: encrypted thinking content + signature from the Messages API.
  * For OpenAI: reasoning items from the Responses API.
@@ -41,7 +51,7 @@ export interface ReasoningContent {
   summary?: Array<{ text: string }>;
 }
 
-export type ContentBlock = TextContent | ToolUseContent | ToolResultContent | ReasoningContent;
+export type ContentBlock = TextContent | ToolUseContent | ToolResultContent | ReasoningContent | ImageContent;
 
 export interface Message {
   /** Stable external chat-bubble identity when one exists. */

@@ -4,7 +4,7 @@ import { countTokens } from '../utils/tokens.js';
 import { isCortexModelId } from '../provider/registry.js';
 
 /** Approximate tokens for an image in the Anthropic API (based on typical resolution) */
-const IMAGE_TOKEN_ESTIMATE = 1600;
+export const IMAGE_TOKEN_ESTIMATE = 1600;
 
 /**
  * Compaction threshold — the fraction of maxContextTokens at which compaction triggers.
@@ -41,7 +41,16 @@ const COMPACTION_THRESHOLD = 0.70;
 // SHIZUHA_CORTEX_COMPACTION_TRIGGER_FRACTION / _TOKENS rather than restoring a
 // flat cap that inverts with window size.
 const MIN_CORTEX_COMPACTION_TRIGGER_TOKENS = 48_000;
-const DEFAULT_CORTEX_COMPACTION_TRIGGER_FRACTION = 0.75;
+const DEFAULT_CORTEX_COMPACTION_TRIGGER_FRACTION = 0.60;
+
+// PLAT-9194 deterministic band: compaction must land at the band FLOOR, not
+// just under the trigger. The old shape (trigger 0.75, trim-to trigger*0.92
+// ≈ 0.69) produced the observed sawtooth ratchet (kai seat 2026-09-18: 50K →
+// 358K over ~3.8h, ~80K tok/h, reactive-only trims, emergency cache-break,
+// TTFT 140s). Steady state is now the band [0.40, 0.60] of the lane limit:
+// trigger at T_high=0.60, hierarchical passes shrink to T_low=0.40, prompts
+// stay flat instead of ratcheting.
+const DEFAULT_CORTEX_COMPACTION_TARGET_FRACTION = 0.40;
 
 function positiveIntEnv(name: string): number | undefined {
   const raw = process.env[name];
@@ -173,6 +182,46 @@ export function estimateTokens(messages: Message[], model?: string): number {
     }
     return sum + msgTokens;
   }, 0);
+}
+
+/**
+ * Drop all but the newest screenshot(s) from the working projection.
+ * Transcript is not touched — callers must not write this result to
+ * session_message_transcript.
+ */
+export function stripStaleWorkingImages(
+  messages: Message[],
+  keepNewest = 1,
+): { messages: Message[]; stripped: number } {
+  const found: Array<{ messageIndex: number; blockIndex: number }> = [];
+  messages.forEach((message, messageIndex) => {
+    if (!Array.isArray(message.content)) return;
+    (message.content as ContentBlock[]).forEach((block, blockIndex) => {
+      if (block.type === 'tool_result' && (block as ToolResultContent).image) {
+        found.push({ messageIndex, blockIndex });
+      }
+    });
+  });
+  if (found.length <= keepNewest) return { messages, stripped: 0 };
+  const drop = new Set(
+    found.slice(0, found.length - keepNewest).map(({ messageIndex, blockIndex }) => `${messageIndex}:${blockIndex}`),
+  );
+  const next = messages.map((message, messageIndex) => {
+    if (!Array.isArray(message.content)) return message;
+    let changed = false;
+    const content = (message.content as ContentBlock[]).map((block, blockIndex) => {
+      if (!drop.has(`${messageIndex}:${blockIndex}`)) return block;
+      changed = true;
+      const toolResult = block as ToolResultContent;
+      return {
+        ...toolResult,
+        image: undefined,
+        content: `${toolResult.content ?? ''}\n[Stale screenshot omitted from working context; transcript unchanged.]`.trim(),
+      };
+    });
+    return changed ? { ...message, content } : message;
+  });
+  return { messages: next, stripped: drop.size };
 }
 
 /** Estimate token overhead from system prompt + tool definitions.
@@ -318,8 +367,8 @@ export function compactionThresholdFor(maxTokens: number): number {
     // of the window, never of the model's spelling.
     //
     // Precedence: absolute env override > fraction env override > default
-    // fraction. The default 0.75 tracks the announced window (a 512K session
-    // compacts at 393,216; a 262K one at 196,608) and always sits below the
+    // fraction. The default 0.60 is the PLAT-9194 T_high (a 512K session
+    // compacts at 307,200; a 262K one at 157,286) and always sits below the
     // fit ceiling (headroom is ≥15% of the window ⇒ ceiling fraction ≥0.85).
     const absolute = positiveIntEnv('SHIZUHA_CORTEX_COMPACTION_TRIGGER_TOKENS');
     const fractionOverride = positiveFloatEnv('SHIZUHA_CORTEX_COMPACTION_TRIGGER_FRACTION');
@@ -338,6 +387,25 @@ export function compactionThresholdFor(maxTokens: number): number {
   // SMALL windows keep the audited 0.70 (2026-06-09: model-quality bound —
   // Qwen-class degradation past ~90K of 131K — not a budget bound).
   return COMPACTION_THRESHOLD;
+}
+
+/**
+ * PLAT-9194 deterministic band floor: the token target hierarchical semantic
+ * compaction passes shrink toward, as a fraction of the lane window. Default
+ * 0.40 (T_low) — with the 0.60 trigger this holds prompts in the steady-state
+ * band [40%, 60%] instead of sawtoothing up to the trigger every cycle.
+ *
+ * Precedence: env override `SHIZUHA_CORTEX_COMPACTION_TARGET_FRACTION` >
+ * default. The result is clamped to sit STRICTLY BELOW the effective trigger
+ * (≤ 95% of the trigger fraction) so a misconfigured high target can never
+ * land at or above T_high — that would re-create the 70–85% compact-succeeded-
+ * but-headroom-abort band (Qwen3.8-27B-Q4, 2026-08-16) with extra steps.
+ */
+export function compactionTargetFractionFor(maxTokens: number): number {
+  const override = positiveFloatEnv('SHIZUHA_CORTEX_COMPACTION_TARGET_FRACTION');
+  const target = override ?? DEFAULT_CORTEX_COMPACTION_TARGET_FRACTION;
+  const triggerFraction = compactionThresholdFor(maxTokens);
+  return Math.min(target, triggerFraction * 0.95);
 }
 
 export function needsCompaction(

@@ -13,8 +13,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,6 +26,13 @@ spec = importlib.util.spec_from_file_location("agent_runtime_overlay", MODULE_PA
 assert spec and spec.loader
 overlay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(overlay)
+
+startup_spec = importlib.util.spec_from_file_location(
+    "verify_agent_runtime_startup", ROOT / "scripts/verify-agent-runtime-startup.py"
+)
+assert startup_spec and startup_spec.loader
+startup = importlib.util.module_from_spec(startup_spec)
+startup_spec.loader.exec_module(startup)
 
 
 def _write_minimum_source(root: Path) -> None:
@@ -65,6 +75,118 @@ def _apply_oci_layer(root: Path, layer: Path) -> None:
                 assert source
                 destination.write_bytes(source.read())
                 os.chmod(destination, member.mode)
+
+
+class RuntimeStartupInstrumentTests(unittest.TestCase):
+    """Controls test the instrument; published images test the actual runtime."""
+
+    def setUp(self):
+        self.fixture = tempfile.TemporaryDirectory(prefix="startup-instrument-")
+        self.addCleanup(self.fixture.cleanup)
+        self.root = Path(self.fixture.name)
+        self.bundle = self.root / "fixture-bundle.py"
+        self.entrypoint = self.root / "fixture-entrypoint"
+        self.uid_patch = mock.patch.object(startup.os, "getuid", return_value=1000)
+        self.uid_patch.start()
+        self.addCleanup(self.uid_patch.stop)
+
+    def write_fixture(self, behavior="good"):
+        self.entrypoint.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f"""\
+            import os, pathlib, sys, tempfile
+            assert len(sys.argv) == 1, 'entrypoint must receive no explicit arguments'
+            home = pathlib.Path(os.environ['HOME'])
+            directory = pathlib.Path(tempfile.mkdtemp(dir=os.environ['TMPDIR']))
+            prompt = directory / 'prompt'
+            prompt.write_text(os.environ['CONTEXT_PROMPT'])
+            prompt.chmod(0o600)
+            flag = '--context-prompt' if {behavior!r} == 'inline' else '--context-prompt-file'
+            os.execv(sys.executable, [sys.executable, {str(self.bundle)!r}, 'gateway', flag, str(prompt)])
+        """))
+        self.entrypoint.chmod(0o755)
+        self.bundle.write_text(textwrap.dedent(f"""\
+            import json, os, pathlib, sqlite3, urllib.request, urllib.error
+            from http.server import BaseHTTPRequestHandler, HTTPServer
+            pathlib.Path({str(self.root / 'pid')!r}).write_text(str(os.getpid()))
+            behavior = {behavior!r}
+            if behavior == 'exit':
+                raise SystemExit(17)
+            document = os.environ['CONTEXT_PROMPT']
+            if behavior == 'mutated':
+                document = document.strip()
+            with sqlite3.connect('.shizuha-state.db') as db:
+                db.execute('CREATE TABLE session_provider_prefix_heads(system_prompt TEXT)')
+                db.execute('INSERT INTO session_provider_prefix_heads VALUES (?)', ('prefix\\n'+document+'suffix',))
+                db.execute('CREATE TABLE messages(body TEXT)')
+                db.execute('CREATE TABLE session_wire_prefix(body TEXT)')
+                if behavior == 'work':
+                    db.execute("INSERT INTO messages VALUES ('unexpected turn')")
+            if behavior == 'inference':
+                try:
+                    urllib.request.urlopen(os.environ['CORTEX_BASE_URL']+'/v1/chat/completions', data=b'{{}}')
+                except urllib.error.HTTPError as error:
+                    assert error.code == 503
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *args): pass
+                def do_GET(self):
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({{'initialized': behavior != 'timeout'}}).encode())
+            HTTPServer(('127.0.0.1', int(os.environ['PORT'])), Handler).serve_forever()
+        """))
+
+    def verify(self, timeout=3):
+        return startup.verify_startup(self.entrypoint, self.bundle, timeout_seconds=timeout)
+
+    def assert_fixture_reaped(self):
+        pid = int((self.root / 'pid').read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_complete_document_and_zero_work_pass_then_cleanup(self):
+        self.write_fixture()
+        result = self.verify()
+        self.assertTrue(result['initialized'])
+        self.assertTrue(result['exact_document_in_system_prefix'])
+        self.assertGreater(result['document_bytes'], 4096)
+        self.assertEqual(result['model_requests'], 0)
+        self.assertEqual(result['messages'], 0)
+        self.assertEqual(result['session_wire_prefix'], 0)
+        self.assertTrue(result['fixture_stopped'])
+        self.assert_fixture_reaped()
+
+    def test_real_startup_failures_fail_the_instrument_and_cleanup(self):
+        for behavior, diagnostic in (
+            ('exit', 'exited before initialization'),
+            ('inline', 'inline argv'),
+            ('mutated', 'exact complete document'),
+            ('work', 'produced messages'),
+            ('inference', 'attempted inference'),
+            ('timeout', 'startup deadline'),
+        ):
+            with self.subTest(behavior=behavior):
+                self.write_fixture(behavior)
+                with self.assertRaisesRegex(RuntimeError, diagnostic):
+                    self.verify(timeout=0.7 if behavior == 'timeout' else 3)
+                self.assert_fixture_reaped()
+
+    def test_source_digest_mismatch_fails_before_launch(self):
+        self.write_fixture()
+        with self.assertRaisesRegex(RuntimeError, 'differs from build source'):
+            startup.verify_startup(self.entrypoint, self.bundle, expected_entrypoint_sha256='0' * 64)
+        self.assertFalse((self.root / 'pid').exists())
+
+    def test_fixture_does_not_inherit_credentials_platform_or_channels(self):
+        with mock.patch.dict(os.environ, {
+            'AGENT_PASSWORD': 'must-not-propagate', 'CORTEX_API_KEY': 'must-not-propagate',
+            'SHIZUHA_PLATFORM_URL': 'https://must-not-connect.invalid',
+            'CONNECT_WS_URL': 'wss://must-not-connect.invalid',
+            'MCP_AUTH_PROXY_SOCKET': '/must-not-mount.sock', 'HTTP_PROXY': 'http://must-not-proxy.invalid',
+        }):
+            env = startup.fixture_environment(self.root, 'http://127.0.0.1:1234', 1235)
+        for key in ('AGENT_PASSWORD', 'CORTEX_API_KEY', 'SHIZUHA_PLATFORM_URL',
+                    'CONNECT_WS_URL', 'MCP_AUTH_PROXY_SOCKET', 'HTTP_PROXY'):
+            self.assertNotIn(key, env)
+        self.assertEqual(env['CORTEX_BASE_URL'], 'http://127.0.0.1:1234')
 
 
 class OverlayLayerTests(unittest.TestCase):
@@ -500,6 +622,160 @@ class OverlayIndexTests(unittest.TestCase):
 
 
 class OverlayWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def manifest_caller_pod():
+        workflow = (ROOT / ".forgejo/workflows/build-agent-runtime.yml").read_text()
+        aggregate = workflow.index('[ "$SMOKE_WAIT_STATUS" -eq 0 ] || exit')
+        start = workflow.index("python3 scripts/render-agent-runtime-manifest-job.py", aggregate)
+        end = workflow.index("| kubectl apply -f -", start)
+        result = subprocess.run(["bash", "-eu", "-c", workflow[start:end].strip()], cwd=ROOT,
+            env={**os.environ, "CANDIDATE_TAG": "candidate-placement", "TAG": "harness-placement",
+                 "IMG": "shizuha-agent-runtime", "AMD64_CANDIDATE_DIGEST": "sha256:" + "a" * 64,
+                 "ARM64_CANDIDATE_DIGEST": "sha256:" + "b" * 64},
+            text=True, capture_output=True, check=True)
+        return json.loads(result.stdout)["spec"]["template"]["spec"]
+
+    @staticmethod
+    def eligible_manifest_node(pod, node):
+        """Bounded predicate for this caller's actual selectors and taints."""
+        labels = node["metadata"]["labels"]
+        if node.get("spec", {}).get("unschedulable"):
+            return False
+        if any(labels.get(key) != value for key, value in pod.get("nodeSelector", {}).items()):
+            return False
+        required = pod.get("affinity", {}).get("nodeAffinity", {}).get("requiredDuringSchedulingIgnoredDuringExecution")
+        if required:
+            def matches(term):
+                for rule in term.get("matchExpressions", []):
+                    if rule["operator"] != "DoesNotExist":
+                        raise AssertionError("review new affinity semantics at the caller boundary")
+                    if rule["key"] in labels:
+                        return False
+                return bool(term.get("matchExpressions"))
+            if not any(matches(term) for term in required["nodeSelectorTerms"]):
+                return False
+        for taint in node.get("spec", {}).get("taints", []):
+            if taint["effect"] not in ("NoSchedule", "NoExecute"):
+                continue
+            if not any(t.get("key") == taint["key"] and t.get("effect") == taint["effect"]
+                       and (t.get("operator", "Equal") == "Exists" or t.get("value", "") == taint.get("value", ""))
+                       for t in pod.get("tolerations", [])):
+                return False
+        return True
+
+    def test_actual_manifest_caller_can_use_worker_without_bypassing_operator_hold(self):
+        fixture = json.loads((ROOT / "tests/ci/fixtures/agent-runtime-manifest-placement-20260908.json").read_text())
+        nodes = fixture["nodes"]
+        self.assertEqual(len(nodes), 18)
+        # Real failed39436 Pod placement could use none of the captured nodes.
+        self.assertEqual([n["metadata"]["name"] for n in nodes
+                          if self.eligible_manifest_node(fixture["failed_placement"], n)], [])
+        pod = self.manifest_caller_pod()
+        self.assertNotIn("nodeName", pod)
+        self.assertEqual([n["metadata"]["name"] for n in nodes if self.eligible_manifest_node(pod, n)], ["i9-ws"])
+        worker = next(n for n in nodes if n["metadata"]["name"] == "i9-ws")
+        held = next(n for n in nodes if n["metadata"]["name"] == "s1")
+        self.assertFalse(self.eligible_manifest_node(pod, held))
+        for mutation in ("arm64", "control-plane", "operator-hold", "unrelated-taint"):
+            node = json.loads(json.dumps(worker))
+            if mutation == "arm64":
+                node["metadata"]["labels"]["kubernetes.io/arch"] = "arm64"
+            elif mutation == "control-plane":
+                node["metadata"]["labels"]["node-role.kubernetes.io/control-plane"] = "true"
+            elif mutation == "operator-hold":
+                node["spec"]["taints"] += [t for t in held["spec"]["taints"] if t["key"] == "operator"]
+            else:
+                node["spec"]["taints"].append({"key": "maintenance", "effect": "NoSchedule"})
+            with self.subTest(mutation=mutation):
+                self.assertFalse(self.eligible_manifest_node(pod, node))
+        # The architecture chosen above matches the same smoke-qualified child.
+        self.assertEqual(pod["containers"][0]["image"], "localhost:30500/shizuha-agent-runtime@sha256:" + "a" * 64)
+        self.assertEqual(pod["containers"][0]["command"], ["python3", "-c"])
+        self.assertEqual(pod["containers"][0]["securityContext"], {"runAsUser": 0})
+        self.assertEqual(pod["containers"][0]["volumeMounts"], [{"mountPath": "/tools", "name": "tools"}])
+        self.assertEqual(pod["initContainers"][0]["volumeMounts"], [{"mountPath": "/tools", "name": "tools"}])
+        self.assertEqual(pod["initContainers"][0]["command"], ["/busybox/sh", "-c"])
+
+    def test_full_build_manifest_caller_runs_without_optional_overlay_base(self):
+        """Run the post-smoke caller with only its exact native children available."""
+        workflow = (ROOT / ".forgejo/workflows/build-agent-runtime.yml").read_text()
+        aggregate = workflow.index('[ "$SMOKE_WAIT_STATUS" -eq 0 ] || exit')
+        start = workflow.index("python3 scripts/render-agent-runtime-manifest-job.py", aggregate)
+        end = workflow.index("| kubectl apply -f -", start)
+        caller = workflow[start:end].strip()
+        amd, arm, absent_base = ("sha256:" + char * 64 for char in "abc")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = {
+                **os.environ,
+                "CANDIDATE_TAG": "candidate-full-build",
+                "TAG": "harness-full-build",
+                "IMG": "shizuha-agent-runtime",
+                "OVERLAY_BASE_INDEX_DIGEST": absent_base,
+                "AMD64_CANDIDATE_DIGEST": amd,
+                "ARM64_CANDIDATE_DIGEST": arm,
+            }
+            rendered = subprocess.run(
+                ["bash", "-eu", "-c", caller], cwd=ROOT, env=env,
+                text=True, capture_output=True, check=True,
+            )
+            pod = json.loads(rendered.stdout)["spec"]["template"]["spec"]
+            container = pod["containers"][0]
+            # Model the actual pull boundary: full native build succeeded even
+            # though the optional overlay base has been removed from registry.
+            available = {
+                f"localhost:30500/shizuha-agent-runtime@{amd}": "amd64",
+                f"localhost:30500/shizuha-agent-runtime@{arm}": "arm64",
+            }
+            self.assertIn(container["image"], available, "manifest runner would ImagePullBackOff")
+            self.assertEqual(pod["nodeSelector"]["kubernetes.io/arch"], available[container["image"]])
+            self.assertNotIn(absent_base, rendered.stdout)
+
+            index = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+                     "manifests": [
+                         {"digest": amd, "platform": {"os": "linux", "architecture": "amd64"}},
+                         {"digest": arm, "platform": {"os": "linux", "architecture": "arm64"}},
+                     ]}
+            body = json.dumps(index).encode()
+            requests = []
+            class Registry(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    requests.append(self.path)
+                    if self.path != "/v2/shizuha-agent-runtime/manifests/harness-full-build":
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Docker-Content-Digest", "sha256:" + hashlib.sha256(body).hexdigest())
+                    self.end_headers()
+                    self.wfile.write(body)
+                def log_message(self, *_args):
+                    pass
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Registry)
+            worker = threading.Thread(target=server.serve_forever)
+            worker.start()
+            try:
+                recorded = root / "crane-argv.json"
+                crane = root / "crane"
+                crane.write_text(f"#!{sys.executable}\nimport json,sys,pathlib\npathlib.Path({str(recorded)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+                crane.chmod(0o755)
+                runner_env = {**env, **{x["name"]: x["value"] for x in container["env"]},
+                              "REGISTRY_V2": f"http://127.0.0.1:{server.server_port}/v2"}
+                # Only map the disposable tools volume; execute the real
+                # embedded stdlib module and final-index verification.
+                script = container["args"][0].replace('"/tools/crane"', json.dumps(str(crane)))
+                result = subprocess.run([*container["command"], script], env=runner_env,
+                                        text=True, capture_output=True, check=True)
+                self.assertEqual(json.loads(result.stdout)["children"], {"amd64": amd, "arm64": arm})
+                argv = json.loads(recorded.read_text())
+                self.assertEqual(argv.count("-m"), 2)
+                self.assertIn(f"registry.registry.svc.cluster.local:5000/shizuha-agent-runtime@{amd}", argv)
+                self.assertIn(f"registry.registry.svc.cluster.local:5000/shizuha-agent-runtime@{arm}", argv)
+                self.assertEqual(requests, ["/v2/shizuha-agent-runtime/manifests/harness-full-build"])
+            finally:
+                server.shutdown()
+                worker.join(timeout=5)
+                server.server_close()
+
     def test_terminal_job_observer_exits_on_complete_and_failed_without_waiting_for_timeout(self):
         observer = ROOT / "scripts/wait-k8s-job-terminal.py"
         with tempfile.TemporaryDirectory() as tmp:
@@ -710,6 +986,22 @@ class OverlayWorkflowTests(unittest.TestCase):
         self.assertIn("--timeout-seconds 1200", workflow[overlay_observer:smoke_amd64])
         self.assertNotIn("--for=condition=complete", workflow[overlay_apply:smoke_amd64])
 
+    def test_native_runtime_cache_helper_really_locks_and_releases(self):
+        self.assertEqual(startup.verify_cache_lock(), {
+            'cache_lock_helper': '/usr/bin/flock', 'cache_lock_verified': True,
+        })
+        dockerfile = (ROOT / 'Dockerfile.agent-runtime').read_text()
+        packages = dockerfile.split('apt-get install -y --no-install-recommends', 1)[1].split('&&', 1)[0]
+        self.assertIn('util-linux', packages.split())
+
+    def test_native_runtime_cache_helper_refuses_missing_or_noop_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, 'helper is missing'):
+                startup.verify_cache_lock(Path(directory) / 'missing')
+        # Exit zero by itself is insufficient: the actual kernel lock must hold.
+        with self.assertRaisesRegex(RuntimeError, 'did not retain'):
+            startup.verify_cache_lock(Path('/bin/true'))
+
     def test_native_smoke_renderer_pins_each_candidate_to_its_architecture(self):
         script = ROOT / "scripts/render-agent-runtime-smoke-job.py"
         common = [
@@ -735,6 +1027,18 @@ class OverlayWorkflowTests(unittest.TestCase):
                 pod_spec["containers"][0]["image"],
                 f"localhost:30500/shizuha-agent-runtime@{digest}",
             )
+            self.assertFalse(pod_spec["automountServiceAccountToken"])
+            self.assertEqual(pod_spec["volumes"], [{"name": "smoke-home", "emptyDir": {}}])
+            self.assertEqual(pod_spec["securityContext"], {"fsGroup": 1000})
+            self.assertEqual(pod_spec["containers"][0]["volumeMounts"],
+                             [{"name": "smoke-home", "mountPath": "/home/agent"}])
+            smoke = pod_spec["containers"][0]["args"][0]
+            self.assertIn((ROOT / "scripts/verify-agent-runtime-startup.py").read_text(), smoke)
+            expected_sha = hashlib.sha256((ROOT / "agent-runtime-entrypoint.sh").read_bytes()).hexdigest()
+            self.assertIn(f"--entrypoint-sha256 {expected_sha}", smoke)
+            subprocess.run(["bash", "-n"], input=smoke, text=True, check=True)
+        self.assertIn("'scripts/verify-agent-runtime-startup.py'",
+                      (ROOT / ".forgejo/workflows/build-agent-runtime.yml").read_text())
 
     def test_authoritative_overlay_and_manifest_jobs_pin_every_image_by_digest(self):
         overlay_job = json.loads(
@@ -765,7 +1069,6 @@ class OverlayWorkflowTests(unittest.TestCase):
                     "--candidate-tag", "candidate-77-deadbee",
                     "--tag", "harness-202608120900-deadbee",
                     "--image-repo", "shizuha-agent-runtime",
-                    "--base-index-digest", "sha256:" + "c" * 64,
                     "--amd64-digest", "sha256:" + "a" * 64,
                     "--arm64-digest", "sha256:" + "b" * 64,
                 ],
@@ -776,7 +1079,7 @@ class OverlayWorkflowTests(unittest.TestCase):
             "localhost:30500/shizuha-agent-runtime@" + "sha256:" + "a" * 64
         )
         manifest_base = (
-            "localhost:30500/shizuha-agent-runtime@" + "sha256:" + "c" * 64
+            "localhost:30500/shizuha-agent-runtime@" + "sha256:" + "a" * 64
         )
         for job in (overlay_job, manifest_job):
             pod_spec = job["spec"]["template"]["spec"]
@@ -791,11 +1094,9 @@ class OverlayWorkflowTests(unittest.TestCase):
                 for container in containers
                 if container["name"] != "crane-bin"
             ]
+            expected_prefix = "localhost:30500/shizuha-agent-runtime@sha256:"
             self.assertTrue(
-                all(
-                    image.startswith("localhost:30500/shizuha-agent-runtime@sha256:")
-                    for image in non_crane_images
-                ),
+                all(image.startswith(expected_prefix) for image in non_crane_images),
                 non_crane_images,
             )
             init = pod_spec["initContainers"]
@@ -811,6 +1112,19 @@ class OverlayWorkflowTests(unittest.TestCase):
                     ],
                 )
 
+        overlay_exprs = overlay_job["spec"]["template"]["spec"]["affinity"][
+            "nodeAffinity"
+        ]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0][
+            "matchExpressions"
+        ]
+        self.assertIn(
+            {
+                "key": "shizuha.io/disk-class",
+                "operator": "NotIn",
+                "values": ["small"],
+            },
+            overlay_exprs,
+        )
         overlay_init = overlay_job["spec"]["template"]["spec"]["initContainers"]
         git_clone = next(container for container in overlay_init if container["name"] == "git-clone")
         dist_builder = next(container for container in overlay_init if container["name"] == "dist-build")

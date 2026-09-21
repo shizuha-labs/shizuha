@@ -28,6 +28,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import Database from 'better-sqlite3';
+import { pinPreparedStatements } from '../shared/sqlite-statement-cache.js';
 
 // ── Types ──
 
@@ -346,6 +347,7 @@ export class MemoryIndex {
 
     const dbPath = path.join(workspace, '.memory-index.db');
     this.db = new Database(dbPath);
+    pinPreparedStatements(this.db);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
 

@@ -164,11 +164,12 @@ printf 'gemini 0.50.0\n'
       path.join(projectRoot, '.harness-build-versions.lock'),
       'utf8',
     );
-    expect(lock).toContain('claude_code=2.1.211');
-    expect(lock).toContain('codex=0.144.5');
+    expect(lock).toContain('claude_code=2.1.263');
+    expect(lock).toContain('codex=0.153.4');
     expect(lock).toContain('antigravity=');
+    expect(lock).toContain('openclaw=');
     expect(lock).not.toContain('gemini=');
-    const harnessInstall = dockerfile.indexOf('&& npm install -g');
+    const harnessInstall = dockerfile.search(/^\s*(?:&&\s*)?npm install -g\b/m);
     expect(harnessInstall).toBeGreaterThan(-1);
     expect(harnessInstall).toBeLessThan(dockerfile.indexOf('COPY dist ./dist'));
     expect(harnessInstall).toBeLessThan(dockerfile.indexOf('COPY .runtime-skills /opt/skills'));

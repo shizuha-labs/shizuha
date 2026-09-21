@@ -89,7 +89,7 @@ exactJson(Object.keys(manifest).sort(), [
   'activationEvents', 'bugs', 'capabilities', 'categories', 'contributes',
   'description', 'devDependencies', 'displayName', 'engines', 'extensionKind',
   'galleryBanner', 'homepage', 'icon', 'keywords', 'license', 'main', 'name',
-  'pricing', 'publisher', 'repository', 'scripts', 'version',
+  'overrides', 'pricing', 'publisher', 'repository', 'scripts', 'version',
 ].sort(), 'package top-level semantic graph');
 exact(manifest.publisher, 'shizuha', 'publisher');
 exact(manifest.name, 'shizuha-vscode', 'extension name');

@@ -49,6 +49,10 @@ import {
   type RuntimeRollDrainRequest,
   type RuntimeRollDrainSnapshot,
 } from '../../shared/runtime-roll-drain.js';
+import { classifyGrokVoiceFailure, isGrokVoiceOmniModel } from '../../provider/grok-voice.js';
+import { isLoopbackAddress, verifyVoiceS2SToken } from '../../voice-s2s/auth.js';
+import { GrokVoiceS2SSession, type VoiceS2SHost } from '../../voice-s2s/session.js';
+import { advertiseVoiceS2STools } from '../../voice-s2s/tools.js';
 
 /** Pending SSE response slot — bridges inbox processing to HTTP response. */
 interface ResponseSlot {
@@ -80,6 +84,8 @@ export interface HttpChannelOptions {
   getRuntimeHealth?: () => Record<string, unknown>;
   armRuntimeRollDrain?: (request: RuntimeRollDrainRequest) => RuntimeRollDrainSnapshot;
   getRuntimeRollDrain?: () => RuntimeRollDrainSnapshot | null;
+  /** Live S2S host — same ToolRegistry the text turn uses. */
+  getVoiceS2SHost?: () => VoiceS2SHost | null;
 }
 
 export class HttpChannel implements Channel {
@@ -94,6 +100,7 @@ export class HttpChannel implements Channel {
   /** All connected WS sockets (for cleanup) */
   private allWsSockets = new Set<WebSocket>();
   private wss: InstanceType<typeof WebSocketServer> | null = null;
+  private voiceWss: InstanceType<typeof WebSocketServer> | null = null;
   private wsPingTimer: NodeJS.Timeout | null = null;
   private port: number;
   private host: string;
@@ -104,6 +111,7 @@ export class HttpChannel implements Channel {
   private getRuntimeHealth: () => Record<string, unknown>;
   private armRuntimeRollDrain?: (request: RuntimeRollDrainRequest) => RuntimeRollDrainSnapshot;
   private getRuntimeRollDrain: () => RuntimeRollDrainSnapshot | null;
+  private getVoiceS2SHost: () => VoiceS2SHost | null;
   private runtimeRollIngressFenced = false;
 
   constructor(options: HttpChannelOptions = {}) {
@@ -123,6 +131,7 @@ export class HttpChannel implements Channel {
     }));
     this.armRuntimeRollDrain = options.armRuntimeRollDrain;
     this.getRuntimeRollDrain = options.getRuntimeRollDrain ?? (() => null);
+    this.getVoiceS2SHost = options.getVoiceS2SHost ?? (() => null);
   }
 
   async start(inbox: Inbox): Promise<void> {
@@ -167,6 +176,10 @@ export class HttpChannel implements Channel {
     if (this.wss) {
       this.wss.close();
       this.wss = null;
+    }
+    if (this.voiceWss) {
+      this.voiceWss.close();
+      this.voiceWss = null;
     }
 
     // Complete all pending SSE responses
@@ -305,6 +318,18 @@ export class HttpChannel implements Channel {
       // first turn builds a system prompt) — scraped by the agent-health exporter.
       contextBudget: getLastContextBudget(),
     }));
+
+    app.get('/v1/voice/s2s', async () => {
+      const host = this.getVoiceS2SHost();
+      const ready = Boolean(host && isGrokVoiceOmniModel(host.model));
+      return {
+        ok: ready,
+        path: '/v1/voice/realtime',
+        transport: 's2s',
+        model: host?.model ?? null,
+        tools: ready ? advertiseVoiceS2STools(host!.tools).map((tool) => tool.name) : [],
+      };
+    });
 
     app.post<{ Body: RuntimeRollDrainRequest }>(
       '/v1/runtime/rollout-drain',
@@ -530,6 +555,96 @@ export class HttpChannel implements Channel {
     });
   }
 
+  private async upgradeVoiceS2S(
+    request: IncomingMessage,
+    socket: any,
+    head: Buffer,
+    url: URL,
+  ): Promise<void> {
+    const remoteIp = request.socket.remoteAddress || '';
+    const headerAuth = String(request.headers.authorization || '');
+    const token = url.searchParams.get('token')
+      || (headerAuth.toLowerCase().startsWith('bearer ') ? headerAuth.slice(7).trim() : '');
+    const allowed = isLoopbackAddress(remoteIp)
+      || process.env['SHIZUHA_GATEWAY_LOCALHOST_BYPASS'] === '1'
+      || await verifyVoiceS2SToken(token);
+    if (!allowed) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    this.voiceWss!.handleUpgrade(request, socket, head, (ws: WebSocket) => {
+      this.voiceWss!.emit('connection', ws, request);
+    });
+  }
+
+  private handleVoiceS2SSocket(ws: WebSocket): void {
+    let session: GrokVoiceS2SSession | null = null;
+    const client = {
+      sendJson: (payload: unknown) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+      },
+      sendBytes: (buf: Buffer) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(buf);
+      },
+    };
+
+    const fail = (message: string, code = 4403, errorCode = 'stream_unavailable') => {
+      try {
+        client.sendJson({
+          type: 'error',
+          message,
+          code: errorCode,
+          fatal: true,
+        });
+      } catch { /* ignore */ }
+      try { ws.close(code, message.slice(0, 80)); } catch { /* ignore */ }
+    };
+
+    ws.on('message', (raw: unknown) => {
+      if (session) {
+        if (Buffer.isBuffer(raw)) session.handleClientData(raw);
+        else session.handleClientData(String(raw));
+        return;
+      }
+      let start: { type?: string; sample_rate?: number; conversation_id?: string; history?: Array<{ role?: string; text?: string }> };
+      try {
+        start = JSON.parse(String(raw)) as typeof start;
+      } catch {
+        fail('The first message must be start.', 4400);
+        return;
+      }
+      if (start.type !== 'start') {
+        fail('The first message must be start.', 4400);
+        return;
+      }
+      const host = this.getVoiceS2SHost();
+      if (!host || !isGrokVoiceOmniModel(host.model)) {
+        fail('Speech-to-speech is only available on a Grok Voice SCLI seat.', 4403);
+        return;
+      }
+      session = new GrokVoiceS2SSession(host, client, {
+        sampleRate: Number(start.sample_rate) || 24_000,
+        conversationId: start.conversation_id,
+        history: start.history,
+      });
+      void session.startSession().catch((err) => {
+        const classified = classifyGrokVoiceFailure(err);
+        logger.warn({ err, code: classified.code }, 'SCLI voice S2S session failed to start');
+        fail(classified.message, 1013, classified.code);
+      });
+    });
+
+    ws.on('close', () => {
+      session?.close();
+      session = null;
+      this.allWsSockets.delete(ws);
+    });
+    ws.on('error', (err: Error) => {
+      logger.warn({ err }, 'SCLI voice S2S client error');
+    });
+  }
+
   // ── WebSocket Server (chatbot protocol) ──
 
   /**
@@ -540,10 +655,19 @@ export class HttpChannel implements Channel {
     const server = this.app!.server;
 
     this.wss = new WebSocketServer({ noServer: true });
+    this.voiceWss = new WebSocketServer({ noServer: true });
+    this.voiceWss.on('connection', (ws: WebSocket) => {
+      this.allWsSockets.add(ws);
+      this.handleVoiceS2SSocket(ws);
+    });
 
-    // Handle upgrade requests — only accept /ws/chat path
+    // Handle upgrade requests — /ws/chat (dashboard) or /v1/voice/realtime (Live S2S)
     server.on('upgrade', (request: IncomingMessage, socket: any, head: Buffer) => {
       const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+      if (url.pathname === '/v1/voice/realtime' || url.pathname === '/v1/voice/realtime/') {
+        void this.upgradeVoiceS2S(request, socket, head, url);
+        return;
+      }
       if (url.pathname !== '/ws/chat' && url.pathname !== '/ws/chat/') {
         socket.destroy();
         return;

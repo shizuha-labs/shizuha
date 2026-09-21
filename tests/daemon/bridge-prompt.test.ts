@@ -41,6 +41,9 @@ describe('bridge identity prompt', () => {
     expect(prompt).toContain('- style: pragmatic');
     expect(prompt).toContain('## Agent Instructions');
     expect(prompt).toContain('Write clean code.');
+    expect(prompt).not.toMatch(/\[hritik\] Hi Sara, please reply with the word: pong/);
+    expect(prompt).not.toContain('content="pong"');
+    expect(prompt).toContain('Do not DM hritik (or anyone) a one-word "pong"');
   });
 
   it('still produces identity guidance when no custom prompt exists', () => {

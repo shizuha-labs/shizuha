@@ -259,4 +259,141 @@ describe('BackgroundTaskRegistry', () => {
       expect(registry.get(task.id)!.output.length).toBeLessThanOrEqual(120_000);
     });
   });
+
+  describe('waitAny', () => {
+    it('resolves with the first task to reach terminal state', async () => {
+      const a = registry.create('bash', 'sleep 1');
+      const b = registry.create('bash', 'sleep 2');
+      const waiter = registry.waitAny([a.id, b.id], 5000);
+      // Complete b first — waitAny must return b, not a.
+      registry.complete(b.id, 0);
+      const result = await waiter;
+      expect(result?.id).toBe(b.id);
+      expect(result?.status).toBe('completed');
+    });
+
+    it('resolves immediately when a task is already terminal', async () => {
+      const a = registry.create('bash', 'done already');
+      registry.complete(a.id, 0);
+      const b = registry.create('bash', 'still running');
+      const result = await registry.waitAny([a.id, b.id], 1000);
+      expect(result?.id).toBe(a.id);
+    });
+
+    it('resolves null on timeout when nothing completes', async () => {
+      const a = registry.create('bash', 'stuck');
+      const result = await registry.waitAny([a.id], 150);
+      expect(result).toBeNull();
+    });
+
+    it('resolves null immediately for unknown ids', async () => {
+      const result = await registry.waitAny(['task-nope'], 1000);
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('waitAll', () => {
+    it('resolves true when all tasks complete', async () => {
+      const a = registry.create('bash', 'a');
+      const b = registry.create('bash', 'b');
+      const waiter = registry.waitAll([a.id, b.id], 5000);
+      registry.complete(a.id, 0);
+      registry.complete(b.id, 0);
+      expect(await waiter).toBe(true);
+    });
+
+    it('resolves true immediately when all are already terminal', async () => {
+      const a = registry.create('bash', 'a');
+      registry.complete(a.id, 0);
+      expect(await registry.waitAll([a.id], 1000)).toBe(true);
+    });
+
+    it('resolves false on timeout when one task is stuck', async () => {
+      const a = registry.create('bash', 'a');
+      const b = registry.create('bash', 'stuck');
+      registry.complete(a.id, 0);
+      expect(await registry.waitAll([a.id, b.id], 150)).toBe(false);
+    });
+
+    it('resolves true for an empty/unknown set', async () => {
+      expect(await registry.waitAll([], 1000)).toBe(true);
+      expect(await registry.waitAll(['task-nope'], 1000)).toBe(true);
+    });
+  });
+
+  describe('getOutput', () => {
+    it('returns structured output and advances the offset', () => {
+      const a = registry.create('bash', 'echo hi');
+      registry.appendOutput(a.id, 'hello ');
+      const first = registry.getOutput(a.id);
+      expect(first?.deltaOutput).toBe('hello ');
+      registry.appendOutput(a.id, 'world');
+      const second = registry.getOutput(a.id);
+      expect(second?.deltaOutput).toBe('world');
+    });
+
+    it('returns full output when full=true without advancing offset', () => {
+      const a = registry.create('bash', 'echo hi');
+      registry.appendOutput(a.id, 'hello');
+      const full = registry.getOutput(a.id, true);
+      expect(full?.deltaOutput).toBe('hello');
+      const again = registry.getOutput(a.id, true);
+      expect(again?.deltaOutput).toBe('hello');
+    });
+
+    it('includes status, exitCode and error', () => {
+      const a = registry.create('bash', 'boom');
+      registry.fail(a.id, 'command not found');
+      const out = registry.getOutput(a.id, true);
+      expect(out?.status).toBe('failed');
+      expect(out?.error).toBe('command not found');
+    });
+
+    it('returns undefined for unknown ids', () => {
+      expect(registry.getOutput('task-nope')).toBeUndefined();
+    });
+  });
+
+  describe('monitor tasks (SCLI-432)', () => {
+    it('creates a monitor task with type monitor', () => {
+      const m = registry.create('monitor', 'tail -f app.log');
+      expect(m.type).toBe('monitor');
+      expect(m.status).toBe('running');
+    });
+
+    it('monitorLine appends line-buffered output', () => {
+      const m = registry.create('monitor', 'tail -f app.log');
+      registry.monitorLine(m.id, 'INFO request ok');
+      registry.monitorLine(m.id, 'WARN retry');
+      expect(registry.get(m.id)!.output).toBe('INFO request ok\nWARN retry\n');
+    });
+
+    it('monitorLine is a no-op for non-monitor tasks', () => {
+      const b = registry.create('bash', 'echo hi');
+      registry.monitorLine(b.id, 'should not append');
+      expect(registry.get(b.id)!.output).toBe('');
+    });
+
+    it('monitorLine is a no-op for unknown ids', () => {
+      registry.monitorLine('task-nope', 'x');
+      expect(registry.get('task-nope')).toBeUndefined();
+    });
+
+    it('monitor progress flows into collectAttachments', () => {
+      const m = registry.create('monitor', 'tail -f app.log');
+      const longLine = 'INFO request ok ' + 'x'.repeat(120);
+      registry.monitorLine(m.id, longLine);
+      const attachments = registry.collectAttachments();
+      expect(attachments.length).toBeGreaterThan(0);
+      const progress = attachments.find((a) => a.type === 'task_progress');
+      expect(progress).toBeDefined();
+      expect(progress!.deltaOutput).toContain('INFO request ok');
+    });
+
+    it('monitor task can be killed', () => {
+      const m = registry.create('monitor', 'tail -f app.log');
+      expect(registry.kill(m.id)).toBe(true);
+      expect(registry.get(m.id)!.status).toBe('killed');
+    });
+  });
 });

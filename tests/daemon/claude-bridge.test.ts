@@ -25,6 +25,9 @@ import {
   isHeartbeatTrigger,
   selectClaudeBridgeQueueAction,
   shouldDropQueuedMessage,
+  decideClaudeSessionProvenance,
+  extractClaudeSessionAuthorityRefs,
+  resolveClaudeSessionAuthoritySnapshot,
 } from '../../src/claude-bridge/index.js';
 import { HEARTBEAT_TRIGGER } from '../../src/agent-base-instructions.js';
 
@@ -257,6 +260,130 @@ describe('Claude bridge turn-boundary arbitration', () => {
   });
 });
 
+describe('Claude bridge retained-session durable provenance (PLAT-4707)', () => {
+  const taskRef = { kind: 'pulse_task' as const, taskKey: 'PLAT-4707' };
+  const prRef = { kind: 'origin_pr' as const, repo: 'shizuha-labs/shizuha-beta', number: 48 };
+
+  it('extracts canonical Pulse and Origin references without retaining message prose', () => {
+    expect(extractClaudeSessionAuthorityRefs(
+      'Handle PLAT-4707 using https://origin.shizuha.com/shizuha-labs/shizuha-beta/pulls/48; PLAT-4707 again',
+    )).toEqual([prRef, taskRef]);
+  });
+
+  it('resumes an unchanged queued session after restart', () => {
+    const queued = {
+      schemaVersion: 1 as const,
+      authorities: [
+        { ref: taskRef, status: 'in_progress', version: 'v7', blockers: [] },
+        { ref: prRef, status: 'open', version: 'v3', headSha: 'abc123', mergeCommitSha: null },
+      ],
+    };
+    expect(decideClaudeSessionProvenance(queued, structuredClone(queued))).toMatchObject({
+      action: 'resume',
+      changedFields: [],
+    });
+  });
+
+  it('invalidates obsolete queued context when durable task/PR state advances before restart', () => {
+    const queued = {
+      schemaVersion: 1 as const,
+      authorities: [
+        { ref: taskRef, status: 'in_progress', version: 'v7', blockers: [{ key: 'PLAT-4557', status: 'open', version: 'b1' }] },
+        { ref: prRef, status: 'open', version: 'v3', headSha: 'abc123', mergeCommitSha: null },
+      ],
+    };
+    const current = {
+      schemaVersion: 1 as const,
+      authorities: [
+        { ref: taskRef, status: 'in_review', version: 'v8', blockers: [] },
+        { ref: prRef, status: 'merged', version: 'v4', headSha: 'def456', mergeCommitSha: 'ff00' },
+      ],
+    };
+    const decision = decideClaudeSessionProvenance(queued, current);
+    expect(decision.action).toBe('invalidate');
+    expect(decision.changedFields).toEqual(['blockers', 'headSha', 'mergeCommitSha', 'status', 'version']);
+    expect(decision.oldDigest).not.toBe(decision.currentDigest);
+  });
+
+  // PLAT-4707 review (jun): the task-key regex matches ubiquitous prose tokens
+  // (SHA-256, UTF-8, ISO-9001). A definitive not-found must DROP the ref (a
+  // nonexistent key is not a durable authority), never throw — throwing wedges
+  // delivery (requeue-exhaustion on direct paths, heartbeat re-arm loops on
+  // the scheduler path). Transport/auth errors stay fail-loud.
+  it('drops a definitively not-found pulse_task ref instead of throwing (prose-token safety)', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const originalToken = process.env['PULSE_SERVICE_TOKEN'];
+    process.env['PULSE_SERVICE_TOKEN'] = 'test-provenance-token';
+    const fetchMock = vi.fn(async (input: any) => {
+      const url = String(input);
+      if (url.includes('/api/items/SHA-256/')) {
+        return new Response('not found', { status: 404 });
+      }
+      if (url.includes('/api/items/PLAT-4707/')) {
+        return new Response(JSON.stringify({
+          item_key: 'PLAT-4707', status: 'in_progress', version: 'v7', active_blockers: [],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const snapshot = await resolveClaudeSessionAuthoritySnapshot([
+        { kind: 'pulse_task', taskKey: 'SHA-256' },
+        { kind: 'pulse_task', taskKey: 'PLAT-4707' },
+      ]);
+      expect(snapshot.authorities).toHaveLength(1);
+      expect(snapshot.authorities[0]!.ref).toEqual({ kind: 'pulse_task', taskKey: 'PLAT-4707' });
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Pulse SHA-256 not found'));
+      // The 404 must short-circuit: no search fallback for a definitive not-found.
+      expect(fetchMock.mock.calls.every((c) => !String(c[0]).includes('/api/items/?search='))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      if (originalToken === undefined) delete process.env['PULSE_SERVICE_TOKEN']; else process.env['PULSE_SERVICE_TOKEN'] = originalToken;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('drops a pulse_task ref when search resolves but no row matches, and stays fail-loud on transport errors', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const originalToken2 = process.env['PULSE_SERVICE_TOKEN'];
+    process.env['PULSE_SERVICE_TOKEN'] = 'test-provenance-token';
+    // Direct endpoint 500s (transport-class), search resolves cleanly but has
+    // no matching row → the ref is definitively not a durable authority.
+    const fetchMock = vi.fn(async (input: any) => {
+      const url = String(input);
+      if (url.includes('/api/items/UTF-8/')) return new Response('boom', { status: 500 });
+      if (url.includes('/api/items/?search=UTF-8')) {
+        return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const snapshot = await resolveClaudeSessionAuthoritySnapshot([{ kind: 'pulse_task', taskKey: 'UTF-8' }]);
+      expect(snapshot.authorities).toHaveLength(0);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Pulse UTF-8 not found'));
+    } finally {
+      warnSpy.mockRestore();
+      if (originalToken2 === undefined) delete process.env['PULSE_SERVICE_TOKEN']; else process.env['PULSE_SERVICE_TOKEN'] = originalToken2;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('stays fail-loud when both direct and search transports fail (no silent authority loss)', async () => {
+    const originalToken3 = process.env['PULSE_SERVICE_TOKEN'];
+    process.env['PULSE_SERVICE_TOKEN'] = 'test-provenance-token';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 503 })));
+    try {
+      await expect(resolveClaudeSessionAuthoritySnapshot([{ kind: 'pulse_task', taskKey: 'PLAT-4707' }]))
+        .rejects.toThrow(/returned HTTP 503/);
+    } finally {
+      if (originalToken3 === undefined) delete process.env['PULSE_SERVICE_TOKEN']; else process.env['PULSE_SERVICE_TOKEN'] = originalToken3;
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 
 function makeJwt(label: string): string {
   const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
@@ -372,11 +499,13 @@ describe('ClaudeBridge', () => {
             markerPath,
             'mcp__shizuha-pulse__pulse_get_my_alerts',
             'mcp__shizuha-pulse__pulse_get_my_tasks',
+            'mcp__shizuha-pulse__pulse_get_my_work',
           ],
         }],
       });
       expect(hooks.PreToolUse?.[0]).toMatchObject({ matcher: '*' });
       expect(hooks.PostToolUse?.map((group) => group.matcher)).toEqual([
+        'mcp__shizuha-pulse__pulse_get_my_work',
         'mcp__shizuha-pulse__pulse_get_my_alerts',
         'mcp__shizuha-pulse__pulse_get_my_tasks',
       ]);
@@ -513,6 +642,123 @@ describe('ClaudeBridge', () => {
       );
       expect(directPrompt.status).toBe(0);
       expect(fs.existsSync(markerPath)).toBe(false);
+    } finally {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it('completes heartbeat observation with pulse_get_my_work alone', () => {
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-heartbeat-work-'));
+    try {
+      const settings: Record<string, unknown> = {};
+      const { markerPath, scriptPath } =
+        installClaudeHeartbeatObservationHooks(settings, workDir);
+      const hookArgs = [
+        scriptPath,
+        '',
+        markerPath,
+        'mcp__shizuha-pulse__pulse_get_my_alerts',
+        'mcp__shizuha-pulse__pulse_get_my_tasks',
+        'mcp__shizuha-pulse__pulse_get_my_work',
+      ];
+      const run = (mode: string, toolName: string) => {
+        const args = [...hookArgs];
+        args[1] = mode;
+        return spawnSync(process.execPath, args, {
+          encoding: 'utf8',
+          input: JSON.stringify({ tool_name: toolName, prompt: '[HEARTBEAT] Automatic sync' }),
+        });
+      };
+
+      expect(run('prompt', '').status).toBe(0);
+      expect(fs.existsSync(markerPath)).toBe(true);
+      expect(run('pre', 'mcp__shizuha-pulse__pulse_execute_transition').status).toBe(2);
+      expect(run('pre', 'mcp__shizuha-pulse__pulse_get_my_work').status).toBe(0);
+      expect(run('post', 'mcp__shizuha-pulse__pulse_get_my_work').status).toBe(0);
+      expect(fs.existsSync(markerPath)).toBe(false);
+    } finally {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails open to ToolSearch/Bash/Connect after repeated blocked tools (PLAT-5257)', () => {
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-heartbeat-escape-'));
+    try {
+      const settings: Record<string, unknown> = {};
+      const { markerPath, scriptPath } =
+        installClaudeHeartbeatObservationHooks(settings, workDir);
+      const args = [
+        scriptPath,
+        'pre',
+        markerPath,
+        'mcp__shizuha-pulse__pulse_get_my_alerts',
+        'mcp__shizuha-pulse__pulse_get_my_tasks',
+      ];
+      const run = (toolName: string) =>
+        spawnSync(process.execPath, args, {
+          encoding: 'utf8',
+          input: JSON.stringify({ tool_name: toolName }),
+        });
+
+      // Arm the gate as a heartbeat turn would.
+      const armed = spawnSync(
+        process.execPath,
+        [
+          scriptPath,
+          'prompt',
+          markerPath,
+          'mcp__shizuha-pulse__pulse_get_my_alerts',
+          'mcp__shizuha-pulse__pulse_get_my_tasks',
+        ],
+        {
+          encoding: 'utf8',
+          input: JSON.stringify({ prompt: '[HEARTBEAT] Automatic sync' }),
+        },
+      );
+      expect(armed.status).toBe(0);
+      expect(fs.existsSync(markerPath)).toBe(true);
+
+      // Simulate the pulse tool being unregistered: the required call never
+      // succeeds (no post event), so every other tool is blocked at first.
+      // ESCAPE_AFTER=3: the first two blocked tools stay blocked...
+      expect(run('ToolSearch').status).toBe(2);
+      expect(run('Bash').status).toBe(2);
+      // ...and on the third consecutive block the escape tools fail open.
+      const escapedConnect = run('mcp__shizuha-connect__message_user');
+      expect(escapedConnect.status).toBe(0);
+      expect(escapedConnect.stderr).toContain('Heartbeat observation degraded');
+
+      // Escape tools stay allowed once the threshold is reached...
+      const escapedToolSearch = run('ToolSearch');
+      expect(escapedToolSearch.status).toBe(0);
+      expect(escapedToolSearch.stderr).toContain('Heartbeat observation degraded');
+      expect(run('Bash').status).toBe(0);
+
+      // ...but non-escape tools remain blocked (observation still enforced).
+      expect(run('mcp__shizuha-pulse__pulse_execute_transition').status).toBe(2);
+
+      // When the required pulse tool finally succeeds, the gate resets and a
+      // fresh turn blocks again until the escape threshold is reached.
+      const postAlerts = spawnSync(
+        process.execPath,
+        [
+          scriptPath,
+          'post',
+          markerPath,
+          'mcp__shizuha-pulse__pulse_get_my_alerts',
+          'mcp__shizuha-pulse__pulse_get_my_tasks',
+        ],
+        {
+          encoding: 'utf8',
+          input: JSON.stringify({
+            tool_name: 'mcp__shizuha-pulse__pulse_get_my_alerts',
+          }),
+        },
+      );
+      expect(postAlerts.status).toBe(0);
+      expect(fs.readFileSync(markerPath, 'utf8')).toBe('tasks');
+      // Escape counter cleared on success: the next block is a fresh failure.
+      expect(run('ToolSearch').status).toBe(2);
     } finally {
       fs.rmSync(workDir, { recursive: true, force: true });
     }

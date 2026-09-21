@@ -4,7 +4,7 @@ import type { ToolRegistry } from '../registry.js';
 import { connectMCP, disconnectMCP, refreshMCPTools } from './client.js';
 import { createMCPToolHandler } from './bridge.js';
 import { logger } from '../../utils/logger.js';
-import { setMcpReconnectConsecutiveFailures } from '../../metrics/registry.js';
+import { setMcpReconnectConsecutiveFailures, recordMcpReconnectFailure, recordMcpReconnectSuccess, type McpReconnectReasonClass } from '../../metrics/registry.js';
 
 function positiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -96,6 +96,23 @@ export function filterMCPConfigsByEnv(configs: MCPServerConfig[], raw = process.
   return configs.filter((config) => allowed.has(config.name));
 }
 
+/**
+ * PLAT-8689 (framework leg 1): classify a reconnect-failure message into the
+ * closed reason_class union exported by the metrics registry. Pattern-matched
+ * on the SAME message shapes the existing routeMissing check uses — never on
+ * untrusted text passed through to the metric label.
+ */
+export function classifyMcpReconnectError(msg: string): McpReconnectReasonClass {
+  const m = msg.toLowerCase();
+  if (/\b40[13]\b/.test(m) || /unauthorized|forbidden|invalid token|auth/i.test(msg)) return 'auth';
+  if (/\b(405|501)\b/.test(m) || /not allowed/i.test(m)) return 'route_missing';
+  if (/\b5\d\d\b/.test(m) || /internal server error|bad gateway|service unavailable/i.test(msg)) return 'http_5xx';
+  if (/timeout|timed out|etimedout|deadline/.test(m)) return 'timeout';
+  if (/econnreset|econnrefused|socket hang up|closed|terminated|aborted|fetch failed|network|not connected/.test(m)) return 'conn_reset';
+  if (/eai_again|enotfound|dns/.test(m)) return 'dns';
+  return 'other';
+}
+
 export class MCPManager {
   private connections = new Map<string, MCPConnection>();
   private toolRegistry: ToolRegistry | null = null;
@@ -121,6 +138,8 @@ export class MCPManager {
   private readonly nextRetryAt = new Map<string, number>();
   /** Per-server consecutive reconnect-failure count (drives backoff). */
   private readonly reconnectFailures = new Map<string, number>();
+  /** User-disabled servers (/mcp toggle) — do not connect or health-redial. */
+  private readonly userDisabled = new Set<string>();
   /** Set by disconnectAll() — bails in-flight reconnects/probes so a redial scheduled by a
    *  transport onclose can't resurrect a connection after teardown (PLAT-427 review P2: shutdown race). */
   private disposed = false;
@@ -132,6 +151,7 @@ export class MCPManager {
     for (const config of configs) this.configs.set(config.name, config);
     logger.info({ total: configs.length, concurrency: CONNECT_CONCURRENCY, timeoutMs: CONNECT_TIMEOUT_MS }, 'MCP startup connect plan');
     await runBounded(prioritizeConfigs(configs), CONNECT_CONCURRENCY, async (config) => {
+      if (this.userDisabled.has(config.name)) return;
       try {
         const conn = await this.connectServer(config.name, config);
         this.wireTransportHandlers(config.name, conn);
@@ -186,6 +206,7 @@ export class MCPManager {
     if (this.disposed) return;
     const now = Date.now();
     await Promise.all([...this.configs.keys()].map(async (name) => {
+      if (this.userDisabled.has(name)) return;
       if (this.reconnecting.has(name)) return;
       const conn = this.connections.get(name);
       if (conn) {
@@ -232,6 +253,7 @@ export class MCPManager {
    */
   private async healthReconnectServer(name: string): Promise<void> {
     if (this.disposed) return;
+    if (this.userDisabled.has(name)) return;
     if (this.reconnecting.has(name)) return;
     // PLAT-427 review (blocker): the backoff/cooldown gate applies to EVERY caller — including
     // the transport onclose path — so a flapping/crashlooping server can't tight-loop reconnects
@@ -271,6 +293,7 @@ export class MCPManager {
       // regardless of how long the redial took.
       this.reconnectFailures.delete(name);
       setMcpReconnectConsecutiveFailures(name, 0);
+      recordMcpReconnectSuccess(name);
       this.nextRetryAt.set(name, Date.now() + RECONNECT_BACKOFF_BASE_MS);
       const idx = this.failedServers.findIndex((f) => f.name === name);
       if (idx >= 0) (this.failedServers as Array<{ name: string; error: string }>).splice(idx, 1);
@@ -285,6 +308,7 @@ export class MCPManager {
       const fails = (this.reconnectFailures.get(name) ?? 0) + 1;
       this.reconnectFailures.set(name, fails);
       setMcpReconnectConsecutiveFailures(name, fails);
+      recordMcpReconnectFailure(name, classifyMcpReconnectError(msg));
       // Route-level permanent rejections (endpoint not deployed / no nginx
       // route): 405/501 or nginx's "Not Allowed" page. Backoff-retrying these
       // every few minutes forever just burns cycles and floods error logs —
@@ -405,11 +429,13 @@ export class MCPManager {
       logger.info({ server: serverName, tools: next.tools.length }, 'MCP reconnected');
       this.reconnectFailures.delete(serverName);
       setMcpReconnectConsecutiveFailures(serverName, 0);
+      recordMcpReconnectSuccess(serverName);
       return next;
     } catch (err) {
       const fails = (this.reconnectFailures.get(serverName) ?? 0) + 1;
       this.reconnectFailures.set(serverName, fails);
       setMcpReconnectConsecutiveFailures(serverName, fails);
+      recordMcpReconnectFailure(serverName, classifyMcpReconnectError(err instanceof Error ? err.message : String(err)));
       logger.warn({ server: serverName, err }, 'MCP reconnect failed');
       return undefined;
     }
@@ -601,6 +627,69 @@ export class MCPManager {
     if (!conn.capabilities?.resources && this.toolRegistry.unregister(resourceTool)) removed++;
     if (removed) logger.info({ server: serverName, removed, tools: conn.tools.length }, 'MCP registry reconciled after reconnect');
     this.onToolsRefreshed?.();
+  }
+
+  /** Names the user turned off in /mcp — skipped at connect and health-redial. */
+  applyDisabledServers(names: Iterable<string>): void {
+    this.userDisabled.clear();
+    for (const name of names) {
+      const key = String(name || '').trim();
+      if (key) this.userDisabled.add(key);
+    }
+  }
+
+  listServers(): Array<{
+    name: string;
+    disabled: boolean;
+    connected: boolean;
+    tools: number;
+    error?: string;
+  }> {
+    const names = new Set([...this.configs.keys(), ...this.connections.keys(), ...this.userDisabled]);
+    return [...names].sort().map((name) => {
+      const conn = this.connections.get(name);
+      const failed = this.failedServers.find((row) => row.name === name);
+      return {
+        name,
+        disabled: this.userDisabled.has(name),
+        connected: Boolean(conn),
+        tools: conn?.tools.length ?? 0,
+        error: failed?.error,
+      };
+    });
+  }
+
+  async setServerEnabled(name: string, enabled: boolean): Promise<{ ok: boolean; message: string }> {
+    const key = name.trim();
+    if (!key) return { ok: false, message: 'MCP server name required' };
+    if (enabled) {
+      this.userDisabled.delete(key);
+      if (this.connections.has(key)) {
+        return { ok: true, message: `${key} already connected` };
+      }
+      const config = this.configs.get(key);
+      if (!config) return { ok: false, message: `Unknown MCP server: ${key}` };
+      try {
+        const conn = await this.connectServer(key, config);
+        this.wireTransportHandlers(key, conn);
+        this.connections.set(key, conn);
+        if (this.toolRegistry) {
+          for (const tool of conn.tools) {
+            this.toolRegistry.upsert(createMCPToolHandler(tool, this));
+          }
+        }
+        this.onToolsRefreshed?.();
+        return { ok: true, message: `${key} enabled` };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, message: `${key} failed to connect: ${msg.slice(0, 160)}` };
+      }
+    }
+    this.userDisabled.add(key);
+    if (this.connections.has(key)) {
+      this.evictServer(key, 'user disabled');
+    }
+    return { ok: true, message: `${key} disabled (persisted)` };
   }
 
   /** Disconnect all */

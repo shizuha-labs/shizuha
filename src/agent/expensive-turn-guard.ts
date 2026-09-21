@@ -15,6 +15,15 @@
  * work even with tiny prose output. Input >> completion is normal (tool results
  * re-enter as prompt). Do not pause for that shape — only for high-prefill
  * *sterile* turns (no tools + negligible text), i.e. empty feed/spin loops.
+ *
+ * SCLI-589 (2026-08): the saki class — many tool calls that each pull large
+ * context (web fetches, file reads, scan tables) with tiny final text — was
+ * invisible to the guard because toolCallCount>0 always meant "productive".
+ * Now a high-prefill tool-calling turn is ALSO counted as sterile when the
+ * whole window produced no durable output (total output <
+ * minProductiveOutputTokens). A single substantive turn breaks the spin, so
+ * genuinely-productive tool agents are never force-paused. Gate:
+ * SHIZUHA_EXPENSIVE_TURN_FLAG_TOOL_STERILE=0 restores the old behavior.
  */
 
 export interface ExpensiveTurnGuardConfig {
@@ -35,6 +44,15 @@ export interface ExpensiveTurnGuardConfig {
    * count as barren when paired with huge prefills.
    */
   minProductiveOutputTokens: number;
+  /**
+   * SCLI-589: when true, high-prefill turns that only issue tool calls (tiny
+   * text) are ALSO counted as sterile when the whole window produced no durable
+   * output (total output < minProductiveOutputTokens). A single substantive
+   * turn breaks the spin. Defaults to true; set
+   * SHIZUHA_EXPENSIVE_TURN_FLAG_TOOL_STERILE=0 to restore the old
+   * tool-calls-are-always-productive behavior.
+   */
+  flagToolCallingSterileTurns: boolean;
   baseBackoffMs: number;
   maxBackoffMs: number;
   notifyCooldownMs: number;
@@ -97,6 +115,7 @@ const DEFAULT_CONFIG: ExpensiveTurnGuardConfig = {
   minPromptTokens: 100_000,
   minPromptOutputRatio: 100,
   minProductiveOutputTokens: 32,
+  flagToolCallingSterileTurns: true,
   baseBackoffMs: 5 * 60_000,
   maxBackoffMs: 15 * 60_000,
   notifyCooldownMs: 15 * 60_000,
@@ -115,7 +134,12 @@ function nonNegativeInt(raw: string | undefined, fallback: number): number {
 
 export function expensiveTurnGuardConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ExpensiveTurnGuardConfig {
   return {
-    enabled: env['SHIZUHA_EXPENSIVE_TURN_GUARD_DISABLED'] !== '1',
+    // Operator directive 2026-09-15: agents must be allowed to use the model
+    // continuously — the force-pause parked lease holders for 3-10 min while
+    // other agents waited for slots. The guard is now OPT-IN
+    // (SHIZUHA_EXPENSIVE_TURN_GUARD_ENABLED=1) and exists only as the
+    // break-glass for a runaway high-prefill feed loop.
+    enabled: env['SHIZUHA_EXPENSIVE_TURN_GUARD_ENABLED'] === '1',
     windowMs: positiveInt(env['SHIZUHA_EXPENSIVE_TURN_WINDOW_MS'], DEFAULT_CONFIG.windowMs),
     minTurns: positiveInt(env['SHIZUHA_EXPENSIVE_TURN_MIN_TURNS'], DEFAULT_CONFIG.minTurns),
     minPromptTokens: positiveInt(env['SHIZUHA_EXPENSIVE_TURN_PROMPT_TOKENS'], DEFAULT_CONFIG.minPromptTokens),
@@ -124,6 +148,7 @@ export function expensiveTurnGuardConfigFromEnv(env: NodeJS.ProcessEnv = process
       env['SHIZUHA_EXPENSIVE_TURN_MIN_PRODUCTIVE_OUTPUT_TOKENS'],
       DEFAULT_CONFIG.minProductiveOutputTokens,
     ),
+    flagToolCallingSterileTurns: env['SHIZUHA_EXPENSIVE_TURN_FLAG_TOOL_STERILE'] !== '0',
     baseBackoffMs: positiveInt(env['SHIZUHA_EXPENSIVE_TURN_BACKOFF_MS'], DEFAULT_CONFIG.baseBackoffMs),
     maxBackoffMs: positiveInt(env['SHIZUHA_EXPENSIVE_TURN_MAX_BACKOFF_MS'], DEFAULT_CONFIG.maxBackoffMs),
     notifyCooldownMs: positiveInt(env['SHIZUHA_EXPENSIVE_TURN_NOTIFY_COOLDOWN_MS'], DEFAULT_CONFIG.notifyCooldownMs),
@@ -132,8 +157,11 @@ export function expensiveTurnGuardConfigFromEnv(env: NodeJS.ProcessEnv = process
 }
 
 /**
- * A turn is productive (not a spin) if it issued any tool call, or produced
- * non-trivial text. Tool-only turns with tiny prose are normal agent work.
+ * A turn is productive (not a spin) if it produced non-trivial text. Tool calls
+ * alone no longer imply productivity: the guard's window-aware
+ * isSterileExpensive() additionally flags tool-calling turns with tiny text
+ * when the whole window produced no durable output (SCLI-589). This helper
+ * remains the no-tools/tiny-text predicate and is exported for diagnostics.
  */
 export function isSterileTurn(
   sample: Pick<ExpensiveTurnSample, 'outputTokens' | 'toolCallCount'>,
@@ -193,11 +221,21 @@ export function estimatePrefillTokens(
   if (sample.prefixCacheBusted) {
     prefill = Math.max(prefill, input);
   }
+  // Slow TTFT is not a cache miss when the provider already proved a hot
+  // prefix. Queueing behind another 250k session on the same TP4 group
+  // (DeepSeek kai/sato 2026-08-22: 37s TTFT, 99.6% cache read) used to
+  // charge the full prompt and look like a cold rebuild.
+  const cacheProven = readRaw != null && Number.isFinite(readRaw)
+    && (
+      (input >= Math.floor(readRaw) && (input - Math.floor(readRaw)) < input * 0.05)
+      || (input < Math.floor(readRaw) && Math.floor(readRaw) > 0)
+    );
   if (
     sample.ttftMs != null
     && Number.isFinite(sample.ttftMs)
     && sample.ttftMs >= config.coldTtftMs
     && input >= config.minPromptTokens
+    && !cacheProven
   ) {
     prefill = Math.max(prefill, input);
   }
@@ -321,11 +359,27 @@ export class ExpensiveTurnGuard {
   }
 
   /** High prefill + no tools + negligible text — the only shape we force-pause. */
-  private isSterileExpensive(sample: StoredSample): boolean {
+  private isSterileExpensive(sample: StoredSample, windowTotalOutput: number): boolean {
     const minOut = this.config.minProductiveOutputTokens
       ?? DEFAULT_CONFIG.minProductiveOutputTokens;
-    return this.isHighPrefill(sample.prefillTokens)
-      && isSterileTurn(sample, minOut);
+    if (!this.isHighPrefill(sample.prefillTokens)) return false;
+    const output = Math.max(0, sample.outputTokens || 0);
+    if (output >= minOut) return false; // substantive text = productive
+    const tools = Math.max(0, Math.floor(sample.toolCallCount ?? 0));
+    if (tools === 0) return true; // no tools + tiny text (existing behavior)
+    // SCLI-589: tool-calling turns with tiny text are sterile when the whole
+    // window produced no durable output (total output below the productive
+    // floor). A single substantive turn breaks the spin. Gated by the
+    // flagToolCallingSterileTurns knob (default on) for operator override.
+    if (!this.config.flagToolCallingSterileTurns) return false;
+    return windowTotalOutput < minOut;
+  }
+
+  /** Sum of output tokens across high-prefill samples still inside the window. */
+  private windowTotalOutput(now: number): number {
+    return this.samples
+      .filter((s) => now - s.now <= this.config.windowMs && this.isHighPrefill(s.prefillTokens))
+      .reduce((sum, s) => sum + Math.max(0, s.outputTokens || 0), 0);
   }
 
   /**
@@ -341,8 +395,9 @@ export class ExpensiveTurnGuard {
    */
   expensiveSamplesInWindow(now = Date.now()): number {
     if (!this.config.enabled) return 0;
+    const totalOutput = this.windowTotalOutput(now);
     return this.samples.filter(
-      (s) => now - s.now <= this.config.windowMs && this.isSterileExpensive(s),
+      (s) => now - s.now <= this.config.windowMs && this.isSterileExpensive(s, totalOutput),
     ).length;
   }
 
@@ -354,8 +409,9 @@ export class ExpensiveTurnGuard {
    */
   msUntilExpensiveSampleExpiry(now = Date.now()): number {
     if (!this.config.enabled) return 0;
+    const totalOutput = this.windowTotalOutput(now);
     const inWindow = this.samples.filter(
-      (s) => now - s.now <= this.config.windowMs && this.isSterileExpensive(s),
+      (s) => now - s.now <= this.config.windowMs && this.isSterileExpensive(s, totalOutput),
     );
     if (inWindow.length === 0) return 0;
     const oldest = Math.min(...inWindow.map((s) => s.now));
@@ -372,12 +428,15 @@ export class ExpensiveTurnGuard {
     const stored: StoredSample = { ...sample, prefillTokens };
 
     this.samples.push(stored);
-    if (this.isSterileExpensive(stored)) this.totalExpensiveSamples += 1;
+    const windowTotalOutput = this.windowTotalOutput(now);
+    if (this.isSterileExpensive(stored, windowTotalOutput)) this.totalExpensiveSamples += 1;
     this.samples = this.samples.filter((s) => now - s.now <= this.config.windowMs);
 
-    // Only sterile high-prefill turns count. Tool-calling agents with fat
-    // contexts (tool results re-fed as input) must not be force-paused.
-    const expensive = this.samples.filter((s) => this.isSterileExpensive(s));
+    // Sterile high-prefill turns count: no-tools + tiny text always; tool-calling
+    // turns only when the whole window produced no durable output (SCLI-589).
+    // Tool-calling agents with fat contexts (tool results re-fed as input) that
+    // DO produce output must not be force-paused.
+    const expensive = this.samples.filter((s) => this.isSterileExpensive(s, windowTotalOutput));
     if (expensive.length < this.config.minTurns) return { action: 'ok' };
 
     const inputTokens = expensive.reduce((sum, s) => sum + Math.max(0, s.inputTokens), 0);

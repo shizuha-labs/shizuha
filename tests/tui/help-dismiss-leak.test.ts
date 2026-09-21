@@ -1,35 +1,60 @@
 /**
- * SCLI-383: help dismiss must not leak printables into the composer.
+ * SCLI-548: help dismiss must consume the exact stdin broadcast.
+ *
+ * Production order: overlay receives `q` and dismisses, React activates the
+ * composer, then the same Ink EventEmitter broadcast reaches composer input
+ * subscribers. The following `/` begins a new broadcast and must be accepted.
  */
-import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { beforeEach, describe, expect, it } from 'vitest';
+import {
+  beginInputDispatch,
+  consumeInputDispatch,
+  createInputDispatchState,
+  inputDispatchWasConsumed,
+  type InputDispatchState,
+} from '../../src/tui/renderer/inputDispatch.js';
 
-const repoRoot = resolve(__dirname, '../..');
+describe('SCLI-548 help dismiss input isolation', () => {
+  let dispatch: InputDispatchState;
 
-function read(path: string): string {
-  return readFileSync(resolve(repoRoot, path), 'utf8');
-}
-
-describe('SCLI-383 help dismiss key isolation', () => {
-  it('HelpOverlay documents Esc/q and dismisses on those keys', () => {
-    const src = read('src/tui/components/HelpOverlay.tsx');
-    expect(src).toMatch(/Esc or q closes/);
-    expect(src).not.toMatch(/any key closes/);
-    expect(src).toMatch(/key\.escape/);
-    expect(src).toMatch(/input === 'q'/);
+  beforeEach(() => {
+    dispatch = createInputDispatchState();
   });
 
-  it('App arms composer suppress on help and pager dismiss', () => {
-    const src = read('src/tui/App.tsx');
-    expect(src).toContain('armComposerKeySuppress');
-    expect(src).toContain('composerKeySuppressed');
-    expect(src).toMatch(/HelpOverlay onDismiss[\s\S]*armComposerKeySuppress/);
-    expect(src).toMatch(/isLocked=\{!!pendingApproval \|\| composerKeySuppressed\}/);
+  it('does not suppress before any stdin dispatch', () => {
+    expect(inputDispatchWasConsumed(dispatch)).toBe(false);
   });
 
-  it('/help all opens the pager instead of dumping into an active draft surface', () => {
-    const src = read('src/tui/hooks/useSlashCommands.ts');
-    expect(src).toMatch(/case '\/help':[\s\S]*showInPager\(HELP_FULL_TEXT\)/);
+  it('rejects the rest of the broadcast that dismissed help', () => {
+    beginInputDispatch(dispatch);
+    expect(inputDispatchWasConsumed(dispatch)).toBe(false);
+
+    consumeInputDispatch(dispatch);
+
+    // InputBox and MultiLineInput run later in this same EventEmitter emit.
+    beginInputDispatch(dispatch);
+    expect(inputDispatchWasConsumed(dispatch)).toBe(true);
+    expect(inputDispatchWasConsumed(dispatch)).toBe(true);
+  });
+
+  it('accepts the first key of the next slash command immediately', async () => {
+    beginInputDispatch(dispatch);
+    consumeInputDispatch(dispatch);
+    expect(inputDispatchWasConsumed(dispatch)).toBe(true);
+
+    // No timer: the next stdin chunk is a distinct broadcast and is accepted.
+    await Promise.resolve();
+    beginInputDispatch(dispatch);
+    expect(inputDispatchWasConsumed(dispatch)).toBe(false);
+  });
+
+  it('keeps Escape control on the same consumption boundary', async () => {
+    beginInputDispatch(dispatch);
+    consumeInputDispatch(dispatch);
+    expect(inputDispatchWasConsumed(dispatch)).toBe(true);
+
+    await Promise.resolve();
+    beginInputDispatch(dispatch);
+    expect(inputDispatchWasConsumed(dispatch)).toBe(false);
   });
 });

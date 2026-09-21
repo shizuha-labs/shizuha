@@ -51,6 +51,28 @@ function runResume(home: string, sessionId: string, mode: string) {
   });
 }
 
+// SCLI-523: resume with extra --cwd/--mode overrides. mode === null means omit
+// the flag entirely; cwd === null means omit --cwd.
+function runResumeOverrides(home: string, sessionId: string, opts: { mode?: string | null; cwd?: string | null }) {
+  const args = ['resume', sessionId];
+  if (opts.mode !== null && opts.mode !== undefined) {
+    args.push('--mode', opts.mode);
+  }
+  if (opts.cwd !== null && opts.cwd !== undefined) {
+    args.push('--cwd', opts.cwd);
+  }
+  return spawnSync('node', [CLI, ...args], {
+    cwd: ROOT,
+    env: { ...process.env, HOME: home, FORCE_COLOR: '0' },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+}
+
+function stateDbPath(home: string): string {
+  return path.join(home, '.config', 'shizuha', 'state.db');
+}
+
 describe('resume --mode preflight (SCLI-178 / PLAT-5893)', () => {
   beforeAll(() => {
     if (!fs.existsSync(CLI)) {
@@ -101,6 +123,104 @@ describe('resume --mode preflight (SCLI-178 / PLAT-5893)', () => {
       const r = runResume(home, 'no-such-session', 'plan');
       expect(r.stdout + r.stderr).not.toMatch(/Invalid --mode/);
       expect(r.stdout + r.stderr).toMatch(/Session not found/);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+// SCLI-523: `shizuha resume` must (1) adjudicate --cwd at the public boundary
+// before session lookup (empty/whitespace/non-directory rejected pre-init) and
+// (2) keep a failed read-only session lookup state-free — a syntactically valid
+// but unknown session id (or an invalid override path) must NOT create
+// ~/.config/shizuha/state.db in a fresh HOME.
+describe('resume --cwd preflight + state-free lookup (SCLI-523)', () => {
+  beforeAll(() => {
+    if (!fs.existsSync(CLI)) {
+      throw new Error(
+        `node bundle missing at ${CLI}; run 'npm run build:node' (CI does this before the suite)`,
+      );
+    }
+  });
+
+  it('rejects empty --cwd before session lookup, state-free', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'scli523-cwd-empty-'));
+    try {
+      const r = runResumeOverrides(home, '00000000-0000-0000-0000-000000000000', { cwd: '' });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('--cwd must be an existing directory');
+      expect(r.stderr).toContain('empty or whitespace-only');
+      expect(r.stderr).not.toMatch(/Session not found|at |node:internal|\/dist\/|TypeError|ERR_/i);
+      expect(fs.existsSync(stateDbPath(home))).toBe(false);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects whitespace-only --cwd before session lookup, state-free', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'scli523-cwd-ws-'));
+    try {
+      const r = runResumeOverrides(home, '00000000-0000-0000-0000-000000000000', { cwd: '   ' });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('--cwd must be an existing directory');
+      expect(r.stderr).toContain('empty or whitespace-only');
+      expect(r.stderr).not.toMatch(/Session not found|at |node:internal|\/dist\/|TypeError|ERR_/i);
+      expect(fs.existsSync(stateDbPath(home))).toBe(false);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects non-directory --cwd before session lookup, state-free', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'scli523-cwd-nd-'));
+    try {
+      const r = runResumeOverrides(home, '00000000-0000-0000-0000-000000000000', { cwd: '/no/such/dir/xyz' });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('--cwd must be an existing directory');
+      expect(r.stderr).toContain('path does not resolve');
+      expect(r.stderr).not.toMatch(/Session not found|at |node:internal|\/dist\/|TypeError|ERR_/i);
+      expect(fs.existsSync(stateDbPath(home))).toBe(false);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects invalid --mode before session lookup, state-free', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'scli523-mode-'));
+    try {
+      const r = runResumeOverrides(home, '00000000-0000-0000-0000-000000000000', { mode: 'synthetic-invalid' });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('Invalid --mode');
+      expect(r.stderr).not.toMatch(/Session not found|at |node:internal|\/dist\/|TypeError|ERR_/i);
+      expect(fs.existsSync(stateDbPath(home))).toBe(false);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a syntactically valid unknown-session lookup state-free', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'scli523-unknown-'));
+    try {
+      const r = runResumeOverrides(home, '00000000-0000-0000-0000-000000000000', {});
+      expect(r.status).toBe(1);
+      expect(r.stdout + r.stderr).toMatch(/Session not found/);
+      expect(r.stdout + r.stderr).not.toMatch(/at |node:internal|\/dist\/|TypeError|ERR_/i);
+      expect(fs.existsSync(stateDbPath(home))).toBe(false);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a valid --cwd on a real session: preflight passes and lookup proceeds', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'scli523-cwd-ok-'));
+    try {
+      const sessionId = seedSession(home);
+      const r = runResumeOverrides(home, sessionId, { cwd: '/tmp' });
+      // Valid --cwd must not be rejected by preflight; the resume body runs and
+      // (in a non-TTY spawn) reports the Ink raw-mode limitation rather than an
+      // option diagnostic. Crucially it must NOT say "Invalid --cwd".
+      expect(r.stdout + r.stderr).not.toMatch(/Invalid --cwd/);
+      expect(r.stdout + r.stderr).not.toMatch(/Invalid --mode/);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }

@@ -21,12 +21,17 @@ function sse(payload: unknown): string {
 async function captureChat(
   messages: ChatMessage[],
   extra?: Record<string, unknown>,
+  model: string = 'DeepSeek-V4-Flash',
 ): Promise<Record<string, unknown>> {
   let body = '';
   const server = http.createServer((req, res) => {
     if (req.url === '/v1/models') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ data: [{ id: 'DeepSeek-V4-Flash', max_model_len: 262144 }] }));
+      res.end(JSON.stringify({ data: [
+        { id: 'DeepSeek-V4-Flash', max_model_len: 262144 },
+        { id: 'DeepSeek-V3', max_model_len: 131072 },
+        { id: 'glm-5.2', max_model_len: 262144 },
+      ] }));
       return;
     }
     if (req.url === '/v1/chat/completions') {
@@ -36,7 +41,7 @@ async function captureChat(
         body = Buffer.concat(parts).toString('utf8');
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         res.write(sse({
-          id: 'c1', object: 'chat.completion.chunk', created: 0, model: 'DeepSeek-V4-Flash',
+          id: 'c1', object: 'chat.completion.chunk', created: 0, model,
           choices: [{ index: 0, delta: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
         }));
         res.write('data: [DONE]\n\n');
@@ -51,7 +56,7 @@ async function captureChat(
     const { port } = server.address() as AddressInfo;
     const provider = new VLlmProvider(`http://127.0.0.1:${port}`, 262144);
     await collect(provider.chat(messages, {
-      model: 'DeepSeek-V4-Flash',
+      model,
       maxTokens: 16,
       thinkingLevel: 'on',
       ...extra,
@@ -125,5 +130,114 @@ describe('SCLI-584 DeepSeek reasoning passback', () => {
     expect(prior?.tool_calls).toEqual([
       { id: 'c1', type: 'function', function: { name: 'read', arguments: '{"path":"a.ts"}' } },
     ]);
+  });
+});
+
+// ── SCLI-696 (re-land of SCLI-584, beta#276 reference pins) ──────────────
+import { toVLlmMessages } from '../../src/provider/vllm.js';
+import type { ModelProfile } from '../../src/provider/model-profile.js';
+
+function betaToolTurn(): ChatMessage {
+  return {
+    role: 'assistant',
+    content: [
+      { type: 'reasoning', rawContent: 'Let me think about this carefully.' },
+      { type: 'text', text: 'I will call the tool.' },
+      { type: 'tool_use', id: 'toolu_1', name: 'bash', input: { command: 'ls' } },
+    ],
+  } as ChatMessage;
+}
+
+function betaPlainTurn(): ChatMessage {
+  return {
+    role: 'assistant',
+    content: [
+      { type: 'reasoning', rawContent: 'Hidden chain of thought.' },
+      { type: 'text', text: 'Here is the answer.' },
+    ],
+  } as ChatMessage;
+}
+
+function betaToolOnlyTurn(): ChatMessage {
+  return {
+    role: 'assistant',
+    content: [
+      { type: 'reasoning', rawContent: 'Reasoning before the call.' },
+      { type: 'tool_use', id: 'toolu_2', name: 'bash', input: { command: 'pwd' } },
+    ],
+  } as ChatMessage;
+}
+
+describe('SCLI-584 toVLlmMessages passback pins (beta#276 re-land)', () => {
+  it('keeps reasoning_content on a tool-call turn', () => {
+    const out = toVLlmMessages([betaToolTurn()]);
+    const assistant = out[0] as { reasoning_content?: string; tool_calls?: unknown[] };
+    expect(assistant.reasoning_content).toBe('Let me think about this carefully.');
+    expect(assistant.tool_calls).toHaveLength(1);
+  });
+
+  it('drops reasoning_content on a plain turn (no tool_calls)', () => {
+    const out = toVLlmMessages([betaPlainTurn()], undefined, {
+      reasoningPassback: 'tool-call-turns',
+    } as ModelProfile);
+    const assistant = out[0] as { reasoning_content?: string };
+    expect(assistant.reasoning_content).toBeUndefined();
+    expect(out[0].content).toBe('Here is the answer.');
+  });
+
+  it('keeps reasoning on a tool-only turn and content is "" (never null)', () => {
+    const out = toVLlmMessages([betaToolOnlyTurn()]);
+    const assistant = out[0] as { reasoning_content?: string; tool_calls?: unknown[]; content: unknown };
+    expect(assistant.reasoning_content).toBe('Reasoning before the call.');
+    expect(assistant.tool_calls).toHaveLength(1);
+    expect(assistant.content).toBe('');
+    expect(assistant.content).not.toBeNull();
+  });
+
+  it('does not attach reasoning_content when there is no reasoning block', () => {
+    const out = toVLlmMessages([{ role: 'assistant', content: [{ type: 'text', text: 'plain' }] }] as ChatMessage[]);
+    expect((out[0] as { reasoning_content?: string }).reasoning_content).toBeUndefined();
+  });
+
+  it('keeps user/system/tool message shapes unchanged', () => {
+    const out = toVLlmMessages([
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: [{ type: 'tool_result', toolUseId: 'toolu_1', content: 'ok' }] },
+    ] as ChatMessage[]);
+    expect(out[0]).toEqual({ role: 'user', content: 'hello' });
+    expect(out[1].role).toBe('assistant');
+  });
+});
+
+describe('SCLI-696 top-level DeepSeek wire pins (request body)', () => {
+  it('DeepSeek request carries top-level thinking:enabled + profile-default effort high', async () => {
+    const body = await captureChat([{ role: 'user', content: 'hi' }]);
+    expect(body['thinking']).toEqual({ type: 'enabled' });
+    expect(body['reasoning_effort']).toBe('high');
+  });
+
+  it('reasoning_effort max passes through unmapped', async () => {
+    const body = await captureChat([{ role: 'user', content: 'hi' }], { reasoningEffort: 'max' });
+    expect(body['thinking']).toEqual({ type: 'enabled' });
+    expect(body['reasoning_effort']).toBe('max');
+  });
+
+  it('low/medium effort maps up to high (DeepSeek only knows high|max)', async () => {
+    const low = await captureChat([{ role: 'user', content: 'hi' }], { reasoningEffort: 'low' });
+    expect(low['reasoning_effort']).toBe('high');
+    const medium = await captureChat([{ role: 'user', content: 'hi' }], { reasoningEffort: 'medium' });
+    expect(medium['reasoning_effort']).toBe('high');
+  });
+
+  it('non-thinking DeepSeek still declares thinking:disabled with no effort', async () => {
+    const body = await captureChat([{ role: 'user', content: 'hi' }], { thinkingLevel: 'off' }, 'DeepSeek-V3');
+    expect(body['thinking']).toEqual({ type: 'disabled' });
+    expect(body['reasoning_effort']).toBeUndefined();
+  });
+
+  it('non-DeepSeek models get NO top-level thinking/reasoning_effort (08-14 garble scope)', async () => {
+    const body = await captureChat([{ role: 'user', content: 'hi' }], { thinkingLevel: 'on' }, 'glm-5.2');
+    expect(body).not.toHaveProperty('thinking');
+    expect(body).not.toHaveProperty('reasoning_effort');
   });
 });

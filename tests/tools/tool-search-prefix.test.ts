@@ -30,8 +30,25 @@ describe('ToolSearch provider-prefix contract', () => {
     expect(after.map((tool) => tool.name)).toEqual(['bash', 'ToolSearch']);
     expect(modelSupportsAppendOnlyToolActivation('cortex/DeepSeek-V4-Flash')).toBe(true);
     expect(modelSupportsAppendOnlyToolActivation('DeepSeek-V4-Flash')).toBe(true);
+    expect(modelSupportsAppendOnlyToolActivation('GLM-5.3-Flash')).toBe(true);
+    expect(modelSupportsAppendOnlyToolActivation('cortex/GLM-5.3-Flash')).toBe(true);
+    expect(modelSupportsAppendOnlyToolActivation('GLM-4.7')).toBe(true);
     expect(modelSupportsAppendOnlyToolActivation('cortex/auto')).toBe(false);
-    expect(modelSupportsAppendOnlyToolActivation('GLM-4.7')).toBe(false);
+    expect(modelSupportsAppendOnlyToolActivation('claude-sonnet-4-5')).toBe(false);
+    expect(modelSupportsAppendOnlyToolActivation('xai/grok-4.6')).toBe(false);
+  });
+
+  it('keeps the declared tool head fixed for GLM-5.3-Flash after ToolSearch discovery', () => {
+    const state = new ToolSearchState();
+    const before = buildDeferredToolDefinitions(
+      defs, state, modelSupportsAppendOnlyToolActivation('GLM-5.3-Flash'),
+    );
+    state.markDiscovered(['mcp__wiki__z_tool', 'mcp__wiki__a_tool']);
+    const after = buildDeferredToolDefinitions(
+      defs, state, modelSupportsAppendOnlyToolActivation('GLM-5.3-Flash'),
+    );
+    expect(after).toEqual(before);
+    expect(after.map((tool) => tool.name)).toEqual(['bash', 'ToolSearch']);
   });
 
   it('appends hosted-provider compatibility schemas in first-discovery order', () => {

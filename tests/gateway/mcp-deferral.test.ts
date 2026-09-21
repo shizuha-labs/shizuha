@@ -160,4 +160,25 @@ describe('gateway deferred MCP activation', () => {
     expect(activation.added).toEqual([taskTool.name]);
     expect(activation.availableAppendOnly).toEqual([]);
   });
+
+  it('keeps the GLM-5.3-Flash tool head stable when ToolSearch-discovered MCP tools are mentioned', () => {
+    const stableHead = [
+      { name: 'bash', description: 'run', inputSchema: { type: 'object' } },
+      { name: 'ToolSearch', description: 'search', inputSchema: { type: 'object' } },
+    ];
+    const wikiTool = {
+      name: 'mcp__shizuha-wiki__wiki_get_page',
+      description: 'get page',
+      inputSchema: { type: 'object' },
+    };
+    const activation = activateExplicitlyMentionedMcpToolsForModel(
+      stableHead,
+      [...stableHead, wikiTool],
+      [wikiTool.name],
+      'GLM-5.3-Flash',
+    );
+    expect(activation.toolDefs).toBe(stableHead);
+    expect(activation.added).toEqual([]);
+    expect(activation.availableAppendOnly).toEqual([wikiTool]);
+  });
 });

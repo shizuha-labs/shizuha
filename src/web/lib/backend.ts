@@ -15,9 +15,14 @@
 
 const STORAGE_KEY = 'shizuha_backend_url';
 
+function isTauriShell(): boolean {
+  return typeof window !== 'undefined' && Boolean((window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+}
+
 /** Default = whatever origin the dashboard was served from. */
 export function defaultBackendUrl(): string {
   if (typeof window === 'undefined') return '';
+  if (isTauriShell()) return 'http://127.0.0.1:8016';
   return window.location.origin;
 }
 

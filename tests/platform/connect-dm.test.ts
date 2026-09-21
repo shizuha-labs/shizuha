@@ -48,7 +48,7 @@ describe('Connect DM client message IDs', () => {
         ok: true,
         status: 201,
         headers: { get: () => null },
-        text: async () => JSON.stringify({ id: 'm2', content: 'pong' }),
+        text: async () => JSON.stringify({ id: 'm2', content: 'looking at AT-91 now' }),
       };
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -56,7 +56,7 @@ describe('Connect DM client message IDs', () => {
     const result = await sendConnectDm({
       conversationId: 'conv-abc',
       recipientEmail: 'hothritik1@gmail.com',
-      content: 'pong',
+      content: 'looking at AT-91 now',
       platformUrl: 'https://connect.example.test',
       token: 'test-token',
     });
@@ -65,9 +65,26 @@ describe('Connect DM client message IDs', () => {
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
     const body = JSON.parse(String(request.body));
     expect(body).toEqual({
-      content: 'pong',
+      content: 'looking at AT-91 now',
       client_message_id: expect.any(String),
     });
     expect(body.recipient_email).toBeUndefined();
+  });
+});
+
+describe('isAckOnlyMessage', () => {
+  it('rejects the forged voice-prompt pong token and keeps real replies', async () => {
+    const { isAckOnlyMessage } = await import('../../src/tools/builtin/message-user.js');
+    expect(isAckOnlyMessage('pong')).toBe(true);
+    expect(isAckOnlyMessage('Pong.')).toBe(true);
+    expect(isAckOnlyMessage('pong sent')).toBe(true);
+    expect(isAckOnlyMessage('Replied.')).toBe(true);
+    expect(isAckOnlyMessage('Test message')).toBe(true);
+    expect(isAckOnlyMessage('Test message — please confirm you can see this.')).toBe(true);
+    expect(isAckOnlyMessage("I'm stuck in a loop. Let me break out of it.")).toBe(true);
+    expect(isAckOnlyMessage("I'm here — what would you like me to do?")).toBe(true);
+    expect(isAckOnlyMessage('CON-98 pong')).toBe(false);
+    expect(isAckOnlyMessage('looking at AT-91 now')).toBe(false);
+    expect(isAckOnlyMessage("I'm stuck in a loop on CTX-528 GPU folio hang")).toBe(false);
   });
 });

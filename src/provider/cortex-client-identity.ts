@@ -25,14 +25,33 @@ function sanitize(value: string, max: number): string {
     .slice(0, max);
 }
 
+function cliSubcommand(): string {
+  // Only the CLI subcommand identifies the process. Scanning the full argv
+  // (including `--prompt`) mislabeled bench `exec` cells as scli-daemon
+  // whenever the prompt contained the words "up" or "daemon"
+  // (Metal chess Usage 114f43796382, 2026-09-05).
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    if (!token || token === '--') continue;
+    if (token.startsWith('-')) {
+      const next = args[i + 1];
+      if (!token.includes('=') && next && !next.startsWith('-')) i += 1;
+      continue;
+    }
+    return token;
+  }
+  return '';
+}
+
 function detectKind(): string {
   const explicit = process.env['SHIZUHA_CLIENT_KIND']?.trim();
   if (explicit) return explicit;
-  const argv = process.argv.slice(1).join(' ');
-  if (/\bgateway\b/.test(argv)) return 'scli-gateway';
-  if (/\b(up|daemon)\b/.test(argv)) return 'scli-daemon';
-  if (/\bexec\b/.test(argv)) return 'scli-exec';
-  if (/\bserve\b/.test(argv)) return 'scli-serve';
+  const sub = cliSubcommand();
+  if (sub === 'gateway') return 'scli-gateway';
+  if (sub === 'up' || sub === 'daemon') return 'scli-daemon';
+  if (sub === 'exec') return 'scli-exec';
+  if (sub === 'serve') return 'scli-serve';
   // The TUI is the no-subcommand default.
   return process.stdout.isTTY ? 'scli-tui' : 'scli';
 }

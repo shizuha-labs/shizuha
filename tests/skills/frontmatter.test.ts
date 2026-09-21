@@ -72,8 +72,12 @@ Full workflow transition procedure.
       path.resolve('src/skills/integrations/heartbeat-protocol/SKILL.md'),
       'utf8',
     );
-    expect(AGENT_BASE_INSTRUCTIONS).toContain("scheduler trigger's drain mode");
-    expect(bundled).toContain('a **bounded** trigger ends after that task');
-    expect(bundled).toContain('without either successor mechanism is still a throughput bug');
+    expect(AGENT_BASE_INSTRUCTIONS).toContain('does not prefetch Pulse');
+    expect(AGENT_BASE_INSTRUCTIONS).toContain('No tool calls = the turn is over');
+    expect(bundled).toContain('does **not** prefetch Pulse');
+    expect(bundled).toContain('the turn ends');
+    expect(bundled).toContain('critical: true');
+    expect(bundled).toContain('agents_md: true');
+    expect(bundled).toContain('pulse_get_my_work');
   });
 });

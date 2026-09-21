@@ -1,12 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  acquirePidLock,
   classifyStateObject,
   readDaemonState,
   readPidLock,
+  releasePidLock,
 } from '../../src/daemon/state.js';
 
 function makeFifo(filePath: string): void {
@@ -66,5 +68,26 @@ describe('SCLI-434 persisted-state object policy', () => {
     const started = Date.now();
     expect(readPidLock()).toBeNull();
     expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('acquirePidLock never signals PID 1 persisted in daemon.pid or daemon.json', () => {
+    // SCLI-582 regression: a replacement PID namespace inherits the previous
+    // container's hostPath state, where daemon.pid=1 / daemon.json pid=1 point
+    // at the new namespace's own init (tini). acquirePidLock must not TERM/KILL
+    // PID 1 (or anything) across a restart — zero signal calls.
+    const lock = path.join(tmpHome, '.shizuha', 'daemon.pid');
+    fs.writeFileSync(lock, '1\n', { mode: 0o644 });
+    const state = path.join(tmpHome, '.shizuha', 'daemon.json');
+    fs.writeFileSync(state, JSON.stringify({ pid: 1, agents: [] }), { mode: 0o600 });
+
+    const killSpy = vi.spyOn(process, 'kill');
+    try {
+      acquirePidLock();
+      expect(killSpy).not.toHaveBeenCalled();
+      expect(readPidLock()).toBe(process.pid);
+    } finally {
+      killSpy.mockRestore();
+      releasePidLock();
+    }
   });
 });

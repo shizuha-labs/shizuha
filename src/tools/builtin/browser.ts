@@ -54,7 +54,26 @@ export const browserTool: ToolHandler = {
     }
 
     try {
-      const session = browserManager.getSession(context.sessionId, input.mode ?? 'fast');
+      // BRW-38 (G1): resolve the effective browser mode from the target URL +
+      // the browser policy (sensitive hosts force `human`, fail-closed). The
+      // policy is best-effort — on config load failure we fall back to the
+      // explicit mode / `fast` default.
+      let browserSection: import('../../config/browser-policy.js').BrowserSection | undefined;
+      try {
+        const { loadConfig } = await import('../../config/loader.js');
+        const cfg = await loadConfig(context.cwd);
+        browserSection = cfg.browser;
+      } catch {
+        browserSection = undefined;
+      }
+      const { resolveBrowserMode } = await import('../../config/browser-policy.js');
+      let mode: import('../../browser/session.js').BrowserMode;
+      if (input.action === 'navigate' && input.url) {
+        mode = resolveBrowserMode(input.url, input.mode, browserSection).mode;
+      } else {
+        mode = input.mode ?? browserSection?.defaultMode ?? 'fast';
+      }
+      const session = browserManager.getSession(context.sessionId, mode);
 
       switch (input.action) {
         case 'navigate': {

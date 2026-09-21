@@ -199,5 +199,32 @@ describe('broker-token', () => {
         cooldown_seconds: 600,
       });
     });
+
+    it('reports deactivate for a dead model token over the broker UDS', async () => {
+      // SCLI-330: TOKEN_DEAD must send action=deactivate so hive applies
+      // auth_failed and the dead credential leaves the pool automatically.
+      let seenBody = '';
+      server = await startBroker((req, res) => {
+        if (req.url === '/model-token/report-status' && req.method === 'POST') {
+          req.on('data', (chunk) => { seenBody += String(chunk); });
+          req.on('end', () => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+          });
+          return;
+        }
+        res.writeHead(404); res.end();
+      });
+      process.env[ENV] = SOCK;
+      await expect(reportBrokerModelTokenStatus(
+        { entryId: 'entry-1', leaseId: 'lease-1' },
+        { action: 'deactivate' },
+      )).resolves.toBe(true);
+      expect(JSON.parse(seenBody)).toEqual({
+        entry_id: 'entry-1',
+        lease_id: 'lease-1',
+        action: 'deactivate',
+      });
+    });
   });
 });

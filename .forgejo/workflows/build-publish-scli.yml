@@ -45,21 +45,44 @@ jobs:
     runs-on: deploy-lane
     steps:
       - name: Install kubectl + cluster access
+        env:
+          # Bound through env rather than interpolated into the shell body
+          # (semgrep run-shell-injection / CWE-78, PLAT-4734).
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
           set -euo pipefail
           KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
           curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
           install -m 0755 kubectl /usr/local/bin/kubectl
           mkdir -p "$HOME/.kube"
-          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
 
       - name: Build + publish all linux targets
+        env:
+          # Every `github.*` value reaches the shell through env, never through
+          # `${{ }}` inside the body (semgrep run-shell-injection / CWE-78,
+          # PLAT-4734). `github.ref` and the dispatch input are the two that are
+          # genuinely caller-controlled: git refs may legally contain `$`, backticks,
+          # `;`, `&` and quotes, and `inputs.version` is free text from whoever
+          # dispatches the workflow. Both previously landed unquoted in a heredoc
+          # that renders a Job applied with cluster credentials.
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_REF: ${{ github.ref }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
-          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
-          RUN_NUMBER="${{ github.run_number }}"
-          RUN_ATTEMPT="${{ github.run_attempt }}"
+          # Env-binding stops the value reaching the shell parser, but this one is
+          # ALSO spliced into rendered YAML below, where a newline or a quote would
+          # restructure the Job spec regardless of how it got here. Constrain the
+          # shape at the boundary instead of trusting the interpolation site.
+          if [ -n "${INPUT_VERSION}" ] && ! printf '%s' "${INPUT_VERSION}" | grep -qE '^[A-Za-z0-9._+-]{1,64}$'; then
+            echo "::error::refusing dispatch input version='${INPUT_VERSION}': expected 1-64 chars of [A-Za-z0-9._+-]"
+            exit 1
+          fi
+          SHORT="$(printf '%s' "$SOURCE_SHA" | cut -c1-7)"
           RELEASE_ID="${SHORT}-${RUN_NUMBER}-a${RUN_ATTEMPT}"
           REGISTRY_BASE="http://forgejo-http.origin.svc.cluster.local:80/api/packages/shizuha-labs/generic/scli-builds/${RELEASE_ID}"
 
@@ -112,13 +135,13 @@ jobs:
                       - name: REGISTRY_BASE
                         value: "${REGISTRY_BASE}"
                       - name: VERSION_OVERRIDE
-                        value: "${{ github.event.inputs.version }}"
+                        value: "${INPUT_VERSION}"
                       - name: CI_RUN_NUMBER
-                        value: "${{ github.run_number }}"
+                        value: "${RUN_NUMBER}"
                       - name: CI_SOURCE_SHA
-                        value: "${{ github.sha }}"
+                        value: "${SOURCE_SHA}"
                       - name: CI_SOURCE_REF
-                        value: "${{ github.ref }}"
+                        value: "${SOURCE_REF}"
                     args:
                       - |
                         set -euo pipefail
@@ -336,7 +359,7 @@ jobs:
                     env:
                       - name: FORGEJO_TOKEN
                         valueFrom: { secretKeyRef: { name: scli-forgejo-token, key: token } }
-                      - { name: CI_SOURCE_SHA, value: "${{ github.sha }}" }
+                      - { name: CI_SOURCE_SHA, value: "${SOURCE_SHA}" }
                       - { name: RELEASE_ID, value: "${RELEASE_ID}" }
                     command: ["/bin/sh", "-c"]
                     args:
@@ -443,6 +466,19 @@ jobs:
     needs: [build-publish-linux]
     runs-on: deploy-lane
     steps:
+      - name: Install cached kubectl + cluster access
+        env:
+          # Bound through env rather than interpolated into the shell body
+          # (semgrep run-shell-injection / CWE-78, PLAT-4734).
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
       - name: Confirm hostPath stage is retired
         run: |
           set -euo pipefail
@@ -454,6 +490,7 @@ jobs:
           # Explicit non-goals of this workflow after retirement:
           test ! -f /tmp/should-not-stage-hostpath
           exit 0
+
 
   # Phase 2 (SCLI-126): macOS/darwin build on the Mac host (`ssh shizuha-mb@v4`)
   # needs MAC_SSH_KEY + v4 Tailscale reachability. The previous `build-darwin`

@@ -77,4 +77,74 @@ describe('VLlmProvider live model discovery', () => {
     expect(provider.maxContextWindow).toBe(16_384);
     expect(requests).toBe(2);
   });
+
+  it('keeps last-known metadata when a force-refresh times out (shizuha1 2026-09-21)', async () => {
+    const originalTimeout = process.env['VLLM_MODEL_DISCOVERY_TIMEOUT_MS'];
+    process.env['VLLM_MODEL_DISCOVERY_TIMEOUT_MS'] = '80';
+    const server = createServer((req, res) => {
+      if (req.url !== '/v1/models') {
+        res.writeHead(404).end();
+        return;
+      }
+      if ((server as unknown as { hang?: boolean }).hang) return;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({
+        data: [{ id: 'cortex/GLM-5.3-Flash', max_model_len: 500_000 }],
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      const provider = new VLlmProvider(`http://127.0.0.1:${port}`, 131_072);
+      expect(await provider.getServedModel('cortex/GLM-5.3-Flash')).toBe('cortex/GLM-5.3-Flash');
+      expect(provider.maxContextWindow).toBe(500_000);
+
+      (server as unknown as { hang?: boolean }).hang = true;
+      expect(await provider.getServedModel('cortex/GLM-5.3-Flash', { forceRefresh: true }))
+        .toBe('cortex/GLM-5.3-Flash');
+      expect(provider.maxContextWindow).toBe(500_000);
+    } finally {
+      if (originalTimeout == null) delete process.env['VLLM_MODEL_DISCOVERY_TIMEOUT_MS'];
+      else process.env['VLLM_MODEL_DISCOVERY_TIMEOUT_MS'] = originalTimeout;
+    }
+  });
+
+  it('keeps last-known metadata when /v1/models returns 5xx, but not when the model is gone', async () => {
+    let mode: 'ok' | 'fail' | 'retired' = 'ok';
+    const server = createServer((req, res) => {
+      if (req.url !== '/v1/models') {
+        res.writeHead(404).end();
+        return;
+      }
+      if (mode === 'fail') {
+        res.writeHead(503).end('unavailable');
+        return;
+      }
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(
+        mode === 'retired'
+          ? { data: [{ id: 'other-model', max_model_len: 8192 }] }
+          : { data: [{ id: 'GLM-5.3-Flash', max_model_len: 500_000 }] },
+      ));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    const provider = new VLlmProvider(`http://127.0.0.1:${port}`, 131_072);
+
+    expect(await provider.getServedModel('GLM-5.3-Flash')).toBe('GLM-5.3-Flash');
+    expect(provider.maxContextWindow).toBe(500_000);
+
+    mode = 'fail';
+    expect(await provider.getServedModel('GLM-5.3-Flash', { forceRefresh: true }))
+      .toBe('GLM-5.3-Flash');
+    expect(provider.maxContextWindow).toBe(500_000);
+
+    mode = 'retired';
+    expect(await provider.getServedModel('GLM-5.3-Flash', { forceRefresh: true }))
+      .toBeUndefined();
+    // Do not import the other model's window.
+    expect(provider.maxContextWindow).toBe(500_000);
+  });
 });

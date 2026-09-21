@@ -151,17 +151,17 @@ export function shouldProbePersistedProviderUnavailable(
  * wrapper: app-server does not expose it, so the model will try to execute the
  * sample as shell/Node code and never reach Pulse. */
 export const CODEX_HEARTBEAT_TRIGGER =
-  '[HEARTBEAT] Automatic sync. Call the native MCP tool `mcp__shizuha-pulse__pulse_get_my_alerts` directly first, then call `mcp__shizuha-pulse__pulse_get_my_tasks` ' +
+  '[HEARTBEAT] Automatic sync. Call the native MCP tool `mcp__shizuha-pulse__pulse_get_my_work` directly ' +
   '(do NOT invoke it through shell/Node/`functions.exec`; do NOT call `list_mcp_resources`, inspect files/env, probe HTTP, or search docs). ' +
-  'This ordered alert-then-task pair is MANDATORY on every heartbeat: prior conversation context never proves the current inboxes, and ZERO output is forbidden until both unfiltered Pulse results are returned. ' +
-  'This is a BOUNDED scheduler turn: after both results, work/forward the highest-priority ready item across alerts and tasks completely; alerts win ties but never preempt higher-priority task WIP. Then STOP without fetching a second item. ' +
-  'The runtime immediately starts a fresh successor turn while ready work remains, so do not drain multiple task contexts here. ' +
+  'That one snapshot is alerts + tasks. You choose what to advance. ZERO output is forbidden until the snapshot returns. ' +
+  'This is a BOUNDED scheduler turn: after the snapshot, work/forward the item you chose completely. Then STOP without fetching a second item. ' +
+  'The runtime immediately starts a fresh successor turn while ready work remains. ' +
   'If nothing is movable, stop immediately with ZERO output.';
 
 export const CODEX_HEARTBEAT_OBSERVATION_RETRY_TRIGGER =
   '[HEARTBEAT RETRY] The preceding scheduler turn failed because it ended before observing Pulse. ' +
-  'Call `mcp__shizuha-pulse__pulse_get_my_alerts` as your FIRST action now, then call `mcp__shizuha-pulse__pulse_get_my_tasks`. This ordered pair is mandatory even if prior context suggests an alert is resolved, a task is blocked, or CI is pending. ' +
-  'After both unfiltered results: work/forward only the highest-priority ready item across alerts and tasks; alerts win ties but never preempt higher-priority task WIP. Produce ZERO output if and only if both inboxes prove nothing is movable.';
+  'Call `mcp__shizuha-pulse__pulse_get_my_work` as your FIRST action now. That one snapshot is alerts + tasks. ' +
+  'You choose what to advance. Produce ZERO output if and only if both inboxes prove nothing is movable.';
 
 export const MAX_CODEX_HEARTBEAT_OBSERVATION_RETRIES = 1;
 
@@ -372,6 +372,88 @@ export function shouldScheduleHeartbeatDrainFollowup(
       || outcome.outcome === 'forwarded'
       || outcome.outcome === 'ready_no_progress'
     );
+}
+
+export type HeartbeatAdmissionState =
+  | 'booting'
+  | 'capability_validating'
+  | 'heartbeat_pending'
+  | 'queue_observed'
+  | 'work_started'
+  | 'productive'
+  | 'honestly_idle'
+  | 'needs_help';
+
+export interface PulseQueueCapabilityManifest {
+  capability_id: 'pulse.queue.read';
+  canonical_tool: 'mcp__shizuha_pulse__pulse_get_my_tasks';
+  model_alias: string;
+  schema_digest: string;
+  scope_digest: string;
+  generation: string;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => `${JSON.stringify(key)}:${canonicalJson(nested)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+export function capabilityDigest(value: unknown): string {
+  return `sha256:${crypto.createHash('sha256').update(canonicalJson(value)).digest('hex')}`;
+}
+
+/** Compose the immutable-per-app-server-generation queue capability from the
+ * inventory returned by Codex itself. A generic MCP resource/list response is
+ * deliberately unusable here: admission requires the exact scoped server and
+ * exact callable tool schema. */
+export function buildPulseQueueCapabilityManifest(
+  inventory: unknown,
+  scope: Record<string, unknown>,
+  generation: string,
+): PulseQueueCapabilityManifest {
+  const servers = Array.isArray((inventory as Record<string, unknown> | null)?.['data'])
+    ? (inventory as { data: Array<Record<string, unknown>> }).data
+    : [];
+  const pulse = servers.find((entry) => entry['name'] === 'shizuha-pulse');
+  const tools = pulse?.['tools'];
+  const queueTool = tools && typeof tools === 'object'
+    ? (tools as Record<string, unknown>)['pulse_get_my_tasks']
+    : undefined;
+  if (!queueTool || typeof queueTool !== 'object') {
+    throw new Error('required capability pulse.queue.read is absent: shizuha-pulse/pulse_get_my_tasks not callable');
+  }
+  const inputSchema = (queueTool as Record<string, unknown>)['inputSchema'];
+  if (!inputSchema || typeof inputSchema !== 'object') {
+    throw new Error('required capability pulse.queue.read has no input schema');
+  }
+  return {
+    capability_id: 'pulse.queue.read',
+    canonical_tool: 'mcp__shizuha_pulse__pulse_get_my_tasks',
+    model_alias: 'mcp__shizuha-pulse__pulse_get_my_tasks',
+    schema_digest: capabilityDigest(inputSchema),
+    scope_digest: capabilityDigest(scope),
+    generation,
+  };
+}
+
+export function mcpToolCallResponseText(response: unknown): string {
+  const record = response && typeof response === 'object' ? response as Record<string, unknown> : {};
+  const content = Array.isArray(record['content']) ? record['content'] : [];
+  return content.map((item) => {
+    if (typeof item === 'string') return item;
+    if (item && typeof item === 'object') {
+      const block = item as Record<string, unknown>;
+      if (typeof block['text'] === 'string') return block['text'];
+      if (typeof block['content'] === 'string') return block['content'];
+    }
+    return canonicalJson(item);
+  }).filter(Boolean).join('\n');
 }
 
 /** Select only skills that belong in Codex's native always-visible catalog.
@@ -786,9 +868,14 @@ export function isExplicitConnectReplyRequest(message: BridgeQueuedMessage): boo
   if (!message.clientId.startsWith('connect:')) return false;
   const text = message.content.trim();
   if (/^\[system\]\s/i.test(text)) return false;
+  // Explicit exact-response probes must preempt autonomous heartbeats at the
+  // safe interrupt boundary. Keep this lexical set tight: routine prose that
+  // merely mentions "exact"/"nonce"/"token", system scheduling notices, and
+  // non-Connect clients must stay out of the interrupt class (SCLI-462 / HIVE-1695).
   return /\bplease\s+reply\b[\s\S]{0,160}\bexactly\b\s*:?/i.test(text)
     || /\breply\s+exactly\b\s*:?/i.test(text)
-    || /\breply\s+(?:with\s+)?(?:the\s+)?(?:word|phrase|text)\b[\s\S]{0,80}/i.test(text);
+    || /\breply\s+(?:with\s+)?(?:the\s+)?(?:word|phrase|text)\b[\s\S]{0,80}/i.test(text)
+    || /\breply\s+with\s+(?:this\s+|the\s+)?exact\s+(?:nonce|token)\b/i.test(text);
 }
 
 export function isLowPriorityConnectSystemMessage(message: BridgeQueuedMessage): boolean {
@@ -991,6 +1078,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isCodexUnsupportedModelError(message: string): boolean {
+  return /model is not supported|unsupported model|not supported when using Codex/i.test(message);
+}
+
 function isCodexLimitError(message: string): boolean {
   const lower = message.toLowerCase();
   if (/\b429\b|rate.?limit|usage limit|quota|too many requests/i.test(lower)) return true;
@@ -1104,6 +1195,7 @@ export function classifyCodexTurnCompletion(
     || (httpStatus !== null && (httpStatus === 408 || httpStatus >= 500))
     || /\b(connection (?:failed|reset|closed)|network error|timed? ?out|timeout|temporar(?:y|ily) unavailable|upstream disconnected|stream disconnected)\b/i.test(signal)
   ) category = 'transient_provider';
+  else if (isCodexUnsupportedModelError(signal)) category = 'deterministic';
   else if (
     ['contextWindowExceeded', 'sessionBudgetExceeded', 'cyberPolicy', 'badRequest',
       'threadRollbackFailed', 'sandboxError', 'activeTurnNotSteerable'].includes(errorCode ?? '')
@@ -1321,10 +1413,16 @@ export class CodexBridge {
     reason: string;
   } | null = null;
   /** Number of mandatory observation retries used by the current heartbeat.
-   * Retry #1 keeps the warm thread; retry #2 uses a clean thread to escape a
-   * context-local empty-turn attractor. Two is a hard bound so prompt
-   * non-compliance cannot hot-loop. */
+   * The single recovery uses a clean thread to escape a context-local
+   * empty-turn attractor. One is the hard bound: missing capability evidence
+   * must become needs_help, never a prompt retry loop. */
   private heartbeatObservationRetryCount = 0;
+  /** SCLI-348 admission is runtime-owned, not inferred from pod readiness or
+   * model prose. Only a verified scoped queue capability plus a real queue
+   * snapshot can advance this state. */
+  private heartbeatAdmissionState: HeartbeatAdmissionState = 'booting';
+  private pulseQueueCapabilityManifest: PulseQueueCapabilityManifest | null = null;
+  private heartbeatAdmissionFailure = '';
   // PLAT-4179: dedicated stuck-latch watchdog, run frequently and decoupled from the
   // hourly heartbeat so a wedged turn's leaked latch is force-cleared within one tick.
   private stuckLatchTimer: ReturnType<typeof setInterval> | null = null;
@@ -1441,46 +1539,82 @@ export class CodexBridge {
     try { proc.kill(signal); } catch { /* already gone */ }
   }
 
+  /**
+   * Production Connect inbound boundary (SCLI-462).
+   *
+   * Extracted from the ConnectClient `onMessage` wiring so regression tests can
+   * drive the exact enqueue → classify → interrupt → processQueue path without
+   * reconstructing those steps out-of-band. Keep this as the single caller of
+   * `isExplicitConnectReplyRequest` + `interruptActiveTurnForPriority` for DMs.
+   */
+  handleConnectInboundMessage(
+    convId: string,
+    content: string,
+    senderName: string,
+    messageId?: string,
+    conversationType?: BridgeQueuedMessage['conversationType'],
+    replyObligation?: BridgeQueuedMessage['replyObligation'],
+  ): void {
+    if (this.runtimeRollDrain.ready) {
+      console.log(
+        `[codex-bridge] [Connect] Holding unread message from ${senderName} during runtime rollout`,
+      );
+      return;
+    }
+    const connectClientId = `connect:${convId}`;
+    console.log(`[codex-bridge] [Connect] Message from ${senderName} in conv ${convId.substring(0, 8)}… len=${content.length} busy=${!!this.activeThreadId}`);
+    if (messageId && this.store.inboundProcessingCompleted(this.sessionId, messageId)) {
+      this.connectClient?.ackMessageProcessed(messageId);
+      console.log(`[codex-bridge] [Connect] Acknowledged completed replay ${messageId}`);
+      return;
+    }
+    const queuedMessage: BridgeQueuedMessage = {
+      clientId: connectClientId,
+      content,
+      ...(messageId ? { messageId } : {}),
+      conversationType,
+      replyObligation,
+    };
+    if (messageId) this.store.markInboundProcessingAdmitted(this.sessionId, messageId, 'connect');
+    if (this.convertRoutineConnectMessageToHeartbeat(queuedMessage)) {
+      if (messageId) {
+        this.store.markInboundProcessingCompleted(this.sessionId, messageId);
+        this.connectClient?.ackMessageProcessed(messageId);
+      }
+      return;
+    }
+    if (!this.serverReady) {
+      const queuePosition = enqueueBridgeMessage(this.messageQueue, queuedMessage);
+      console.log(`[codex-bridge] [Connect] Queued message until app-server init from ${senderName} in conv ${convId.substring(0, 8)}… position=${queuePosition + 1} depth=${this.messageQueue.length}`);
+    } else {
+      const queuePosition = enqueueBridgeMessage(this.messageQueue, queuedMessage);
+      console.log(`[codex-bridge] [Connect] Queued message from ${senderName} in conv ${convId.substring(0, 8)}… position=${queuePosition + 1} depth=${this.messageQueue.length}`);
+      if (this.activeThreadId && isExplicitConnectReplyRequest(queuedMessage)) {
+        this.interruptActiveTurnForPriority('explicit Connect reply request');
+      }
+      void this.processQueue();
+    }
+  }
+
   async start(): Promise<void> {
     // Start Connect client (unified messaging)
     try {
       const { ConnectClient } = await import('../connect-client/index.js');
       this.connectClient = new ConnectClient({
         onOpen: () => this.emitTelemetry(),
-        onMessage: (convId, content, senderId, senderName, messageId, conversationType, replyObligation) => {
-          if (this.runtimeRollDrain.ready) {
-            console.log(
-              `[codex-bridge] [Connect] Holding unread message from ${senderName} during runtime rollout`,
-            );
-            return;
-          }
-          const connectClientId = `connect:${convId}`;
-          console.log(`[codex-bridge] [Connect] Message from ${senderName} in conv ${convId.substring(0, 8)}… len=${content.length} busy=${!!this.activeThreadId}`);
-          if (messageId && this.store.inboundProcessingCompleted(this.sessionId, messageId)) {
-            this.connectClient?.ackMessageProcessed(messageId);
-            console.log(`[codex-bridge] [Connect] Acknowledged completed replay ${messageId}`);
-            return;
-          }
-          const queuedMessage = { clientId: connectClientId, content, messageId, conversationType, replyObligation };
-          if (messageId) this.store.markInboundProcessingAdmitted(this.sessionId, messageId, 'connect');
-          if (this.convertRoutineConnectMessageToHeartbeat(queuedMessage)) {
-            if (messageId) {
-              this.store.markInboundProcessingCompleted(this.sessionId, messageId);
-              this.connectClient?.ackMessageProcessed(messageId);
-            }
-            return;
-          }
-          if (!this.serverReady) {
-            const queuePosition = enqueueBridgeMessage(this.messageQueue, queuedMessage);
-            console.log(`[codex-bridge] [Connect] Queued message until app-server init from ${senderName} in conv ${convId.substring(0, 8)}… position=${queuePosition + 1} depth=${this.messageQueue.length}`);
-          } else {
-            const queuePosition = enqueueBridgeMessage(this.messageQueue, queuedMessage);
-            console.log(`[codex-bridge] [Connect] Queued message from ${senderName} in conv ${convId.substring(0, 8)}… position=${queuePosition + 1} depth=${this.messageQueue.length}`);
-            if (this.activeThreadId && isExplicitConnectReplyRequest(queuedMessage)) {
-              this.interruptActiveTurnForPriority('explicit Connect reply request');
-            }
-            void this.processQueue();
-          }
+        // PLAT-8787: re-ack the durably-completed inbound backlog on every
+        // reconnect — a turn-end ack lost to a dying socket otherwise
+        // guarantees a byte-identical replay re-delivery next reconnect.
+        completedInboundMessageIds: () => this.store.completedInboundMessageIds(),
+        onMessage: (convId, content, _senderId, senderName, messageId, conversationType, replyObligation) => {
+          this.handleConnectInboundMessage(
+            convId,
+            content,
+            senderName,
+            messageId,
+            conversationType,
+            replyObligation,
+          );
         },
         onConfigUpdate: (cfg) => {
           console.log(`[codex-bridge] agent_config_update received: keys=${Object.keys(cfg).join(',')}`);
@@ -1546,6 +1680,8 @@ export class CodexBridge {
     // so they never ran the pulse_get_my_tasks catch-up / escalation routine.
     this.startHeartbeat();
     this.startTelemetry();
+    this.heartbeatAdmissionState = 'heartbeat_pending';
+    void this.markAgentAvailability(false, 'awaiting runtime-verified Pulse queue observation');
     this.startTokenRefresh();
     console.log(JSON.stringify({
       level: 30, time: Date.now(), pid: process.pid, hostname: os.hostname(),
@@ -1682,6 +1818,11 @@ export class CodexBridge {
   }
 
   private async initialize(): Promise<void> {
+    // A replacement child is a new capability generation. Never carry an old
+    // manifest/productive admission across reconnect or account rotation.
+    this.pulseQueueCapabilityManifest = null;
+    this.heartbeatAdmissionFailure = '';
+    this.heartbeatAdmissionState = 'heartbeat_pending';
     const result = await this.rpcRequest('initialize', {
       clientInfo: { name: 'shizuha-codex-bridge', version: '1.0.0' },
       capabilities: {
@@ -1689,6 +1830,7 @@ export class CodexBridge {
         // the experimental API capability. This mode is specifically designed
         // for a client-owned refresh authority and never receives a refresh token.
         experimentalApi: true,
+        requestAttestation: false,
         experimental: {
           'thread/start.dynamicTools': true,
         },
@@ -1880,6 +2022,85 @@ export class CodexBridge {
 
     // turn/start returns immediately, events come as notifications
     await this.rpcRequest('turn/start', params);
+  }
+
+  private pulseQueueCapabilityScope(): Record<string, unknown> {
+    return {
+      agent_id: process.env['AGENT_ID'] ?? null,
+      agent_username: this.opts.agentUsername ?? process.env['AGENT_USERNAME'] ?? null,
+      agent_role: process.env['AGENT_ROLE'] ?? null,
+      effective_mcp_services: process.env['SHIZUHA_MCP_SERVICES'] ?? null,
+      server: 'shizuha-pulse',
+    };
+  }
+
+  /** Runtime-enforced first heartbeat call. This uses Codex app-server's native
+   * MCP client so the exact same scoped registration exposed to the model is
+   * validated and called before any model sampling. One reload/recompose is the
+   * entire recovery budget; after that the agent fails closed and visible. */
+  private async primeHeartbeatQueueObservation(): Promise<string> {
+    if (!this.codexThreadId) this.codexThreadId = await this.createThread();
+    this.heartbeatAdmissionState = 'capability_validating';
+    const generation = `${this.executionGeneration}:${this.serverProcess?.pid ?? 'no-child'}`;
+
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const inventory = await this.rpcRequest('mcpServerStatus/list', {
+          threadId: this.codexThreadId,
+          detail: 'full',
+          limit: 100,
+        });
+        const manifest = buildPulseQueueCapabilityManifest(
+          inventory,
+          this.pulseQueueCapabilityScope(),
+          generation,
+        );
+        const response = await this.rpcRequest('mcpServer/tool/call', {
+          threadId: this.codexThreadId,
+          server: 'shizuha-pulse',
+          tool: 'pulse_get_my_tasks',
+          arguments: {},
+        }) as Record<string, unknown>;
+        const snapshot = mcpToolCallResponseText(response);
+        if (response['isError'] === true) {
+          throw new Error(`Pulse queue call returned isError: ${snapshot.slice(0, 500)}`);
+        }
+        if (!snapshot.trim()) throw new Error('Pulse queue call returned no snapshot content');
+
+        this.pulseQueueCapabilityManifest = manifest;
+        this.heartbeatAdmissionFailure = '';
+        this.heartbeatAdmissionState = 'queue_observed';
+        this.heartbeatToolCalls.push({ name: manifest.canonical_tool });
+        this.heartbeatToolResults.push({ content: snapshot, isError: false });
+        console.log(`[codex-bridge] [capability-admission] ${JSON.stringify({
+          state: this.heartbeatAdmissionState,
+          manifest,
+          queue_snapshot_bytes: Buffer.byteLength(snapshot),
+        })}`);
+        return `[RUNTIME-VERIFIED PULSE QUEUE]\n` +
+          `The bridge called ${manifest.canonical_tool} before model sampling; do not fetch the queue again in this bounded turn. ` +
+          `Work or forward only the first movable task from this authoritative snapshot, then stop.\n` +
+          `Capability manifest: ${JSON.stringify(manifest)}\n` +
+          `Queue snapshot:\n${snapshot}`;
+      } catch (error) {
+        lastError = error as Error;
+        if (attempt === 0) {
+          console.warn(`[codex-bridge] Pulse capability validation/call failed; using one bounded MCP reload: ${lastError.message}`);
+          await this.rpcRequest('config/mcpServer/reload').catch(() => undefined);
+          continue;
+        }
+      }
+    }
+
+    const reason = `Pulse capability admission failed after bounded recovery: ${lastError?.message ?? 'unknown error'}`;
+    this.heartbeatAdmissionState = 'needs_help';
+    this.heartbeatAdmissionFailure = reason;
+    this.recentErrors.push({ ts: Date.now(), level: 'error', msg: reason });
+    this.recentErrors = this.recentErrors.slice(-20);
+    void this.markAgentAvailability(false, reason);
+    console.error(`[codex-bridge] [capability-admission] ${JSON.stringify({ state: 'needs_help', reason })}`);
+    throw new Error(reason);
   }
 
   // ── JSON-RPC Transport ──
@@ -2252,6 +2473,7 @@ export class CodexBridge {
           const commandFailed = exitCode !== 0 || item.status === 'failed';
           if (commandFailed) this.activeTurnToolFailures++;
           if (this.activeTurnIsHeartbeat) {
+            if (this.heartbeatAdmissionState === 'queue_observed') this.heartbeatAdmissionState = 'work_started';
             this.heartbeatToolCalls.push({ name: 'exec_command' });
             this.heartbeatToolResults.push({
               content: compactText(item.aggregatedOutput ?? item.output ?? ''),
@@ -2278,6 +2500,7 @@ export class CodexBridge {
           this.currentTurnHasOutput = true;
           this.codexActiveTurnStreamedState = true;
           if (this.activeTurnIsHeartbeat) {
+            if (this.heartbeatAdmissionState === 'queue_observed') this.heartbeatAdmissionState = 'work_started';
             this.heartbeatToolCalls.push({ name: 'apply_patch' });
             this.heartbeatToolResults.push({ content: item.path ?? '', isError: false });
           }
@@ -2290,6 +2513,9 @@ export class CodexBridge {
         } else if (itemType === 'mcpToolCall' || itemType === 'mcp_tool_call') {
           if (this.activeTurnIsHeartbeat) {
             const observation = buildHeartbeatToolObservationFromCodexMcpItem(item);
+            if (this.heartbeatAdmissionState === 'queue_observed' && /pulse_(?:add_comment|execute_transition|assign_task|link_pr)$/.test(observation.toolCall.name ?? '')) {
+              this.heartbeatAdmissionState = 'work_started';
+            }
             this.heartbeatToolCalls.push(observation.toolCall);
             this.heartbeatToolResults.push(observation.toolResult);
           }
@@ -2509,6 +2735,18 @@ export class CodexBridge {
               toolResults: this.heartbeatToolResults,
             });
             console.log(formatHeartbeatQueueDrainOutcomeLogLine(outcome));
+            if (outcome.outcome === 'worked_task' || outcome.outcome === 'forwarded') {
+              this.heartbeatAdmissionState = 'productive';
+              void this.markAgentAvailability(true, '');
+            } else if (outcome.outcome === 'queue_empty' || outcome.outcome === 'all_blocked' || outcome.outcome === 'future_due') {
+              this.heartbeatAdmissionState = 'honestly_idle';
+              void this.markAgentAvailability(true, '');
+            } else if (outcome.outcome === 'ready_no_progress' || outcome.outcome === 'needs_help' || outcome.outcome === 'not_observed') {
+              this.heartbeatAdmissionState = outcome.outcome === 'ready_no_progress' ? 'queue_observed' : 'needs_help';
+              const reason = `heartbeat admission ${outcome.outcome}: ${outcome.reason}`;
+              this.heartbeatAdmissionFailure = reason;
+              void this.markAgentAvailability(false, reason);
+            }
             continueHeartbeatDrain = shouldScheduleHeartbeatDrainFollowup(outcome);
             // After repeated blind turns the classifier escalates not_observed
             // to needs_help. Allow at most one clean-thread rescue while still
@@ -2726,6 +2964,18 @@ export class CodexBridge {
       this.providerUnavailableReason = errorMessage || 'rate_limit';
       this.emitTelemetry();
     }
+    // ChatGPT Codex rejects some Hive-pinned models (live 2026-08-22: Jun
+    // gpt-5.6-sol "not supported when using Codex with a ChatGPT account").
+    // That is not a blip — every turn fails — so the seat must surface
+    // provider_unavailable and Hive must hibernate it so Pulse can drain WIP.
+    if (
+      failure.category === 'deterministic'
+      && isCodexUnsupportedModelError(errorMessage)
+    ) {
+      this.providerUnavailable = true;
+      this.providerUnavailableReason = errorMessage || 'unsupported_model';
+      this.emitTelemetry();
+    }
     // Explicit rate/usage limits retain the bounded account-rotation path.
     // Every other structured failure terminates this attempt without scheduling
     // mandatory heartbeat retries: retrying an auth/bad-request/policy failure
@@ -2870,13 +3120,39 @@ export class CodexBridge {
       }
     }
 
-    console.log(`[codex-bridge] Sending turn: ${content.slice(0, 80)}...`);
+    let sampledContent = content;
+    if (this.activeTurnIsHeartbeat) {
+      try {
+        sampledContent = await this.primeHeartbeatQueueObservation();
+        this.activeTurnContent = sampledContent;
+      } catch (error) {
+        const errMsg = (error as Error).message;
+        this.broadcastToThread(threadId, {
+          type: 'error', execution_id: threadId, data: { message: errMsg },
+        });
+        this.broadcastToThread(threadId, {
+          type: 'complete', execution_id: threadId,
+          data: { result: { total_turns: this.turnCount, input_tokens: this.totalInputTokens, output_tokens: this.totalOutputTokens } },
+        });
+        this.activeThreadId = null;
+        this.activeThreadStartedAt = null;
+        this.activeMessageId = null;
+        this.activeTurnContent = null;
+        this.activeTurnIsHeartbeat = false;
+        this.heartbeatToolCalls = [];
+        this.heartbeatToolResults = [];
+        this.processQueue();
+        return;
+      }
+    }
+
+    console.log(`[codex-bridge] Sending turn: ${sampledContent.slice(0, 80)}...`);
 
     try {
       // Wait for turn to complete (resolved by handleServerNotification)
       await new Promise<void>((resolve, reject) => {
         this.activeTurnResolve = resolve;
-        this.sendTurn(content).catch(reject);
+        this.sendTurn(sampledContent).catch(reject);
       });
     } catch (e) {
       // A stuck-latch recovery rejects every old-child RPC to release its timers.
@@ -4231,7 +4507,8 @@ export class CodexBridge {
           }
         }
         mcpJson.mcpServers = servers;
-        fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2));
+        fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2), { mode: 0o600 });
+        fs.chmodSync(mcpJsonPath, 0o600);
       }
 
       if (fs.existsSync(configPath)) {
@@ -4290,7 +4567,8 @@ export class CodexBridge {
         }
         if (browserMcp) mcpJson.mcpServers = { ...(mcpJson.mcpServers ?? {}), [browserMcp.name]: browserMcp.entry };
         else if (mcpJson?.mcpServers?.['browser']) delete mcpJson.mcpServers['browser'];
-        fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2));
+        fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2), { mode: 0o600 });
+        fs.chmodSync(mcpJsonPath, 0o600);
       }
     } catch { /* best-effort stale cron cleanup */ }
     let mcpConfig = '';
@@ -4357,7 +4635,8 @@ ${envLines ? `\n[mcp_servers.${browserMcp.name}.env]\n${envLines}\n` : ''}
           ...(browserMcp ? { [browserMcp.name]: browserMcp.entry } : {}),
           ...proxyPlatformConfigs,
         };
-        fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2));
+        fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2), { mode: 0o600 });
+        fs.chmodSync(mcpJsonPath, 0o600);
       } catch (err) {
         console.warn(`[codex-bridge] Failed to refresh workspace .mcp.json: ${(err as Error).message}`);
       }
@@ -4394,8 +4673,9 @@ ${envLines}
         );
         mcpConfig = mcpConfig.replace('PLATFORM_PULSE_CONNECTED = \"1\"', 'PLATFORM_PULSE_CONNECTED = \"\"');
       }
+      const hasMultiplexer = 'shizuha-mcp' in proxyPlatformConfigs;
       const requiredBase = ['shizuha-pulse', 'shizuha-connect', 'shizuha-wiki'];
-      const missingBase = requiredBase.filter((name) => !(name in proxyPlatformConfigs));
+      const missingBase = hasMultiplexer ? [] : requiredBase.filter((name) => !(name in proxyPlatformConfigs));
       if (missingBase.length) {
         console.error(`[codex-bridge] Platform MCP base servers missing from Codex config: ${missingBase.join(', ')}`);
       }
@@ -4413,7 +4693,7 @@ ${envLines}
 
     if (platformConnected) {
       const writtenConfig = fs.readFileSync(configPath, 'utf-8');
-      const hasPlatformServer = /\[mcp_servers\.shizuha-(pulse|connect|wiki)\]/.test(writtenConfig);
+      const hasPlatformServer = /\[mcp_servers\.shizuha-(pulse|connect|wiki|mcp)\]/.test(writtenConfig);
       const hasCodexHttpBearer = writtenConfig.includes(`bearer_token_env_var = "${CODEX_PLATFORM_MCP_TOKEN_ENV}"`);
       const hasProxyBearer = writtenConfig.includes('MCP_UPSTREAM_BEARER') || writtenConfig.includes('MCP_UPSTREAM_BEARER_FILE');
       if (!hasPlatformServer || (!hasCodexHttpBearer && !hasProxyBearer)) {
@@ -5428,8 +5708,13 @@ ${envLines}
         this.activeThreadId !== null,
         this.messageQueue.length,
       );
+      // SCLI-348: admission-aware status — a ready pod with an unobserved Pulse
+      // queue is degraded, not ok (fail closed on missing Pulse capability).
+      const admissionHealthy = this.heartbeatAdmissionState === 'productive'
+        || this.heartbeatAdmissionState === 'honestly_idle';
       return {
-        status: providerHealthy ? 'ok' : 'degraded', bridge: 'codex-app-server', model: this.opts.model,
+        status: providerHealthy && admissionHealthy ? 'ok' : 'degraded',
+        bridge: 'codex-app-server', model: this.opts.model,
         busy: this.activeThreadId !== null, queueDepth: this.messageQueue.length,
         serverReady: this.serverReady, initialized: this.serverReady,
         authenticated: this.hasAuth,
@@ -5438,6 +5723,11 @@ ${envLines}
         quota_ok: !quotaUnavailable,
         in_backoff: this.providerUnavailable,
         uptime: Date.now() - this.startTime,
+        heartbeatAdmission: {
+          state: this.heartbeatAdmissionState,
+          capability: this.pulseQueueCapabilityManifest,
+          failure: this.heartbeatAdmissionFailure || null,
+        },
         // Cumulative token/turn counters (load metric — exporter scrapes these and
         // Grafana rate()s them into tok/min, tok/hour per agent).
         outputTokens: this.totalOutputTokens, inputTokens: this.totalInputTokens, turns: this.turnCount,
@@ -5612,10 +5902,14 @@ ${envLines}
 
 /** Entry point — called from CLI command. */
 export async function startCodexBridge(opts: CodexBridgeOptions): Promise<void> {
-  // The constructor creates persistent state, so cwd validation must happen at
-  // this exported boundary before construction or any signal/listener setup.
+  // The constructor creates persistent state, so cwd + host validation must
+  // happen at this exported boundary before construction or any
+  // signal/listener setup (SCLI-555: reject path/URL/overlong --host before
+  // any session/auth/skill/child/metrics/DNS work).
+  const { requireBindHost } = await import('../cli/option-preflight.js');
   const bridge = new CodexBridge({
     ...opts,
+    host: requireBindHost('host', opts.host ?? '0.0.0.0'),
     cwd: assertWorkspaceDir(opts.cwd ?? '/workspace'),
   });
 

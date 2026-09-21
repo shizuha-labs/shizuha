@@ -26,9 +26,14 @@ function shouldStreamAssistantText(): boolean {
   return true;
 }
 
-function shouldRenderReasoningTextAsAssistantContent(model: string): boolean {
-  const normalized = model.toLowerCase();
-  return normalized.startsWith('cortex/') || normalized.includes('glm');
+/** Live thinking preview: one short rolling line, never the full CoT. */
+export const THINKING_SNIPPET_MAX_CHARS = 96;
+
+export function latestThinkingSnippet(text: string, max = THINKING_SNIPPET_MAX_CHARS): string {
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (!collapsed) return '';
+  if (collapsed.length <= max) return collapsed;
+  return collapsed.slice(collapsed.length - max).trimStart();
 }
 
 function appendStreamingDelta(current: string, delta: string): string {
@@ -54,9 +59,23 @@ const STALL_WARN_MS = parseInt(
 );
 /** Provider no-header wait threshold for the prominent recovery UI (Esc / /model). */
 const PROVIDER_SOFT_STALL_MS = parseInt(
-  process.env['TUI_PROVIDER_SOFT_STALL_MS'] || String(DEFAULT_TUI_STALL_ESCALATION_MS),
+  // SCLI-522: 1ad759e83 unified this to DEFAULT_TUI_STALL_ESCALATION_MS (5 min),
+  // regressing SCLI-388's bounded 30s no-header recovery. The idle stall warning
+  // (STALL_WARN_MS) may stay quiet for ordinary cold starts, but a provider
+  // no-header wait must surface budget + Esc + /model promptly.
+  process.env['TUI_PROVIDER_SOFT_STALL_MS'] || '30000',
   10,
 );
+
+/**
+ * SCLI-522: keepalive freshness grace for the idle watchdog.
+ *
+ * The provider header-wait keepalives arrive every 5s (interactive) / 15s
+ * (non-interactive). While they are still arriving, the stall banner belongs to
+ * the direct writers; the watchdog must hold, not clear. The grace must exceed
+ * the slowest cadence we emit so a live stream never looks stale.
+ */
+const PROVIDER_WAIT_FRESH_MS = 20_000;
 
 /**
  * Lifecycle / non-turn provider notices must never become a live streaming
@@ -243,7 +262,6 @@ export function messageToTranscriptContent(message: Message): string {
   }
 
   const textParts: string[] = [];
-  const reasoningParts: string[] = [];
   let toolResultCount = 0;
   let internalAssistantBlockCount = 0;
 
@@ -261,13 +279,9 @@ export function messageToTranscriptContent(message: Message): string {
       continue;
     }
     // Hide internal assistant machinery from resumed transcript view.
+    // Reasoning stays on the persisted message for prefix-cache/replay, but
+    // it is not the user-visible answer (operator 2026-09-10).
     if (message.role === 'assistant' && (blockType === 'reasoning' || blockType === 'tool_use')) {
-      if (blockType === 'reasoning') {
-        const rawContent = (block as { rawContent?: string }).rawContent;
-        if (typeof rawContent === 'string' && rawContent.trim()) {
-          reasoningParts.push(rawContent);
-        }
-      }
       internalAssistantBlockCount++;
       continue;
     }
@@ -275,9 +289,6 @@ export function messageToTranscriptContent(message: Message): string {
 
   if (textParts.length > 0) {
     return textParts.join('\n\n');
-  }
-  if (message.role === 'assistant' && reasoningParts.length > 0) {
-    return reasoningParts.join('\n\n');
   }
   if (internalAssistantBlockCount > 0) {
     return '';
@@ -535,6 +546,14 @@ interface UseAgentSessionResult {
   renameSession: (name: string) => boolean;
   forkSession: () => string | null;
   listMCPTools: () => Promise<Array<{ name: string; description: string }>>;
+  listMcpServers: () => Array<{
+    name: string;
+    disabled: boolean;
+    connected: boolean;
+    tools: number;
+    error?: string;
+  }>;
+  setMcpServerEnabled: (name: string, enabled: boolean) => Promise<{ ok: boolean; message: string }>;
   addTranscriptEntry: (entry: TranscriptEntry) => void;
   submitWithImage: (prompt: string, imageBase64: string, mediaType: string) => void;
   setThinkingLevel: (level: string) => void;
@@ -613,6 +632,8 @@ export function useAgentSession(
   const streamingTextRef = useRef('');
   const reasoningSummariesRef = useRef<string[]>([]);
   const lastReasoningSummaryRef = useRef('');
+  const reasoningTextAccRef = useRef('');
+  const lastThinkingLabelAtRef = useRef(0);
   const currentToolsRef = useRef<ToolCallEntry[]>([]);
   const recentCompletedToolsRef = useRef<ToolCallEntry[]>([]);
   const lastStreamingRenderAtRef = useRef(0);
@@ -632,6 +653,13 @@ export function useAgentSession(
   const [activeWatches, setActiveWatches] = useState<string[]>([]);
   const lastCompactionSummaryRef = useRef<string>('');
   const stallAnnouncedRef = useRef(false);
+  // SCLI-522: provider header-wait keepalive freshness. Keepalives deliberately
+  // do NOT refresh lastAgentEventAtRef (SCLI-388 — the idle watchdog must still
+  // catch a hang masked by fake keepalives), so the idle clock alone would
+  // clear the direct writers' 30s card within a second of every keepalive.
+  // These refs let the watchdog HOLD the banner while keepalives are fresh.
+  const providerWaitActiveRef = useRef(false);
+  const lastProviderWaitAtRef = useRef(0);
 
   /** Sync queue count + prompt texts from the ref into React state. */
   const syncQueueState = useCallback(() => {
@@ -833,6 +861,14 @@ export function useAgentSession(
         // historical retry telemetry. Clear it at the first authoritative
         // recovery signal so a healthy streaming response never sits beneath
         // a stale "no response headers" warning until executeTurn completes.
+        if (isProviderRecoverySignal(event)) {
+          // Retryable 429/ECONNRESET used to call setError(), which pins a red
+          // ✗ banner above the header. Recovery used to clear retryNotice and
+          // stalledMs but left that chrome up until executeTurn completed —
+          // so a working bash turn still showed "API error (429) … stalled 27s"
+          // (shizuha1, 2026-09-16). Always drop it on the first real token/tool.
+          setError(null);
+        }
         if (
           isProviderRecoverySignal(event)
           && (
@@ -843,6 +879,7 @@ export function useAgentSession(
           )
         ) {
           providerWaitNoticeActiveRef.current = false;
+          providerWaitActiveRef.current = false;
           setRetryNotice(null);
           setStalledMs(0);
           stalledMsRef.current = 0;
@@ -865,6 +902,7 @@ export function useAgentSession(
             setLiveTurnPerf(null);
             setProcessingLabel('Thinking...');
             setStalledMs(0);
+            providerWaitActiveRef.current = false;
             break;
 
           case 'background_task': {
@@ -898,13 +936,19 @@ export function useAgentSession(
           }
 
           case 'reasoning_text': {
-            if (!shouldRenderReasoningTextAsAssistantContent(s.model)) {
-              break;
-            }
-            streamingTextRef.current = appendStreamingDelta(streamingTextRef.current, event.text);
-            if (shouldStreamAssistantText()) {
-              upsertStreamingAssistant(false);
-            }
+            // Live preview only. Never append thinking tokens to the answer
+            // body — they belong in the processing label while the turn is
+            // in flight, then they disappear (operator 2026-09-10).
+            if (!event.text || streamingTextRef.current.trim()) break;
+            const acc = appendStreamingDelta(reasoningTextAccRef.current, event.text);
+            reasoningTextAccRef.current = acc.length > 2000 ? acc.slice(-2000) : acc;
+            const snippet = latestThinkingSnippet(reasoningTextAccRef.current);
+            if (!snippet || snippet === lastReasoningSummaryRef.current) break;
+            const now = Date.now();
+            if (now - lastThinkingLabelAtRef.current < STREAM_RENDER_INTERVAL_MS) break;
+            lastThinkingLabelAtRef.current = now;
+            lastReasoningSummaryRef.current = snippet;
+            setProcessingLabel(snippet);
             break;
           }
 
@@ -939,6 +983,16 @@ export function useAgentSession(
               );
             }
             if (statusCode === 'request_wait' || statusCode === 'request_start') {
+              if (currentToolsRef.current.some((tool) => tool.status === 'running')) {
+                // Tool in flight — keepalives from the previous HTTP wait must
+                // not re-pin "Long provider wait" over "Running bash".
+                break;
+              }
+              // SCLI-522: mark the provider wait live + fresh so the idle
+              // watchdog holds the banner instead of clearing it (keepalives
+              // intentionally do not refresh the idle clock — SCLI-388).
+              providerWaitActiveRef.current = true;
+              lastProviderWaitAtRef.current = Date.now();
               const elapsed = typeof event.elapsedMs === 'number' ? event.elapsedMs : 0;
               const stallMs = longWaitDisplayMs(elapsed, PROVIDER_SOFT_STALL_MS);
               if (stallMs > 0 && stallMs !== stalledMsRef.current) {
@@ -1162,6 +1216,7 @@ export function useAgentSession(
             streamingTextRef.current = '';
             reasoningSummariesRef.current = [];
             lastReasoningSummaryRef.current = '';
+            reasoningTextAccRef.current = '';
             currentToolsRef.current = [];
             recentCompletedToolsRef.current = [];
             lastCompactionSummaryRef.current = '';
@@ -1182,9 +1237,11 @@ export function useAgentSession(
           }
 
           case 'error':
-            setError(event.error);
             setLiveTurnPerf(null);
             if (/retrying in|retrying turn|compacted history and retrying/i.test(event.error)) {
+              // Live yellow retryNotice only. setError() is the red header chrome
+              // and must not pin a snapshot of an in-flight retry (stalled 27s)
+              // after the provider has already recovered.
               setProcessingLabel('Retrying...');
               providerWaitNoticeActiveRef.current = true;
               setRetryNotice(`↻ ${event.error}`);
@@ -1207,6 +1264,7 @@ export function useAgentSession(
               });
               appendSystemEntry(`↻ ${event.error}`);
             } else {
+              setError(event.error);
               appendSystemEntry(`✗ ${event.error}`);
               // Settle any tools still marked 'running': a terminal turn error
               // means no tool_complete will ever arrive for them, and the
@@ -1292,6 +1350,7 @@ export function useAgentSession(
             streamingTextRef.current = '';
             reasoningSummariesRef.current = [];
             lastReasoningSummaryRef.current = '';
+            reasoningTextAccRef.current = '';
             currentToolsRef.current = [];
             recentCompletedToolsRef.current = [];
             lastCompactionSummaryRef.current = '';
@@ -1342,6 +1401,7 @@ export function useAgentSession(
         streamingTextRef.current = '';
         reasoningSummariesRef.current = [];
         lastReasoningSummaryRef.current = '';
+        reasoningTextAccRef.current = '';
         currentToolsRef.current = [];
         recentCompletedToolsRef.current = [];
         lastCompactionSummaryRef.current = '';
@@ -1412,6 +1472,7 @@ export function useAgentSession(
         streamingTextRef.current = '';
         reasoningSummariesRef.current = [];
         lastReasoningSummaryRef.current = '';
+        reasoningTextAccRef.current = '';
         setStalledMs(0);
         lastAgentEventAtRef.current = 0;
         setProcessingLabel(null);
@@ -1454,8 +1515,26 @@ export function useAgentSession(
     }
     const tick = () => {
       if (isProcessing) {
+        // SCLI-522: while the provider's header-wait keepalives are still
+        // arriving, the banner belongs to the direct writers — HOLD it. The
+        // idle clock deliberately does not refresh on keepalives (SCLI-388),
+        // so clearing on `idleMs < STALL_WARN_MS` here erased the direct
+        // writers' 30s card within a second of every keepalive: the card was
+        // visible ~0.1s in 300s on the cortex/ollama lanes (QA reconfirmation
+        // 2026-09-14). Fall back to the idle clock as soon as keepalives stop,
+        // so a hung or fake keepalive stream still escalates via STALL_WARN_MS.
+        const waitFresh = providerWaitActiveRef.current
+          && Date.now() - lastProviderWaitAtRef.current < PROVIDER_WAIT_FRESH_MS;
         const idleMs = Date.now() - lastAgentEventAtRef.current;
-        const nextStall = longWaitDisplayMs(idleMs, STALL_WARN_MS);
+        // A long-running tool (bash watch, kubectl wait) produces no agent
+        // events, so the idle clock used to paint "Long provider wait" on top
+        // of "Running bash 8m" after a recovered 429 (shizuha1, 2026-09-16).
+        const toolsRunning = currentToolsRef.current.some((tool) => tool.status === 'running');
+        const nextStall = toolsRunning
+          ? 0
+          : waitFresh
+            ? Math.max(stalledMsRef.current, longWaitDisplayMs(idleMs, STALL_WARN_MS))
+            : longWaitDisplayMs(idleMs, STALL_WARN_MS);
         // The idle watchdog is the ONLY authority that CLEARS the stall banner.
         // Direct writers (provider_status request_wait/stall_timeout handlers)
         // set positive stalledMs AND sync prevStalledRef. Reconcile against the
@@ -1538,6 +1617,7 @@ export function useAgentSession(
     streamingTextRef.current = '';
     reasoningSummariesRef.current = [];
     lastReasoningSummaryRef.current = '';
+    reasoningTextAccRef.current = '';
     currentToolsRef.current = [];
     recentCompletedToolsRef.current = [];
     lastCompactionSummaryRef.current = '';
@@ -1586,6 +1666,7 @@ export function useAgentSession(
       streamingTextRef.current = '';
       reasoningSummariesRef.current = [];
       lastReasoningSummaryRef.current = '';
+      reasoningTextAccRef.current = '';
       setTotalInputTokens(0);
       setTotalOutputTokens(0);
       setTurnCount(0);
@@ -1627,6 +1708,7 @@ export function useAgentSession(
     streamingTextRef.current = '';
     reasoningSummariesRef.current = [];
     lastReasoningSummaryRef.current = '';
+    reasoningTextAccRef.current = '';
     recentCompletedToolsRef.current = [];
     lastCompactionSummaryRef.current = '';
     stallAnnouncedRef.current = false;
@@ -1660,6 +1742,7 @@ export function useAgentSession(
       streamingTextRef.current = '';
       reasoningSummariesRef.current = [];
       lastReasoningSummaryRef.current = '';
+      reasoningTextAccRef.current = '';
       currentToolsRef.current = [];
       recentCompletedToolsRef.current = [];
       lastCompactionSummaryRef.current = '';
@@ -1698,6 +1781,7 @@ export function useAgentSession(
     streamingTextRef.current = '';
     reasoningSummariesRef.current = [];
     lastReasoningSummaryRef.current = '';
+    reasoningTextAccRef.current = '';
     currentToolsRef.current = [];
     recentCompletedToolsRef.current = [];
     lastCompactionSummaryRef.current = '';
@@ -1731,6 +1815,7 @@ export function useAgentSession(
         streamingTextRef.current = '';
         reasoningSummariesRef.current = [];
         lastReasoningSummaryRef.current = '';
+        reasoningTextAccRef.current = '';
         recentCompletedToolsRef.current = [];
         lastCompactionSummaryRef.current = '';
         clearQueueState();
@@ -1759,6 +1844,7 @@ export function useAgentSession(
     streamingTextRef.current = '';
     reasoningSummariesRef.current = [];
     lastReasoningSummaryRef.current = '';
+    reasoningTextAccRef.current = '';
     recentCompletedToolsRef.current = [];
     lastCompactionSummaryRef.current = '';
     clearQueueState();
@@ -1822,6 +1908,7 @@ export function useAgentSession(
     streamingTextRef.current = '';
     reasoningSummariesRef.current = [];
     lastReasoningSummaryRef.current = '';
+    reasoningTextAccRef.current = '';
     currentToolsRef.current = [];
     recentCompletedToolsRef.current = [];
     lastCompactionSummaryRef.current = '';
@@ -1841,6 +1928,14 @@ export function useAgentSession(
   const listMCPToolsFn = useCallback(async (): Promise<Array<{ name: string; description: string }>> => {
     return sessionRef.current?.listMCPTools() ?? [];
   }, []);
+  const listMcpServersFn = useCallback(() => sessionRef.current?.listMcpServers() ?? [], []);
+  const setMcpServerEnabledFn = useCallback(
+    async (name: string, enabled: boolean) => {
+      if (!sessionRef.current) return { ok: false, message: 'MCP manager not ready' };
+      return sessionRef.current.setMcpServerEnabled(name, enabled);
+    },
+    [],
+  );
 
   const setThinkingLevelFn = useCallback((level: string) => {
     sessionRef.current?.setThinkingLevel(level);
@@ -1964,6 +2059,7 @@ export function useAgentSession(
     compact, interrupt, listSessions, resumeSession, newSession,
     availableModels, availableProviders: availableProvidersList,
     renameSession: renameSessionFn, forkSession: forkSessionFn, listMCPTools: listMCPToolsFn,
+    listMcpServers: listMcpServersFn, setMcpServerEnabled: setMcpServerEnabledFn,
     addTranscriptEntry, submitWithImage,
     setThinkingLevel: setThinkingLevelFn, setReasoningEffort: setReasoningEffortFn, setFastMode: setFastModeFn,
     deleteSession: deleteSessionFn, configureAuth, codexDeviceAuthDone, consumeAutoShowModelPicker,

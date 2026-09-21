@@ -3,6 +3,8 @@ from pathlib import Path
 import json
 import unittest
 
+from tests.ci.test_runtime_release_concurrency import RuntimeReleaseConcurrencyTests
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".forgejo" / "workflows" / "build-agent-runtime.yml"
 LOCK = ROOT / "runtime-skills.lock"
@@ -31,6 +33,21 @@ class AgentRuntimeWorkflowParityTests(unittest.TestCase):
             '[ -n "$OPENCLAW_VER" ] || OPENCLAW_VER="$(npm_latest \'openclaw\')"',
         ):
             self.assertIn(assignment, text)
+        # Last smoked multi-arch is the overlay rootfs. Source-only SCLI must
+        # not fall through to full Kaniko just because npm latest drifted.
+        self.assertIn('Last smoked multi-arch: harness-202609110337-f1f8d87', text)
+        self.assertIn(
+            'OVERLAY_BASE_INDEX_DIGEST="sha256:f9a64b8169408c9128f0da3d2e7df2fc58cb6ea9185009a0fc92d6fb9ec02730"',
+            text,
+        )
+        self.assertIn(
+            'OVERLAY_BASE_SOURCE_SHA="f1f8d87674bd27652a2d9d96bc4a5973b4d5dbd8"',
+            text,
+        )
+        self.assertIn(
+            'pinning harness to last smoked overlay base (npm latest drifted)',
+            text,
+        )
         # Antigravity CLI is a native binary — never installed from npm gemini-cli.
         self.assertIn('ANTIGRAVITY_VER', text)
         self.assertIn('antigravity-cli-auto-updater', text)
@@ -113,13 +130,15 @@ class AgentRuntimeWorkflowParityTests(unittest.TestCase):
         self.assertIn('select(.metadata.labels["shizuha.io/disk-class"] != "small")', text)
         self.assertIn("activeDeadlineSeconds: 900", text)
 
-    def test_legacy_orphan_cleanup_is_exact_and_live_coalescer_gated(self):
+    def test_legacy_orphan_cleanup_is_exact_and_native_authority_gated(self):
         text = WORKFLOW.read_text()
-        cleanup = text.index('live_coalescer="$(kubectl exec')
+        cleanup = text.index('python3 scripts/verify-runtime-release-concurrency.py')
         fence = text.index("wait_for_prior_runtime_release_jobs()")
         section = text[cleanup:fence]
 
-        self.assertIn('"build-agent-runtime.yml"', section)
+        self.assertIn('--run-id "$ORIGIN_RUN_ID" --source-sha "$SOURCE_SHA"', section)
+        self.assertIn('--source-ref "refs/heads/${SOURCE_BRANCH}"', section)
+        self.assertIn('--repository shizuha-labs/shizuha-beta', section)
         self.assertIn(
             "^ci-build-agentrt-harness-[0-9]{12}-[0-9a-f]{7}-(amd64|arm64)$",
             section,
@@ -128,16 +147,8 @@ class AgentRuntimeWorkflowParityTests(unittest.TestCase):
         self.assertIn("kubectl logs", section)
         self.assertIn('kubectl delete job -n build "$legacy_job" --wait=true', section)
         self.assertNotIn("candidate-", section)
-        self.assertIn('-l app=run-coalescer -o json', text)
-        self.assertIn('select(.status.phase == "Running")', text)
-        self.assertIn('sort_by(.metadata.name)', text)
-        self.assertIn(
-            'kubectl exec -n origin "$live_coalescer_pod"', text
-        )
-        self.assertNotIn(
-            'kubectl exec -n origin deployment/run-coalescer', text
-        )
-        self.assertNotIn("cat /app/server.py' 2>/dev/null || true", text)
+        self.assertIn("      - 'scripts/verify-runtime-release-concurrency.py'", text)
+        self.assertNotIn("live_coalescer", text)
 
     def test_browser_payload_uses_qualified_internal_donor(self):
         text = DOCKERFILE.read_text()
@@ -145,7 +156,16 @@ class AgentRuntimeWorkflowParityTests(unittest.TestCase):
 
         self.assertIn(
             "registry.registry.svc.cluster.local:5000/shizuha-agent-runtime@"
-            "sha256:a1c8a4935fd098217f52926505b08e050ffdd230e6a32f01222fe5774a76d4f5 "
+            # Qualified donor advanced 2026-09-19 (PLAT-9231): the prior donor
+            # index digest 02137f09… was garbage-collected from the registry
+            # (PLAT-9225 loss class; build run 6752 on 35316466
+            # MANIFEST_UNKNOWN, both attempts), so the Dockerfile base moved to
+            # the live harness-202609170222-58dba8c index digest. The
+            # in-Dockerfile post-COPY assertions (chromium-1208 /
+            # chromium_headless_shell-1208 / ffmpeg-1011) remain the payload
+            # qualification; the donor was built from beta master 58dba8c with
+            # the same playwright 1.58.2 lockfile.
+            "sha256:f11a905ba5998ea7072b787bf961abf88ec7b8e801a64e595529d308e8df761e "
             "AS playwright-donor",
             text,
         )

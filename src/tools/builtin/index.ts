@@ -15,6 +15,7 @@ import { todoWriteTool, todoReadTool } from './todo.js';
 import { enterPlanModeTool, exitPlanModeTool } from './plan-mode.js';
 import { taskOutputTool } from './task-output.js';
 import { taskStopTool } from './task-stop.js';
+import { waitTasksTool } from './wait-tasks.js';
 import { scheduleJobTool, listJobsTool, removeJobTool, configureHeartbeatTool } from './cron.js';
 import { memoryTool, memoryStoreTool, memorySearchTool, memoryListTool, memoryForgetTool } from './memory.js';
 import { textToSpeechTool } from './text-to-speech.js';
@@ -56,6 +57,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register(exitPlanModeTool);
   registry.register(taskOutputTool);
   registry.register(taskStopTool);
+  registry.register(waitTasksTool);
   const platformLinked = process.env['PLATFORM_PULSE_CONNECTED'] === '1';
   if (!platformLinked) {
     registry.register(scheduleJobTool);

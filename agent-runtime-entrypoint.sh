@@ -14,6 +14,11 @@ if [ "$(id -u)" = "0" ]; then
   printf '[global]\nindex-url = http://%s:30511/simple/\ntrusted-host = %s\n' "$PACKAGE_CACHE_HOST" "$PACKAGE_CACHE_HOST" > /etc/pip.conf 2>/dev/null || true
 fi
 export NPM_CONFIG_REGISTRY="${NPM_CONFIG_REGISTRY:-http://${PACKAGE_CACHE_HOST}:30512/}"
+# SCLI-6xx: mirror the SCLI activity log to stdout so alloy/Loki captures it
+# permanently — the in-pod shizuha.log dies at hibernation, and the
+# agent-log-inspection line-by-line doctrine needs evidence for hibernated
+# seats too. Lines are stamped src="scli" for Loki isolation.
+export SCLI_LOG_STDOUT_MIRROR="${SCLI_LOG_STDOUT_MIRROR:-1}"
 export PIP_INDEX_URL="${PIP_INDEX_URL:-http://${PACKAGE_CACHE_HOST}:30511/simple/}"
 export PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-$PACKAGE_CACHE_HOST}"
 
@@ -87,7 +92,17 @@ args=(
 )
 [ -n "${MODEL:-}" ]          && args+=(--model "$MODEL")
 [ -n "${EFFORT:-}" ]         && args+=(--effort "$EFFORT")
-[ -n "${CONTEXT_PROMPT:-}" ] && args+=(--context-prompt "$CONTEXT_PROMPT")
+if [ -n "${CONTEXT_PROMPT:-}" ]; then
+  # Hive context is a document, not the CLI's bounded single-line option.
+  # Keep its bytes out of argv and use the regular-file transport supported by
+  # every bridge. The private file lives for this container's lifetime; a
+  # failed write/exec cleans it up and must never fall back to inline content.
+  context_prompt_dir="$(mktemp -d "${TMPDIR:-/tmp}/shizuha-context.XXXXXX")"
+  context_prompt_file="$context_prompt_dir/prompt"
+  trap 'rm -f -- "$context_prompt_file"; rmdir -- "$context_prompt_dir"' EXIT
+  (umask 077; printf '%s' "$CONTEXT_PROMPT" > "$context_prompt_file")
+  args+=(--context-prompt-file "$context_prompt_file")
+fi
 
 echo "[entrypoint] method-selected command=${COMMAND} model=${MODEL:-none} effort=${EFFORT:-none}"
 exec node "$DIST" "${args[@]}"

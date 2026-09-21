@@ -38,8 +38,11 @@ raise SystemExit(namespace["main"](argv))
 
 
 def render(args: argparse.Namespace) -> dict:
+    # Native smoke has already proved this exact child (including Python).
+    # Full-build fallback must not depend on the optional overlay base still
+    # existing. The child is architecture-specific until this Job makes the index.
     runtime_image = (
-        f"localhost:30500/{args.image_repo}@{args.base_index_digest}"
+        f"localhost:30500/{args.image_repo}@{args.amd64_digest}"
     )
     return {
         "apiVersion": "batch/v1",
@@ -56,6 +59,22 @@ def render(args: argparse.Namespace) -> dict:
             "template": {
                 "spec": {
                     "restartPolicy": "Never",
+                    "nodeSelector": {"kubernetes.io/arch": "amd64"},
+                    # The exact amd64 child needs the same worker admission
+                    # used by native smoke. Operator holds remain untolerated.
+                    "tolerations": [{
+                        "key": "node.shizuha/workstation",
+                        "operator": "Exists",
+                        "effect": "NoSchedule",
+                    }],
+                    "affinity": {"nodeAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": {
+                            "nodeSelectorTerms": [{"matchExpressions": [{
+                                "key": "node-role.kubernetes.io/control-plane",
+                                "operator": "DoesNotExist",
+                            }]}],
+                        },
+                    }},
                     "initContainers": [
                         {
                             "name": "crane-bin",
@@ -95,7 +114,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--candidate-tag", required=True)
     result.add_argument("--tag", required=True)
     result.add_argument("--image-repo", required=True)
-    result.add_argument("--base-index-digest", required=True)
     result.add_argument("--amd64-digest", required=True)
     result.add_argument("--arm64-digest", required=True)
     return result
