@@ -19,7 +19,6 @@ import type { AgentConfig } from './agent/types.js';
 import type { AgentEvent } from './events/types.js';
 import type { Message } from './agent/types.js';
 import {
-  AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
   incompleteTurnError,
   MAX_THINKING_ONLY_RECOVERY,
   shouldContinueAutonomousMaxTokens,
@@ -78,9 +77,15 @@ export async function* runAgentWithPrompt(
     model = providerReg.resolveAutoModel();
   }
 
+  // SCLI-623: resolveWithModel() returns BOTH the provider and the canonical
+  // (prefix-stripped) model name — resolve() alone keeps a provider-prefixed
+  // spec (e.g. `openai:DeepSeek-V4-Flash`) on `model`, which is then sent
+  // verbatim to the upstream API. Mirror agent-process.ts.
   let provider;
   try {
-    provider = providerReg.resolve(model);
+    const resolved = providerReg.resolveWithModel(model);
+    provider = resolved.provider;
+    model = resolved.resolvedModel;
   } catch (err) {
     yield { type: 'error', error: (err as Error).message, timestamp: Date.now() };
     return;
@@ -454,13 +459,6 @@ export async function* runAgentWithPrompt(
           outputTokens: result.outputTokens,
         })) {
           thinkingOnlyRecoveryCount++;
-          const continueMsg: Message = {
-            role: 'user',
-            content: AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
-            timestamp: Date.now(),
-          };
-          messages.push(continueMsg);
-          store.appendMessage(session.id, continueMsg);
           continue;
         }
         const incompleteError = incompleteTurnError(result.stopReason);

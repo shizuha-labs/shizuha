@@ -48,6 +48,55 @@ describe('cortexClientHeaders', () => {
     expect(cortexClientHeaders()['X-Cortex-Client-Kind']).toBe('bench-harness');
   });
 
+  it('classifies exec even when the prompt contains up/daemon', () => {
+    const orig = process.argv;
+    process.argv = [
+      'node',
+      '/opt/shizuha/dist/shizuha.js',
+      'exec',
+      '--prompt',
+      'set up a chess daemon up to eight pieces',
+      '--cwd',
+      '/workspace',
+    ];
+    resetCortexClientHeadersCache();
+    try {
+      expect(cortexClientHeaders()['X-Cortex-Client-Kind']).toBe('scli-exec');
+    } finally {
+      process.argv = orig;
+    }
+  });
+
+  it('skips a flag value so a later subcommand still classifies', () => {
+    const orig = process.argv;
+    process.argv = [
+      'node',
+      '/opt/shizuha/dist/shizuha.js',
+      '--cwd',
+      '/workspace',
+      'exec',
+      '--prompt',
+      'hello',
+    ];
+    resetCortexClientHeadersCache();
+    try {
+      expect(cortexClientHeaders()['X-Cortex-Client-Kind']).toBe('scli-exec');
+    } finally {
+      process.argv = orig;
+    }
+  });
+
+  it('classifies up as the daemon, not a prompt word', () => {
+    const orig = process.argv;
+    process.argv = ['node', '/opt/shizuha/dist/shizuha.js', 'up'];
+    resetCortexClientHeadersCache();
+    try {
+      expect(cortexClientHeaders()['X-Cortex-Client-Kind']).toBe('scli-daemon');
+    } finally {
+      process.argv = orig;
+    }
+  });
+
   it('never emits header-breaking characters', () => {
     process.env['SHIZUHA_CLIENT_KIND'] = 'evil\r\nX-Injected: 1';
     resetCortexClientHeadersCache();

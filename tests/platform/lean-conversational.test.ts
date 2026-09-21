@@ -3,6 +3,8 @@ import { SkillRegistry } from '../../src/skills/registry.js';
 import {
   LEAN_CONVERSATIONAL_MCP,
   LEAN_CONVERSATIONAL_MCP_TOOL_NAMES,
+  PULSE_MCP_TOOL,
+  WORK_HEARTBEAT_MCP_TOOL_NAMES,
   connectAutoReplyEnabled,
   isLeanConversationalEnv,
   leanConversationalSkillNames,
@@ -48,9 +50,15 @@ describe('lean conversational seats', () => {
     expect(talkPromptMode({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: '1' })).toBe('minimal');
     expect(talkPromptMode({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: 'none' })).toBe('none');
     expect(talkPromptMode({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: '0' })).toBe('full');
-    expect(connectAutoReplyEnabled(lean)).toBe(true);
+    expect(connectAutoReplyEnabled(lean)).toBe(false);
+    expect(connectAutoReplyEnabled({ ...lean, SHIZUHA_CONNECT_AUTOREPLY: '1' })).toBe(true);
     expect(connectAutoReplyEnabled({ ...lean, SHIZUHA_CONNECT_AUTOREPLY: '0' })).toBe(false);
     expect(connectAutoReplyEnabled({} as NodeJS.ProcessEnv)).toBe(false);
+    expect(connectAutoReplyEnabled({
+      ...lean,
+      MODEL: 'cortex/grok-voice-think-fast-2.0',
+      SHIZUHA_CONNECT_AUTOREPLY: '0',
+    } as NodeJS.ProcessEnv)).toBe(true);
     expect(talkSeatSuppressesTools(lean)).toBe(false);
     expect(talkSeatSuppressesTools({ ...lean, SHIZUHA_TALK_MINIMAL_PROMPT: '1' } as NodeJS.ProcessEnv)).toBe(false);
     expect(talkSeatSuppressesTools({ SHIZUHA_TALK_SUPPRESS_TOOLS: '1' } as NodeJS.ProcessEnv)).toBe(true);
@@ -90,12 +98,24 @@ describe('lean conversational seats', () => {
     expect(names).toContain('mcp__shizuha-pulse__pulse_get_my_tasks');
     expect(names).toContain('mcp__shizuha-pulse__pulse_get_user_tasks');
     expect(names).toContain('mcp__shizuha-pulse__pulse_get_my_alerts');
+    expect(names).toContain('mcp__shizuha-pulse__pulse_get_my_work');
     expect(names).toContain('mcp__shizuha-pulse__pulse_get_task');
     expect(names).toContain('mcp__shizuha-pulse__pulse_execute_transition');
     expect(names).toContain('mcp__shizuha-connect__message_user');
     expect(names).toContain('mcp__shizuha-hive__hive_list_fleet_agents');
     expect(names).toContain('mcp__shizuha-admin__admin_list_teams');
     expect(names).toEqual([...names].sort());
+  });
+
+  it('pre-activates the Pulse tools heartbeat stubs tell the model to call', () => {
+    expect(WORK_HEARTBEAT_MCP_TOOL_NAMES).toEqual([
+      PULSE_MCP_TOOL.getMyWork,
+      PULSE_MCP_TOOL.getTask,
+      PULSE_MCP_TOOL.executeTransition,
+      PULSE_MCP_TOOL.addComment,
+    ]);
+    expect(PULSE_MCP_TOOL.addComment).toBe('mcp__shizuha-pulse__pulse_add_comment');
+    expect(PULSE_MCP_TOOL.addComment).not.toBe('pulse_add_comment');
   });
 
   it('does not rewrite the tool head when a heartbeat names Pulse tools already in the lean set', () => {

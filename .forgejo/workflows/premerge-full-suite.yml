@@ -154,6 +154,26 @@ jobs:
                       - name: EXPECTED_SHA
                         value: "${SOURCE_SHA}"
                     volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                  # TUI tmux e2e is part of the default suite. node:22-bookworm
+                  # has no tmux; a root init copies tmux + linked libs onto the
+                  # shared volume so the non-root fullsuite container can run it.
+                  - name: install-tmux
+                    image: node:22-bookworm
+                    securityContext: { runAsUser: 0, runAsNonRoot: false }
+                    command: ["/bin/bash","-c"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        export DEBIAN_FRONTEND=noninteractive
+                        apt-get update -qq
+                        apt-get install -y -qq --no-install-recommends tmux
+                        mkdir -p /workspace/opt/tmux/bin /workspace/opt/tmux/lib
+                        install -D "\$(command -v tmux)" /workspace/opt/tmux/bin/tmux
+                        ldd "\$(command -v tmux)" | awk '{print \$3}' | grep -E '^/' | while read -r lib; do
+                          install -D "\$lib" "/workspace/opt/tmux/lib/\$(basename "\$lib")"
+                        done
+                        /workspace/opt/tmux/bin/tmux -V
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
                 containers:
                   # PR-authored code executes HERE. Deliberately no kubeconfig and no
                   # secret env — if a future change adds one, that is the review flag.
@@ -164,6 +184,10 @@ jobs:
                     args:
                       - |
                         set -euo pipefail
+                        export PATH="/workspace/opt/tmux/bin:\${PATH}"
+                        export LD_LIBRARY_PATH="/workspace/opt/tmux/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+                        command -v tmux
+                        tmux -V
                         npm config set registry "\${NPM_CONFIG_REGISTRY}"
                         # Fail closed on a wedged registry instead of sitting until
                         # activeDeadline (ALERT-25167: hour-long runs, zero suite logs).
@@ -201,7 +225,7 @@ jobs:
             for pod in $(kubectl -n build get pods -l "job-name=${JOB}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
               echo "--- pod/${pod} describe (tail) ---"
               kubectl -n build describe "pod/${pod}" 2>/dev/null | tail -60
-              for c in git-clone fullsuite; do
+              for c in git-clone install-tmux fullsuite; do
                 echo "--- pod/${pod} logs container=${c} ---"
                 kubectl -n build logs "pod/${pod}" -c "${c}" --tail=200 2>/dev/null
               done

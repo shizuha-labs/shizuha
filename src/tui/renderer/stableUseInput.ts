@@ -21,6 +21,10 @@ import { useEffect, useRef } from 'react';
 import parseKeypress, { nonAlphanumericKeys } from '../parse-keypress.js';
 // @ts-expect-error — Ink internal
 import useStdin from './use-stdin.js';
+// @ts-expect-error — resolved from Ink's hook resolveDir by the esbuild patch
+import { beginInputDispatch } from '../../../../src/tui/renderer/inputDispatch.js';
+// @ts-expect-error — resolved from Ink's hook resolveDir by the esbuild patch
+import { splitStdinChunk } from '../../../../src/tui/renderer/stdinChunkSplit.js';
 
 // Inlined (do not import src/ — this file is loaded with resolveDir =
 // ink/build/hooks). Keep in sync with src/tui/utils/terminalKeys.ts.
@@ -64,10 +68,17 @@ const useInput = (inputHandler: any, options: any = {}) => {
   useEffect(() => {
     setRawMode(true);
 
-    const handleData = (data: string) => {
+    // SCLI-774 dispatch boundary (explicit): ONE dispatch generation per
+    // KEYPRESS event, not per stdin read. A coalesced chunk ('\x1b[BX' =
+    // Down + X) is N logical key events; each gets its own generation so a
+    // subscriber consuming the first (e.g. a pager handling Down) cannot
+    // suppress the trailing bytes for later subscribers. A plain-text chunk
+    // (paste) parses as ONE event and keeps exactly one generation — the
+    // pre-fix semantics for that case are unchanged.
+    const dispatchKeypress = (keypress: any) => {
+      if (isActiveRef.current) beginInputDispatch();
       if (!isActiveRef.current) return;
 
-      const keypress = parseKeypress(data);
       const deleteFlags = classifyTerminalDelete(keypress.sequence ?? '', keypress.name);
 
       const key: Record<string, any> = {
@@ -135,6 +146,20 @@ const useInput = (inputHandler: any, options: any = {}) => {
       // Respect exitOnCtrlC (our app sets it to false, so this always passes)
       if (!(input === 'c' && key.ctrl) || !exitOnCtrlCRef.current) {
         handlerRef.current(input, key);
+      }
+    };
+
+    // SCLI-774: a stdin chunk can coalesce an escape sequence with subsequent
+    // keys ('\x1b[BX' = Down + X). parseKeypress consumes only the FIRST
+    // keypress and — fnKeyRe having no end anchor — reports the WHOLE chunk
+    // as its sequence, so the trailing bytes were mapped into input='' and
+    // silently dropped (SCLI-461 e2e run 6757). Split the chunk into
+    // per-keypress segments and dispatch each through the same pipeline.
+    // Plain-text chunks (no ESC) are one segment — paste semantics preserved.
+    const handleData = (data: string) => {
+      if (!isActiveRef.current) return;
+      for (const segment of splitStdinChunk(data)) {
+        dispatchKeypress(parseKeypress(segment));
       }
     };
 

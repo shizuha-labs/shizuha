@@ -149,6 +149,7 @@ export interface Agent {
   mcpServers: Array<{ name: string; slug: string }>;
   status: 'running' | 'starting' | 'error' | 'stopped' | 'unknown';
   enabled?: boolean;
+  localPort?: number | null;
   pid?: number;
   error?: string;
   // Platform-aligned fields

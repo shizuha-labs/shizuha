@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { scopeGatewayPlatformMcpConfigs } from '../../src/gateway/agent-process.js';
+import { platformMcpServiceGranted, scopeGatewayPlatformMcpConfigs } from '../../src/gateway/agent-process.js';
 import type { MCPServerConfig } from '../../src/agent/types.js';
 
 function multiplexer(services: string[]): MCPServerConfig {
@@ -21,6 +21,13 @@ function multiplexer(services: string[]): MCPServerConfig {
 }
 
 describe('gateway effective MCP scope', () => {
+  it('treats Hive service:org grants as permission for the unscoped service', () => {
+    expect(platformMcpServiceGranted('pulse', ['pulse:komal-soni', 'wiki:personal-3'])).toBe(true);
+    expect(platformMcpServiceGranted('pulse', ['pulse'])).toBe(true);
+    expect(platformMcpServiceGranted('scs', ['pulse:komal-soni'])).toBe(false);
+    expect(platformMcpServiceGranted('id', ['identity:personal-3'])).toBe(false);
+  });
+
   it('keeps the PLAT-3119 multiplexer and scopes its embedded services', () => {
     const result = scopeGatewayPlatformMcpConfigs(
       [multiplexer(['pulse', 'id', 'admin', 'notes', 'wiki', 'drive', 'hive', 'connect'])],
@@ -50,6 +57,53 @@ describe('gateway effective MCP scope', () => {
       'shizuha-pulse', 'customer-tools',
     ]);
     expect(result.dropped).toEqual(['shizuha-books']);
+  });
+
+  it('keeps unscoped shizuha-pulse when Hive grants pulse:org (Sato 2026-08-18)', () => {
+    const result = scopeGatewayPlatformMcpConfigs([
+      { name: 'shizuha-pulse', transport: 'stdio', command: 'pulse' },
+      { name: 'shizuha-books', transport: 'stdio', command: 'books' },
+      { name: 'shizuha-scs', transport: 'stdio', command: 'scs' },
+      { name: 'customer-tools', transport: 'stdio', command: 'custom' },
+    ], new Set([
+      'admin:komal-soni',
+      'books:komal-soni',
+      'books:personal-3',
+      'connect:komal-soni',
+      'pulse:komal-soni',
+      'pulse:personal-3',
+      'wiki:komal-soni',
+    ]));
+
+    expect(result.configs.map((config) => config.name)).toEqual([
+      'shizuha-pulse', 'shizuha-books', 'customer-tools',
+    ]);
+    expect(result.dropped).toEqual(['shizuha-scs']);
+  });
+
+  it('does not treat a longer service name as a grant prefix', () => {
+    const result = scopeGatewayPlatformMcpConfigs([
+      { name: 'shizuha-id', transport: 'stdio', command: 'id' },
+      { name: 'shizuha-identity', transport: 'stdio', command: 'identity' },
+    ], new Set(['id:personal-3']));
+
+    expect(result.configs.map((config) => config.name)).toEqual(['shizuha-id']);
+    expect(result.dropped).toEqual(['shizuha-identity']);
+  });
+
+  it('scopes multiplexer embeds against service:org grants', () => {
+    const result = scopeGatewayPlatformMcpConfigs(
+      [multiplexer(['pulse', 'id', 'admin', 'notes', 'wiki', 'drive', 'hive', 'connect'])],
+      new Set(['pulse:komal-soni', 'wiki:personal-3', 'connect:komal-soni']),
+    );
+
+    expect(result.configs).toHaveLength(1);
+    const args = result.configs[0]?.args ?? [];
+    const services = JSON.parse(args[args.indexOf('--services') + 1]!) as Array<{ name: string }>;
+    expect(services.map((service) => service.name)).toEqual(['pulse', 'wiki', 'connect']);
+    expect(result.dropped).toEqual([
+      'shizuha-id', 'shizuha-admin', 'shizuha-notes', 'shizuha-drive', 'shizuha-hive',
+    ]);
   });
 
   it('fails a malformed multiplexer closed', () => {

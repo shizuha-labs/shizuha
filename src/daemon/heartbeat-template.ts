@@ -75,6 +75,45 @@ export function seedHeartbeatTemplate(workspaceDir: string): void {
   }
 }
 
+/** Canonical checklist names the combined Pulse inbox. Aoi 2026-09-10 wrote an
+ *  8-line "report status" HEARTBEAT.md that never mentions a Pulse fetch; she
+ *  is the only live seat with that file. Operator customizations that name
+ *  `pulse_get_my_work` or the older alerts+tasks pair are left alone. */
+export function heartbeatTemplateHasMandatoryPulsePair(text: string): boolean {
+  if (/pulse_get_my_work/i.test(text)) return true;
+  return /pulse_get_my_alerts/i.test(text) && /pulse_get_my_tasks/i.test(text);
+}
+
+export function isStaleHeartbeatTemplate(text: string): boolean {
+  if (heartbeatTemplateHasMandatoryPulsePair(text)) return false;
+  return true;
+}
+
+export type HeartbeatTemplateUpgradeResult = 'upgraded' | 'kept' | 'absent' | 'skipped';
+
+/**
+ * Replace a workspace HEARTBEAT.md that omits the mandatory Pulse pair.
+ * Does not create the file when absent (other seats work without one) and
+ * never follows a symlink/FIFO. Gateway boot calls this so a model-written
+ * checklist cannot keep telling the seat to "report status" instead of
+ * calling get_my_tasks.
+ */
+export function upgradeStaleHeartbeatTemplate(workspaceDir: string): HeartbeatTemplateUpgradeResult {
+  const target = path.join(workspaceDir, HEARTBEAT_FILENAME);
+  try {
+    const st = fs.lstatSync(target);
+    if (!st.isFile() || st.isSymbolicLink()) return 'skipped';
+    const current = fs.readFileSync(target, 'utf-8');
+    if (!isStaleHeartbeatTemplate(current)) return 'kept';
+    writeFileAtomic(target, getHeartbeatTemplate());
+    return 'upgraded';
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    console.error(`[heartbeat-template] stale upgrade failed for ${workspaceDir}:`, err);
+    return 'skipped';
+  }
+}
+
 function statKind(stats: fs.Stats): string {
   if (stats.isSymbolicLink()) return 'symlink';
   if (stats.isFIFO()) return 'FIFO';

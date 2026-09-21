@@ -267,7 +267,7 @@ export function getPlatformMcpConfigs(opts: PlatformMcpConfigOptions): Record<st
   // services as a JSON env var and routes tool calls by name prefix.
   if (useMultiplexer && launcher) {
     const services = PLATFORM_MCP_SERVICES
-      .filter((svc) => !allow || allow.has(svc.name))
+      .filter((svc) => !allow || allowListGrantsService(allow, svc.name))
       .map((svc) => {
         const url = isLocalHost
           ? `http://${mcpHost}:${svc.port}/mcp`
@@ -294,7 +294,8 @@ export function getPlatformMcpConfigs(opts: PlatformMcpConfigOptions): Record<st
           '--services', JSON.stringify(services),
         ],
         env: {
-          MCP_UPSTREAM_BEARER: opts.bearerToken,
+          // A persistent config file must never carry the bearer inline. The
+          // broker/token file is refreshed out-of-band and re-read per dial.
           ...(opts.bearerTokenFile ? { MCP_UPSTREAM_BEARER_FILE: opts.bearerTokenFile } : {}),
           ...(organizationId ? { MCP_UPSTREAM_ORG: organizationId } : {}),
         },
@@ -304,7 +305,7 @@ export function getPlatformMcpConfigs(opts: PlatformMcpConfigOptions): Record<st
   }
 
   for (const svc of PLATFORM_MCP_SERVICES) {
-    if (allow && !allow.has(svc.name)) continue;
+    if (allow && !allowListGrantsService(allow, svc.name)) continue;
     const url = isLocalHost
       ? `http://${mcpHost}:${svc.port}/mcp`
       : `${platformUrl || `https://${mcpHost}`}/mcp/${svc.name}/mcp`;
@@ -339,6 +340,57 @@ export function getPlatformMcpConfigs(opts: PlatformMcpConfigOptions): Record<st
     };
   }
   return configs;
+}
+
+
+/**
+ * Convert `getPlatformMcpConfigs()` output into harness MCPServerConfig
+ * entries. HTTP entries map to streamable-http; stdio command entries (the
+ * PLAT-3119 `shizuha-mcp` multiplexer, or explicit stdio-proxy entries) map to
+ * the stdio transport the MCPManager spawns directly.
+ *
+ * PLAT-4013: the PLAT-3195 env-derivation fallback used to admit `url`-bearing
+ * entries ONLY, so a seat that relies on derivation (no provisioned
+ * ~/.mcp.json, no agentCfg mcp.servers) booted with ZERO MCP servers when
+ * SHIZUHA_MCP_MULTIPLEXER=true — the single stdio `shizuha-mcp` entry was
+ * silently dropped by the url-only filter (staged canary agent-hina, 09-17:
+ * flag live at every layer, yet the whole MCP surface empty). The
+ * agent-process stdio-proxy routing leaves `transport: 'stdio'` entries
+ * untouched and the access-matrix scope special-cases `shizuha-mcp`, so a
+ * stdio multiplexer entry flows through both unchanged.
+ */
+export interface PlatformDerivedServerConfig {
+  name: string;
+  transport: 'stdio' | 'streamable-http';
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  platformManaged: true;
+}
+
+export function platformMcpEntriesToConfigs(
+  derived: Record<string, McpServerEntry>,
+): PlatformDerivedServerConfig[] {
+  // The callback's return type is annotated: an inferred flatMap over a union
+  // of differently-shaped arrays ({http}[] | {stdio}[]) makes TS infer U from
+  // the first member and reject the second (TS2322 at this return, run 6596).
+  return Object.entries(derived).flatMap(([name, entry]): PlatformDerivedServerConfig[] =>
+    ('url' in entry ? [{
+      name,
+      transport: 'streamable-http' as const,
+      url: entry.url,
+      headers: { ...entry.headers },
+      platformManaged: true as const,
+    }] : ('command' in entry ? [{
+      name,
+      transport: 'stdio' as const,
+      command: entry.command,
+      args: [...entry.args],
+      env: { ...entry.env },
+      platformManaged: true as const,
+    }] : [])));
 }
 
 /**
@@ -409,6 +461,26 @@ export function resolveMcpAllowList(explicit?: string[]): Set<string> | null {
     return new Set([...roleSet].filter((s) => envSet.has(s)));
   }
   return roleSet ?? envSet ?? null;
+}
+
+/**
+ * Hive tenant grants are `pulse:shizuha-digital` (service:org). Platform
+ * registry names stay bare `pulse`. Exact `Set.has(svc.name)` dropped every
+ * derived server for Digital/Trading seats (Reo 2026-09-16: SHIZUHA_MCP_SERVICES
+ * set, zero MCP connected, wrap-up heartbeats, needs_help no Pulse snapshot).
+ *
+ * A grant matches the unscoped service when it is the bare name or any
+ * `service:scope` suffix. `id` does not match `identity:…`.
+ */
+export function allowListGrantsService(allow: Iterable<string>, serviceName: string): boolean {
+  const name = serviceName.trim();
+  if (!name) return false;
+  for (const raw of allow) {
+    const entry = String(raw || '').trim();
+    if (!entry) continue;
+    if (entry === name || entry.startsWith(`${name}:`)) return true;
+  }
+  return false;
 }
 
 /**

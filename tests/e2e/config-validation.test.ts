@@ -464,6 +464,9 @@ describe('Tool Registry Completeness', () => {
     // GAP D: Agent control
     pause_agent:       { riskLevel: 'medium', readOnly: false },
     resume_agent:      { riskLevel: 'medium', readOnly: false },
+    // SCLI-688: agent-callable WaitTasks tool (wait_any/wait_all surface).
+    // Read-only: it only polls task state, never mutates it.
+    WaitTasks:         { riskLevel: 'low',    readOnly: true },
   };
 
   const EXPECTED_TOOL_NAMES = Object.keys(EXPECTED_TOOLS);

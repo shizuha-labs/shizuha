@@ -175,6 +175,19 @@ describe('isCortexModelId (CTX-67)', () => {
     expect(isCortexModelId('xai/not-a-grok')).toBe(false);
   });
 
+  it('routes OpenCode Zen free ids through Cortex, not Ollama', () => {
+    for (const id of [
+      'big-pickle',
+      'cortex/big-pickle',
+      'opencode/deepseek-v4-flash-free',
+      'hy3-free',
+      'nemotron-3.5-lightning-free',
+      'laguna-s-2.1-free',
+    ]) {
+      expect(isCortexModelId(id)).toBe(true);
+    }
+  });
+
   it('routes Cortex Grok aliases (incl. xai/ prefix) to cortex, not ollama/xai slash', () => {
     const config = {
       providers: {

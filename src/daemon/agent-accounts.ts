@@ -25,6 +25,28 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { logger } from '../utils/logger.js';
 
+/** PLAT-7787: last ensureAgentAccount fail-closed outcome (consumed by the spawn retry loop). */
+export type EnsureAgentAccountDiag = {
+  agent: string;
+  phase: string;
+  kind?: string;
+  reason?: string;
+  status?: number;
+};
+
+let lastEnsureAgentAccountDiag: EnsureAgentAccountDiag | null = null;
+
+export function consumeEnsureAgentAccountDiag(): EnsureAgentAccountDiag | null {
+  const diag = lastEnsureAgentAccountDiag;
+  lastEnsureAgentAccountDiag = null;
+  return diag;
+}
+
+function noteEnsureFail(diag: EnsureAgentAccountDiag): null {
+  lastEnsureAgentAccountDiag = diag;
+  return null;
+}
+
 /**
  * Resolve a shizuha-id URL for an app path (given WITHOUT the public `/id`
  * ingress prefix, e.g. `api/auth/login/`).
@@ -422,7 +444,13 @@ export async function ensureAgentAccount(opts: {
         },
         'Agent account: canonical login is not a confirmed credential mismatch — failing closed without credential reconciliation (PLAT-4573)',
       );
-      return null;
+      return noteEnsureFail({
+        agent: agentUsername,
+        phase: 'canonical_login_fail_closed',
+        kind: canonicalLogin.kind,
+        reason: canonicalLogin.reason,
+        status: canonicalLogin.status,
+      });
     }
 
     // PLAT-3997: the canonical (k8s Secret-injected) AGENT_PASSWORD received a
@@ -482,6 +510,12 @@ export async function ensureAgentAccount(opts: {
       { agent: agentUsername, userId: driftedUserId, hasFleetToken: !!fleetProvisionerToken() },
       'Agent account: FULLY-DRIFTED account could NOT self-heal — canonical+cached+legacy logins all failed AND the unconditional admin reconcile failed; agent will thrash until manually reconciled (PLAT-4006/PLAT-1254 fail-loud)',
     );
+    noteEnsureFail({
+      agent: agentUsername,
+      phase: 'fully_drifted_reconcile_failed',
+      kind: 'reconcile-failed',
+      reason: 'admin_set_password_or_login_failed',
+    });
   }
 
   // 1. Cached, fresh token — fast path only when there is no canonical #2 value
@@ -540,7 +574,13 @@ export async function ensureAgentAccount(opts: {
         },
         'Agent account: stored-password login is not a confirmed credential mismatch — failing closed without first-time provisioning (PLAT-4573)',
       );
-      return null;
+      return noteEnsureFail({
+        agent: agentUsername,
+        phase: 'stored_password_fail_closed',
+        kind: result.kind,
+        reason: result.reason,
+        status: result.status,
+      });
     }
     logger.warn({ agent: agentUsername }, 'Agent account: stored password credential mismatch — attempting first-time provision');
   }

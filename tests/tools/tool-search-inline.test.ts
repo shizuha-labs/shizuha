@@ -31,13 +31,14 @@ function freshState(): ToolSearchState {
 }
 
 describe('modelNeedsInlineToolSchemas', () => {
-  it('is true for self-hosted / OpenAI-compatible open models', () => {
-    expect(modelNeedsInlineToolSchemas('cortex/GLM-4.7')).toBe(true);
+  it('is true only for raw self-hosted endpoints without Cortex expansion', () => {
     expect(modelNeedsInlineToolSchemas('vllm/GLM-4.7')).toBe(true);
     expect(modelNeedsInlineToolSchemas('ollama/qwen3.5')).toBe(true);
     expect(modelNeedsInlineToolSchemas('llamacpp/local')).toBe(true);
   });
-  it('is false for hosted frontier providers (server-side expansion handles it)', () => {
+  it('is false for Cortex and hosted providers (server-side tool_reference expansion)', () => {
+    expect(modelNeedsInlineToolSchemas('cortex/GLM-4.7')).toBe(false);
+    expect(modelNeedsInlineToolSchemas('DeepSeek-V4-Flash')).toBe(false);
     expect(modelNeedsInlineToolSchemas('claude-opus-4.6')).toBe(false);
     expect(modelNeedsInlineToolSchemas('gpt-5.5')).toBe(false);
     expect(modelNeedsInlineToolSchemas('')).toBe(false);
@@ -62,6 +63,8 @@ describe('ToolSearch inline-schema mode (Codex-style)', () => {
     const res = await tool.execute({ query: 'pulse workflows', max_results: 3 }, CTX);
     expect(res.content).toContain('Call one of these discovered tools directly');
     expect(res.content).not.toContain('Input JSON Schema');
+    expect(res.content).toContain('"type":"tool_reference"');
+    expect(res.content).toContain('"tool_name":"mcp__shizuha-pulse__pulse_list_workflows"');
   });
 
   it('re-evaluates the inlineSchemas thunk per call (mid-session model switch)', async () => {

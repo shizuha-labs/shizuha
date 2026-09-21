@@ -18,6 +18,7 @@
  * zero state mutation.
  */
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -55,6 +56,21 @@ describe('SCLI-436 provision-agent preflight', () => {
       for (const u of ['nagi', 'qa1', 'agent-x', 'dev_nagi', 'a.b', 'a0']) {
         expect(() => validateProvisionInputs(u, validOpts())).not.toThrow();
       }
+    });
+
+    it('rejects uppercase (non-canonical) usernames BEFORE any state mutation, with a lowercase suggestion (SCLI-691)', () => {
+      for (const u of ['Nagi', 'QA1', 'Agent-X', 'nagiX', 'DEV_nagi']) {
+        let msg = '';
+        expect(() => {
+          try { validateProvisionInputs(u, validOpts()); } catch (err) { msg = (err as Error).message; throw err; }
+        }).toThrow(/provision-agent: username/);
+        // The diagnostic names the canonical form and stays single-line/escaped.
+        expect(msg).toContain(`did you mean '${u.toLowerCase()}'`);
+        expect(msg).not.toMatch(/[\r\n]/);
+        expect(msg).not.toContain('\u001b');
+      }
+      // Mixed-case with otherwise-legal syntax is still rejected by the same gate.
+      expect(() => validateProvisionInputs('aB.c', validOpts())).toThrow(/lowercase-canonical/);
     });
 
     it('rejects empty / whitespace / control / path-traversal usernames', () => {
@@ -158,6 +174,68 @@ describe('SCLI-436 provision-agent preflight', () => {
       const short = describeProvisionValue('a'.repeat(500));
       expect(short.length).toBeLessThan(100);
       expect(short.endsWith('…')).toBe(true);
+    });
+
+    it('never truncates on a dangling JSON escape', () => {
+      const short = describeProvisionValue(`${'a'.repeat(79)}\\tail`);
+      expect(short.endsWith('\\…')).toBe(false);
+      expect(short).not.toMatch(/[\u0000-\u001f\u007f]/);
+    });
+  });
+
+  describe('packaged CLI boundary', () => {
+    const cli = path.resolve('dist/shizuha.js');
+
+    beforeAll(() => {
+      if (!fs.existsSync(cli)) {
+        throw new Error('dist/shizuha.js is required: run npm run build:node before this suite');
+      }
+    });
+
+    function invoke(args: string[]) {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'scli436-cli-home-'));
+      const result = spawnSync(process.execPath, [cli, 'provision-agent', ...args], {
+        encoding: 'buffer',
+        env: { ...process.env, HOME: home, SHIZUHA_PLATFORM_URL: '', SHIZUHA_ADMIN_TOKEN: '' },
+        timeout: 10_000,
+      });
+      const entries = fs.readdirSync(home);
+      fs.rmSync(home, { recursive: true, force: true });
+      return { ...result, entries };
+    }
+
+    it('rejects explicit-empty role instead of applying the absent-option default', () => {
+      const result = invoke([
+        'qa-ok-user', '--role=', '--platform-url', 'http://127.0.0.1:9', '--admin-token', 'dummy',
+      ]);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toHaveLength(0);
+      expect(result.stderr.toString('utf8')).toMatch(/role must be one of.*got ""/);
+      expect(result.stderr.includes(0x1b)).toBe(false);
+      expect(result.entries).toEqual([]);
+    });
+
+    it('rejects control-bearing username before output, network, or HOME mutation', () => {
+      const result = invoke([
+        'evil\nFAKE-LINE', '--role', 'qa', '--platform-url', 'http://127.0.0.1:9', '--admin-token', 'dummy',
+      ]);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toHaveLength(0);
+      const stderr = result.stderr.toString('utf8');
+      expect(stderr).toContain('got "evil\\nFAKE-LINE"');
+      expect(stderr).not.toContain('got "evil\nFAKE-LINE"');
+      expect(result.stderr.includes(0x1b)).toBe(false);
+      expect(result.entries).toEqual([]);
+    });
+
+    it('rejects a non-http platform URL at the real Commander-to-handler boundary', () => {
+      const result = invoke([
+        'qa-ok-user', '--role', 'qa', '--platform-url', 'file:///etc/passwd', '--admin-token', 'dummy',
+      ]);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toHaveLength(0);
+      expect(result.stderr.toString('utf8')).toMatch(/platform URL must use http:\/\/ or https:\/\//);
+      expect(result.entries).toEqual([]);
     });
   });
 

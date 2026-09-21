@@ -149,6 +149,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/token", s.handleToken)
 	mux.HandleFunc("/model-token", s.handleModelToken)
 	mux.HandleFunc("/model-token/report-status", s.handleModelTokenReportStatus)
+	mux.HandleFunc("/mcp-projection", s.handleMCPProjection)
 	mux.HandleFunc("/credential/request", s.handleCredentialRequest)
 	mux.HandleFunc("/upstreams/health", s.handleUpstreamHealth)
 	return mux

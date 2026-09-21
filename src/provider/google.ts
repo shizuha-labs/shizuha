@@ -8,6 +8,27 @@ const MODEL_CONTEXT: Record<string, number> = {
   'gemini-2.0-flash': 1048576,
 };
 
+/**
+ * SCLI-692: the Gemini-style API accepts only an OpenAPI subset in
+ * function declarations — `additionalProperties` (present in our internal
+ * JSON-Schema-style tool schemas) is rejected with a 400
+ * ("Unknown name \"additionalProperties\" ... Cannot find field") for every
+ * declaration, which made the default `shizuha exec` one-shot unusable on
+ * agent seats. Strip the unsupported keyword recursively (it appears at
+ * every nesting level, not just the root) and drop empty constraint objects
+ * it leaves behind.
+ */
+export function toGeminiSchema(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(toGeminiSchema);
+  if (schema === null || typeof schema !== 'object') return schema;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+    if (key === 'additionalProperties' || key === '$schema') continue;
+    out[key] = toGeminiSchema(value);
+  }
+  return out;
+}
+
 function toGoogleContents(messages: ChatMessage[]): Content[] {
   const contents: Content[] = [];
   for (const msg of messages) {
@@ -80,7 +101,7 @@ export class GoogleProvider implements LLMProvider {
             functionDeclarations: options.tools.map((t) => ({
               name: t.name,
               description: t.description,
-              parameters: t.inputSchema,
+              parameters: toGeminiSchema(t.inputSchema),
             })),
           },
         ]

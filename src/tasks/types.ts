@@ -7,7 +7,7 @@
  */
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'killed';
-export type TaskType = 'bash' | 'agent';
+export type TaskType = 'bash' | 'agent' | 'monitor';
 export type TaskNotifyPolicy = 'done_only' | 'state_changes' | 'silent';
 
 export interface BackgroundTask {

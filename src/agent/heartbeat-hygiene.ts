@@ -36,21 +36,44 @@ const DEFAULT_HEARTBEAT_HARD_FRACTION = 0.85;
 /** Absolute fallbacks only when the window is not yet known (pre-discovery). */
 const DEFAULT_HEARTBEAT_SOFT_TOKENS = 30_000;
 const DEFAULT_HEARTBEAT_HARD_TOKENS = 45_000;
+/**
+ * PLAT-9203: bounded ABSOLUTE budgets for eternal (heartbeat) sessions.
+ *
+ * Evidence (ichi's Cortex forensics, agent-aoi 2026-08-27): 726 requests in
+ * 24h at avg 182K prompt tokens, ratcheting 173K→187K — compaction never
+ * engaged. Root cause: with a known window, the soft budget defaulted to
+ * 0.70 × window (≈190K on a 272K model) and the compaction trigger to 0.75 ×
+ * window (≈204K) — the ratchet stabilizes just BELOW both, so an eternal
+ * session re-ships its whole accumulated context every scheduler tick
+ * instead of compacting to a bounded steady-state.
+ *
+ * Default posture (supersedes the fraction default for budget purposes):
+ * soft 120K / hard 160K absolute — compaction engages well below the lane
+ * limit and the summarize-and-trim lands the prompt at a flat steady-state.
+ * `SHIZUHA_HEARTBEAT_CONTEXT_BUDGET_MODE=proportional` restores the legacy
+ * window-fraction behavior. The 2026-08-17 never-skip guarantee is
+ * unaffected: budgets are compaction hints, never an admission gate (the
+ * skip path was removed; loop.ts proceeds on every heartbeat regardless of
+ * budget state).
+ */
+const DEFAULT_HEARTBEAT_ETERNAL_SOFT_TOKENS = 120_000;
+const DEFAULT_HEARTBEAT_ETERNAL_HARD_TOKENS = 160_000;
 
 /**
- * Heartbeat soft/hard budgets for pre-turn compaction / reset gates.
+ * Heartbeat soft/hard budgets are compaction *hints*, never a skip gate.
  *
- * Explicit absolute token settings are operator intent and therefore win over
- * window-derived defaults. This matters for the fleet contract, which already
- * renders 80k/100k pins: silently ignoring them let active sessions grow past
- * 250K and made every cache eviction an interactive multi-minute prefill.
+ * Operator 2026-08-17: even at very high ctx, do not skip heartbeats.
+ * Fleet pods still carry leftover 80k/100k absolute pins next to 0.70/0.85
+ * fractions. When the provider window is known, fractions win — otherwise a
+ * 282k DeepSeek session (524k window) looked over-budget and the gateway
+ * skipped the Pulse turn (live 2/8 admissions).
  *
- * Precedence: explicit absolute token values (or mode=absolute), then window
- * fractions, then the small unknown-window defaults.
- *
- * When the window is unknown, fall back to absolute token env / small defaults.
- * Set `SHIZUHA_HEARTBEAT_CONTEXT_BUDGET_MODE=absolute` to force the legacy
- * absolute token knobs even when a window is known.
+ * PLAT-9203 (2026-09-18): the fraction DEFAULT caused the eternal-session
+ * prompt ratchet (aoi 173K→187K, compaction never engaging below the
+ * window-proportional thresholds). The default is now the bounded absolute
+ * posture (soft 120K / hard 160K); `proportional` opts back into window
+ * fractions. The never-skip guarantee is structural (loop.ts), not a
+ * function of which budget source wins.
  */
 export function heartbeatBudgetConfig(
   maxContextTokens?: number,
@@ -60,13 +83,9 @@ export function heartbeatBudgetConfig(
     ? maxContextTokens
     : 0;
   const mode = String(env.SHIZUHA_HEARTBEAT_CONTEXT_BUDGET_MODE || '').trim().toLowerCase();
-  const forceAbsolute = mode === 'absolute';
-  const hasAbsoluteOverride = Boolean(
-    env.SHIZUHA_HEARTBEAT_CONTEXT_SOFT_TOKENS
-    || env.SHIZUHA_HEARTBEAT_CONTEXT_HARD_TOKENS,
-  );
+  const forceProportional = mode === 'proportional' || mode === 'fraction';
 
-  if (window > 0 && !forceAbsolute && !hasAbsoluteOverride) {
+  if (window > 0 && forceProportional) {
     const softFrac = parseFraction(env.SHIZUHA_HEARTBEAT_CONTEXT_SOFT_FRACTION, DEFAULT_HEARTBEAT_SOFT_FRACTION);
     const hardFrac = parseFraction(env.SHIZUHA_HEARTBEAT_CONTEXT_HARD_FRACTION, DEFAULT_HEARTBEAT_HARD_FRACTION);
     const soft = Math.max(8_000, Math.floor(window * softFrac));
@@ -74,8 +93,13 @@ export function heartbeatBudgetConfig(
     return { softBudgetTokens: soft, hardBudgetTokens: hard };
   }
 
-  const soft = parsePositiveInt(env.SHIZUHA_HEARTBEAT_CONTEXT_SOFT_TOKENS, DEFAULT_HEARTBEAT_SOFT_TOKENS);
-  const hard = parsePositiveInt(env.SHIZUHA_HEARTBEAT_CONTEXT_HARD_TOKENS, DEFAULT_HEARTBEAT_HARD_TOKENS);
+  // Absolute posture (PLAT-9203 default; also the pre-discovery fallback).
+  // Eternal sessions bound at soft 120K / hard 160K regardless of window;
+  // window-less deployments keep the audited 30K/45K fallbacks.
+  const softDefault = window > 0 ? DEFAULT_HEARTBEAT_ETERNAL_SOFT_TOKENS : DEFAULT_HEARTBEAT_SOFT_TOKENS;
+  const hardDefault = window > 0 ? DEFAULT_HEARTBEAT_ETERNAL_HARD_TOKENS : DEFAULT_HEARTBEAT_HARD_TOKENS;
+  const soft = parsePositiveInt(env.SHIZUHA_HEARTBEAT_CONTEXT_SOFT_TOKENS, softDefault);
+  const hard = parsePositiveInt(env.SHIZUHA_HEARTBEAT_CONTEXT_HARD_TOKENS, Math.max(soft, hardDefault));
   return { softBudgetTokens: soft, hardBudgetTokens: Math.max(soft, hard) };
 }
 
@@ -120,9 +144,30 @@ function messageText(message: Message): string {
   }).join('\n');
 }
 
+/**
+ * Optional lean-head helper. Heartbeats must still run at high ctx;
+ * do not use this as a skip substitute.
+ */
+export function keepHeartbeatNudgeOnly(messages: Message[]): Message[] {
+  const last = messages.at(-1);
+  if (!last || last.role !== 'user') return [];
+  if (classifyPromptSource([last]) !== 'heartbeat') return [];
+  return [last];
+}
+
 export function classifyPromptSource(messages: Message[], initialPrompt?: string): PromptSourceKind {
   const lastUser = [...messages].reverse().find((m) => m.role === 'user');
   const prompt = initialPrompt ?? (lastUser ? messageText(lastUser) : '');
+  return classifyPromptText(prompt);
+}
+
+/**
+ * PLAT-9185: classify a raw incoming prompt text (before any session resume
+ * decision). The pipe entrypoint needs this to enforce the runtime lifecycle
+ * invariant — autonomous heartbeat/scheduled turns must start a CLEAN session
+ * and never inherit the predecessor transcript — before `messages` exist.
+ */
+export function classifyPromptText(prompt: string): PromptSourceKind {
   if (/^\s*\[(heartbeat|HEARTBEAT)\]/i.test(prompt) || /^\s*\[Heartbeat\]/.test(prompt)) return 'heartbeat';
   if (/automatic sync|schedule(d)? wakeup|cron/i.test(prompt)) return 'scheduled';
   return prompt ? 'user' : 'unknown';

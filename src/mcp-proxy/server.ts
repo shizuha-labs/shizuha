@@ -82,21 +82,58 @@ export interface McpProxyConfig {
 
 /**
  * Parse repeated `--header "Key: Value"` CLI args into a header map. Also
- * accepts `Key=Value`. Blank / malformed entries are skipped. Exported for
- * tests.
+ * accepts `Key=Value`. Malformed entries (empty key, no separator, or a
+ * field-name with invalid characters) are REJECTED with a bounded diagnostic —
+ * never silently skipped (SCLI-403).
  */
 export function parseExtraHeaders(raw: string[] | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   for (const entry of raw ?? []) {
-    if (!entry) continue;
+    if (!entry || !entry.trim()) continue;
     const sep = entry.indexOf(':') >= 0 ? ':' : (entry.indexOf('=') >= 0 ? '=' : '');
-    if (!sep) continue;
+    if (!sep) {
+      throw new Error(
+        `mcp-proxy: invalid --header ${JSON.stringify(entry)}; expected "Key: Value" (or "Key=Value")`,
+      );
+    }
     const idx = entry.indexOf(sep);
     const key = entry.slice(0, idx).trim();
     const value = entry.slice(idx + 1).trim();
-    if (key) out[key] = value;
+    if (!key || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(key)) {
+      throw new Error(
+        `mcp-proxy: invalid --header ${JSON.stringify(entry)}; expected a non-empty valid HTTP field-name before the separator`,
+      );
+    }
+    out[key] = value;
   }
   return out;
+}
+
+/**
+ * Validate an upstream URL is an absolute http:/https: endpoint (SCLI-403).
+ * Rejects malformed, non-HTTP (file:, javascript:, data:, etc.), and relative
+ * values with a bounded diagnostic. Returns the validated URL string.
+ */
+export function validateUpstreamUrl(raw: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(
+      `mcp-proxy: invalid --upstream-url ${JSON.stringify(raw)}; expected an absolute http:// or https:// endpoint`,
+    );
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      `mcp-proxy: invalid --upstream-url ${JSON.stringify(raw)}; expected an http:// or https:// endpoint (got ${parsed.protocol}//)`,
+    );
+  }
+  if (!parsed.hostname) {
+    throw new Error(
+      `mcp-proxy: invalid --upstream-url ${JSON.stringify(raw)}; expected an absolute http:// or https:// endpoint with a host`,
+    );
+  }
+  return parsed.toString();
 }
 
 /**
@@ -118,7 +155,7 @@ export function resolveProxyConfig(
   if (org && !Object.keys(extraHeaders).some((k) => k.toLowerCase() === 'x-organization-id')) {
     extraHeaders['X-Organization-ID'] = org;
   }
-  return { name, upstreamUrl, extraHeaders };
+  return { name, upstreamUrl: validateUpstreamUrl(upstreamUrl), extraHeaders };
 }
 
 /**
@@ -174,8 +211,12 @@ async function resolveUpstreamBearerFresh(env: NodeJS.ProcessEnv): Promise<strin
 }
 
 /** Build the per-request header set, reading the bearer FRESH (broker > file > env). */
-export async function buildUpstreamHeaders(extraHeaders: Record<string, string>, env: NodeJS.ProcessEnv): Promise<Record<string, string>> {
-  const bearer = await resolveUpstreamBearerFresh(env);
+export async function buildUpstreamHeaders(
+  extraHeaders: Record<string, string>,
+  env: NodeJS.ProcessEnv,
+  bearerResolver: (env: NodeJS.ProcessEnv) => Promise<string> = resolveUpstreamBearerFresh,
+): Promise<Record<string, string>> {
+  const bearer = await bearerResolver(env);
   return {
     ...extraHeaders,
     ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
@@ -228,6 +269,47 @@ function sleep(ms: number): Promise<void> {
     const t = setTimeout(resolve, ms);
     if (typeof t.unref === 'function') t.unref();
   });
+}
+
+/**
+ * PLAT-8689 (framework leg 3): sleep for `ms`, but cut the sleep short as soon
+ * as the upstream answers at the HTTP layer (ANY status — 401/403/404 all prove
+ * the network path and the listener are back; auth/handshake is the next
+ * attempt's job). Polls every BACKOFF_POLL_INTERVAL_MS with a short timeout.
+ * This is the "backoff reset on upstream health-probe success" leg: without it
+ * a wedged reconnect loop stays dark for the full capped delay after the path
+ * heals, because the background liveness tick never runs while `client` is
+ * null. Never rejects; worst case it degrades to a plain sleep.
+ */
+const BACKOFF_POLL_INTERVAL_MS = 5_000;
+const BACKOFF_POLL_TIMEOUT_MS = 2_000;
+
+async function sleepWithUpstreamPoll(upstreamUrl: string, ms: number): Promise<void> {
+  const deadline = Date.now() + ms;
+  let controller: AbortController | null = null;
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+    const wait = Math.min(BACKOFF_POLL_INTERVAL_MS, Math.max(0, remaining));
+    await sleep(wait);
+    if (Date.now() >= deadline) return;
+    controller = new AbortController();
+    const timer = setTimeout(() => controller?.abort(), BACKOFF_POLL_TIMEOUT_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    try {
+      await fetch(upstreamUrl, {
+        method: 'GET',
+        signal: controller.signal,
+        // No auth header on purpose: this is a path-liveness probe, not a
+        // handshake. Any status (401/403/404/406/500) proves the listener.
+      });
+      log(`upstream "${upstreamUrl}" answered at the HTTP layer during backoff — retrying connect immediately`);
+      return;
+    } catch {
+      // still dark (or fetch unsupported) — keep sleeping
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 /**
@@ -341,7 +423,15 @@ export class UpstreamConnection {
         const jitter = base * 0.25 * (2 * Math.random() - 1);
         const delay = Math.max(0, Math.round(base + jitter));
         log(`upstream "${this.config.name}" connect attempt ${attempt} failed: ${(err as Error).message} — retrying in ${delay}ms`);
-        await sleep(delay);
+        // PLAT-8689 (framework leg 3): backoff reset on upstream health-probe
+        // success. The background liveness tick skips entirely while `client`
+        // is null (down + backing off), so nothing previously shortened the
+        // sleep when the upstream recovered — a wedged client stayed dark for
+        // the full capped delay even after the path healed. Poll the upstream
+        // cheaply during the backoff window; any HTTP response (any status —
+        // liveness, not auth) means the path is back and the next handshake
+        // attempt should happen immediately.
+        await sleepWithUpstreamPoll(this.config.upstreamUrl, delay);
         // loop forever; the stdio side stays alive while we keep trying
       }
     }

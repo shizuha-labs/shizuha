@@ -6,6 +6,8 @@
  * without introducing a manager↔gateway import cycle.
  */
 
+import { PULSE_MCP_TOOL } from '../platform/lean-conversational.js';
+
 export type HeartbeatQueueDrainOutcome =
   | 'queue_empty'
   | 'all_blocked'
@@ -35,6 +37,8 @@ export interface HeartbeatQueueDrainRecord extends Required<Omit<HeartbeatQueueD
   observedAt: string;
   needsHelpAfter: number;
   reason: string;
+  /** A rejected model turn must not trigger destruction of useful history. */
+  incompleteReason?: 'required_tool_not_called' | 'progress_only' | 'reasoning_only' | 'degenerate_generation' | 'semantic_compaction_failed';
 }
 
 export interface HeartbeatQueueDrainTurnToolCall {
@@ -50,6 +54,232 @@ export interface HeartbeatQueueDrainTurnToolResult {
 export interface HeartbeatQueueDrainTurn {
   toolCalls: HeartbeatQueueDrainTurnToolCall[];
   toolResults: HeartbeatQueueDrainTurnToolResult[];
+  incompleteReason?: HeartbeatQueueDrainRecord['incompleteReason'];
+}
+
+/** Sato 2026-08-18: bash then a fake "pulse_get_my_alerts → none" summary. */
+export function isPulseGetMyAlertsToolName(name?: string): boolean {
+  return /pulse_get_my_alerts/i.test(String(name ?? ''));
+}
+
+export function isPulseGetMyWorkToolName(name?: string): boolean {
+  return /pulse_get_my_work/i.test(String(name ?? ''));
+}
+
+export function isPulseGetMyTasksToolName(name?: string): boolean {
+  return /pulse_get_my_tasks/i.test(String(name ?? ''));
+}
+
+/** Combined inbox or the task half — either one is a Pulse queue snapshot. */
+export function heartbeatSawTaskInbox(name?: string): boolean {
+  return isPulseGetMyWorkToolName(name) || isPulseGetMyTasksToolName(name);
+}
+
+/** Listing tools the prefetch already satisfied — not get_task / transition. */
+export function isPulseInboxListingToolName(name?: string): boolean {
+  return heartbeatSawTaskInbox(name) || isPulseGetMyAlertsToolName(name);
+}
+
+/**
+ * Ryo 2026-09-11 gen34: after prefetch, GLM still called pulse_get_my_work
+ * with `{}` vs `{limit:40}` until context hit 170k. That is a legal call
+ * (no tool_choice), but executing it again re-fetches Pulse and appends
+ * another snapshot. Answer with a stub instead — the model stays free to
+ * call get_task / transition / comment.
+ */
+export const HEARTBEAT_INBOX_ALREADY_FETCHED =
+  'Combined inbox is already in this turn. Do not fetch alerts/tasks again. '
+  + `If the listing shows ready/movable items, advance one (${PULSE_MCP_TOOL.getTask}, `
+  + `${PULSE_MCP_TOOL.executeTransition}, or ${PULSE_MCP_TOOL.addComment}). `
+  + 'Do not write a queue-status line.';
+
+/**
+ * Ryo/Hiro/Ichi 2026-09-11 gen36: listing-loop break used the get_task ABAB
+ * copy ("Do not pulse_get_task the same keys again"), so GLM narrated the
+ * stub then sat. The looping tool is get_my_work — tell it to OPEN a ticket.
+ */
+export const HEARTBEAT_LISTING_LOOP_BREAK =
+  'You are stuck in a loop fetching the Pulse inbox you already have. Stopping execution. '
+  + `Do not call ${PULSE_MCP_TOOL.getMyWork}, ${PULSE_MCP_TOOL.getMyTasks}, or ${PULSE_MCP_TOOL.getMyAlerts} again. `
+  + `If the listing shows ready/movable items, call ${PULSE_MCP_TOOL.getTask}, ${PULSE_MCP_TOOL.executeTransition}, or ${PULSE_MCP_TOOL.addComment} on one of them. `
+  + 'Do not write a queue-status line.';
+
+export const HEARTBEAT_GET_TASK_LOOP_BREAK =
+  'You are stuck in a loop (same tool, or alternating between two arguments). Stopping execution. '
+  + `Do not call ${PULSE_MCP_TOOL.getTask} with the same keys again. Take a different action on work you already fetched, `
+  + 'or pick a different task.';
+
+export function heartbeatLoopBreakMessage(toolName?: string): string {
+  return isPulseInboxListingToolName(toolName)
+    ? HEARTBEAT_LISTING_LOOP_BREAK
+    : HEARTBEAT_GET_TASK_LOOP_BREAK;
+}
+
+/** Every successful tool in the turn was a Pulse inbox listing (including stubs). */
+export function heartbeatTurnWasPulseListingOnly(turn: HeartbeatQueueDrainTurn): boolean {
+  if (turn.toolCalls.length === 0) return false;
+  return turn.toolCalls.every((call, i) => {
+    if (turn.toolResults[i]?.isError) return false;
+    return isPulseInboxListingToolName(call.name);
+  });
+}
+
+export function heartbeatInboxReplayContent(toolName: string, alreadyFetched: boolean): string | null {
+  if (!alreadyFetched) return null;
+  if (!isPulseInboxListingToolName(toolName)) return null;
+  return HEARTBEAT_INBOX_ALREADY_FETCHED;
+}
+
+/**
+ * Kumo 2026-09-12: GLM observation-drop salvage re-samples a *different*
+ * `pulse_get_my_work` after prefetch already put the snapshot in the turn.
+ * That dispatch is harness forcing; it feeds the "inbox already in this turn"
+ * loop. Discard the recovered listing name instead of executing it. The agent
+ * still may call get-work itself when prefetch did not run.
+ */
+export function shouldDiscardSalvagedInboxListing(
+  toolName: string,
+  inboxAlreadyInTurn: boolean,
+): boolean {
+  return inboxAlreadyInTurn === true && isPulseInboxListingToolName(toolName);
+}
+
+export function isHeartbeatInboxReplayContent(content: unknown): boolean {
+  const text = typeof content === 'string' ? content : String(content ?? '');
+  return text.startsWith('Combined inbox is already in this turn');
+}
+
+export function isPulseGetTaskToolName(name?: string): boolean {
+  return /pulse_get_task(?!s)/i.test(String(name ?? ''));
+}
+
+/**
+ * Saki 2026-08-18: a heartbeat that already has alerts re-calls
+ * pulse_get_my_alerts until the loop detector aborts the turn, so
+ * pulse_get_my_tasks never runs and Hive shows "no Pulse queue snapshot".
+ * After the first alerts snapshot, another alerts-only tool batch means
+ * the runtime must take the task snapshot itself.
+ *
+ * Aoi 2026-09-10: more often she calls alerts **once** and then narrates
+ * ("I'm ready to help" / "I don't have any pending tasks") with zero tools.
+ * That empty current batch is handled by
+ * {@link heartbeatShouldInjectQueueToolsAfterNarration}, not this function —
+ * treating empty current here also fired during progress-only recovery.
+ */
+export function heartbeatShouldForceTaskSnapshot(
+  _isHeartbeat: boolean,
+  _priorCalls: Array<{ name?: string }>,
+  _currentCalls: Array<{ name?: string }>,
+): boolean {
+  // 2026-09-14: harness no longer injects Pulse. Model stops → turn ends.
+  return false;
+}
+
+/**
+ * Aoi 2026-09-10 gen32: GLM still calls alerts then memory/narration; the
+ * reactive inject races the next 90s heartbeat. Prefetch the combined inbox
+ * once at heartbeat start. The model stays free to choose the next action
+ * (no Cortex tool_choice). This is the harness fallback. Do not open a ticket.
+ */
+export function heartbeatShouldPrefetchCombinedInbox(_input: {
+  isHeartbeat: boolean;
+  permissionMode?: string;
+  talkSeat?: boolean;
+}): boolean {
+  // 2026-09-14: prefetch + fence user-message is what kept GLM circling
+  // (Kumo/Ren). Codex / Claude Code / Grok Build do not fetch tools for the
+  // model. The agent calls pulse_get_my_work itself, or stops.
+  return false;
+}
+
+/** Heartbeat ended in narration after alerts (or tasks) without the next Pulse tool. */
+export function heartbeatShouldInjectQueueToolsAfterNarration(
+  _isHeartbeat: boolean,
+  _priorCalls: Array<{ name?: string }>,
+): { tasks: boolean; firstReady: boolean } {
+  // 2026-09-14: narration / wrap-up / reasoning_only is a stop, not a cue
+  // to inject pulse_get_my_work and continue.
+  return { tasks: false, firstReady: false };
+}
+
+/**
+ * Saki 2026-08-18: after the queue snapshot exists, the model re-calls
+ * pulse_get_my_tasks until loop-break aborts. Hive then shows ready_no_progress
+ * with 4–8 ready items and she never opens a ticket. Another tasks-only batch
+ * means the runtime must open the first ready item itself.
+ */
+export function heartbeatShouldForceFirstReadyTask(
+  _isHeartbeat: boolean,
+  _priorCalls: Array<{ name?: string }>,
+  _currentCalls: Array<{ name?: string }>,
+): boolean {
+  // Combined inbox is the backstop. Do not open a specific ticket for the model.
+  return false;
+}
+
+/** Task half of a combined `pulse_get_my_work` snapshot, or the whole
+ *  `pulse_get_my_tasks` payload when there is no `## Tasks` heading. */
+export function pulseTasksTextFromSnapshot(raw: string): string {
+  const text = String(raw ?? '');
+  const parts = text.split(/^## Tasks\s*$/m);
+  if (parts.length > 1) return parts.slice(1).join('\n');
+  return text;
+}
+
+export function lastSuccessfulPulseTasksContent(
+  calls: Array<{ name?: string }>,
+  results: Array<{ content?: unknown; isError?: boolean }>,
+): string | null {
+  for (let i = calls.length - 1; i >= 0; i--) {
+    if (!heartbeatSawTaskInbox(calls[i]?.name)) continue;
+    if (results[i]?.isError) continue;
+    if (isHeartbeatInboxReplayContent(results[i]?.content)) continue;
+    const content = results[i]?.content;
+    if (content == null) continue;
+    const raw = typeof content === 'string' ? content : JSON.stringify(content);
+    return pulseTasksTextFromSnapshot(raw);
+  }
+  return null;
+}
+
+/** Prefetch (or a later real listing) showed at least one ready Pulse item. */
+export function heartbeatSnapshotHasReadyWork(
+  calls: Array<{ name?: string }>,
+  results: Array<{ content?: unknown; isError?: boolean }>,
+): boolean {
+  const text = lastSuccessfulPulseTasksContent(calls, results);
+  if (!text) return false;
+  return parsePulseGetMyTasksResult(text).readyTaskCount > 0;
+}
+
+/** First queue-ordered ready Pulse key from a get_my_tasks markdown snapshot. */
+export function firstReadyPulseTaskKeyFromSnapshot(content: string | null | undefined): string | null {
+  const text = String(content ?? '');
+  if (!text.trim()) return null;
+  const ready: { key: string; schemaRepair: boolean }[] = [];
+  const blocks = text.split(/(?=^- \*\*)/m);
+  for (const block of blocks) {
+    const key = block.match(/^- \*\*([A-Z][A-Z0-9]*-\d+)\*\*/)?.[1];
+    if (!key) continue;
+    if (/\bStatus:\s*blocked\b/i.test(block)) continue;
+    if (pulseTaskStatusRows(block).some(row => row.ownerAwareness)) continue;
+    ready.push({
+      key,
+      schemaRepair: /\[SCHEMA REPAIR:/i.test(block),
+    });
+  }
+  // SCHEMA REPAIR todos are agent-doable form retries, but they rank urgent
+  // and trap weak/looping seats into re-fetching the parent hold. Prefer a
+  // real ready item when one exists; only open the repair if it is the
+  // remaining work.
+  return ready.find((row) => !row.schemaRepair)?.key ?? ready[0]?.key ?? null;
+}
+
+export function heartbeatDrainSawPulseAlerts(
+  toolCalls: Array<{ name?: string }> | undefined,
+): boolean {
+  return (toolCalls ?? []).some((call) =>
+    isPulseGetMyAlertsToolName(call.name) || isPulseGetMyWorkToolName(call.name));
 }
 
 /**
@@ -129,6 +359,30 @@ export function recordObservedEmptyPulseQueue(
   });
 }
 
+/**
+ * Pulse/file mutation on a non-heartbeat turn is the same producer evidence
+ * as a worked heartbeat. Hive's needs_help flag is owned by this map; if we
+ * only write it from source=heartbeat, a busy seat that never goes idle keeps
+ * painting Needs help while audit shows comments/transitions (san/mio/nagi
+ * 2026-09-09). Bash-only turns do not clear — that is Sato's idle-shell trap.
+ */
+export function recordObservedWorkProgress(
+  agentId: string,
+  turn: Pick<HeartbeatQueueDrainTurn, 'toolCalls' | 'toolResults'>,
+  observedAt = new Date().toISOString(),
+): HeartbeatQueueDrainRecord | null {
+  const progressEventCount = countMutatingProgressEvents(turn);
+  if (progressEventCount <= 0) return null;
+  const previous = latestHeartbeatOutcomes.get(agentId);
+  return recordHeartbeatQueueDrainOutcome(agentId, {
+    readyTaskCount: previous?.readyTaskCount ?? 0,
+    blockedTaskCount: previous?.blockedTaskCount ?? 0,
+    futureDueCount: previous?.futureDueCount ?? 0,
+    progressEventCount,
+    observedAt,
+  });
+}
+
 export function recordHeartbeatQueueDrainOutcome(
   agentId: string,
   input: Omit<HeartbeatQueueDrainInput, 'consecutiveReadyNoProgressHeartbeats'> & { observedAt?: string },
@@ -170,6 +424,22 @@ export function getHeartbeatQueueDrainOutcome(agentId: string): HeartbeatQueueDr
 }
 
 /**
+ * After a fruitless-session rotate, consecutive no-progress must restart.
+ * Aoi 2026-09-09: consecutive=5 survived a wipe, so the next heartbeat
+ * rotated an already-empty session two minutes later (messageCount=0).
+ * needs_help stays until a later producer event with progress; only the
+ * rotate trigger is re-armed.
+ */
+export function clearFruitlessConsecutiveAfterSessionRotate(agentId: string): void {
+  const previous = latestHeartbeatOutcomes.get(agentId);
+  if (!previous) return;
+  latestHeartbeatOutcomes.set(agentId, {
+    ...previous,
+    consecutiveReadyNoProgressHeartbeats: 0,
+  });
+}
+
+/**
  * Project the latest queue-drain result into the bridge telemetry envelope.
  *
  * Daemon-managed agents already publish this state through daemon-link frames,
@@ -195,6 +465,7 @@ export function heartbeatQueueDrainTelemetry(agentId: string): Record<string, un
     pulse_alert_task_order_valid: record.pulseAlertTaskOrderValid,
     consecutive_ready_no_progress_heartbeats: record.consecutiveReadyNoProgressHeartbeats,
     needs_help_after: record.needsHelpAfter,
+    ...(record.incompleteReason ? { incomplete_reason: record.incompleteReason } : {}),
   };
 }
 
@@ -300,14 +571,28 @@ export function recordHeartbeatQueueDrainTurn(
   observedAt = new Date().toISOString(),
   policy: HeartbeatQueueBlindPolicy = {},
 ): HeartbeatQueueDrainRecord {
+  const record = evaluateHeartbeatQueueDrainTurn(agentId, turn, observedAt, policy);
+  if (turn.incompleteReason) record.incompleteReason = turn.incompleteReason;
+  if (turn.incompleteReason === 'semantic_compaction_failed') {
+    record.outcome = 'needs_help';
+    record.reason = 'Semantic compaction failed; active conversation preserved for a later attempt';
+  }
+  return record;
+}
+
+function evaluateHeartbeatQueueDrainTurn(
+  agentId: string,
+  turn: HeartbeatQueueDrainTurn,
+  observedAt = new Date().toISOString(),
+  policy: HeartbeatQueueBlindPolicy = {},
+): HeartbeatQueueDrainRecord {
   const pulseQueueObligated = policy.pulseQueueObligated !== false;
   const pulseResults: string[] = [];
-  let progressEventCount = 0;
+  let mutatingProgressEventCount = 0;
+  let shellProgressEventCount = 0;
   let forwardedEventCount = 0;
   let pulseGetMyTasksCallCount = 0;
   let pulseGetMyAlertsCallCount = 0;
-  let firstPulseGetMyAlertsCallIndex = -1;
-  let firstPulseGetMyTasksCallIndex = -1;
 
   for (let i = 0; i < turn.toolCalls.length; i++) {
     const toolName = normalizeToolName(turn.toolCalls[i]?.name ?? '');
@@ -317,14 +602,21 @@ export function recordHeartbeatQueueDrainTurn(
     if (turn.toolResults[i]?.isError) {
       continue;
     }
+    if (isHeartbeatInboxReplayContent(turn.toolResults[i]?.content)) {
+      continue;
+    }
+    if (isPulseGetMyWorkTool(toolName)) {
+      pulseGetMyAlertsCallCount += 1;
+      pulseGetMyTasksCallCount += 1;
+      pulseResults.push(pulseTasksTextFromSnapshot(contentToText(turn.toolResults[i]?.content)));
+      continue;
+    }
     if (isPulseGetMyAlertsTool(toolName)) {
       pulseGetMyAlertsCallCount += 1;
-      if (firstPulseGetMyAlertsCallIndex < 0) firstPulseGetMyAlertsCallIndex = i;
       continue;
     }
     if (isPulseGetMyTasksTool(toolName)) {
       pulseGetMyTasksCallCount += 1;
-      if (firstPulseGetMyTasksCallIndex < 0) firstPulseGetMyTasksCallIndex = i;
       pulseResults.push(contentToText(turn.toolResults[i]?.content));
       continue;
     }
@@ -332,21 +624,32 @@ export function recordHeartbeatQueueDrainTurn(
       forwardedEventCount += 1;
       continue;
     }
-    if (isProgressTool(toolName)) {
-      progressEventCount += 1;
+    if (isMutatingProgressTool(toolName)) {
+      mutatingProgressEventCount += 1;
+      continue;
+    }
+    if (isShellProgressTool(toolName)) {
+      shellProgressEventCount += 1;
     }
   }
+  // Sato 2026-08-17: a completed idle heartbeat whose only "work" is bash
+  // (`check comments again` / `queue unchanged`) was scored worked_task and
+  // fast-rearmed every 60s at 330k tokens. Shell is real progress only when
+  // the same drain also mutated something (edit/write/Pulse/GitHub).
+  const progressEventCount = mutatingProgressEventCount > 0
+    ? mutatingProgressEventCount + shellProgressEventCount
+    : 0;
 
-  const pulseAlertTaskOrderValid = pulseGetMyAlertsCallCount > 0
-    && pulseGetMyTasksCallCount > 0
-    && firstPulseGetMyAlertsCallIndex < firstPulseGetMyTasksCallIndex;
-  if (!pulseAlertTaskOrderValid) {
+  const sawTaskInbox = pulseGetMyTasksCallCount > 0;
+  // Prefetch + later listing stubs used to fail `count === toolCalls.length`
+  // (stubs are skipped above so they do not overwrite the snapshot). Alerts +
+  // tasks is also listing-only. Fruitless rotate must see that flag.
+  const pulseGetMyTasksOnly = heartbeatTurnWasPulseListingOnly(turn) && pulseGetMyTasksCallCount > 0;
+  if (!sawTaskInbox) {
     const previous = latestHeartbeatOutcomes.get(agentId);
     const reason = pulseGetMyAlertsCallCount === 0
-      ? 'heartbeat did not reconcile assigned alerts before the task queue'
-      : pulseGetMyTasksCallCount === 0
-        ? 'heartbeat reconciled alerts but did not expose a Pulse task queue snapshot'
-        : 'heartbeat observed Pulse inboxes out of order; alerts must precede tasks';
+      ? 'heartbeat did not expose a Pulse queue snapshot'
+      : 'heartbeat reconciled alerts but did not expose a Pulse task queue snapshot';
     // Only real progress counts, NOT forwarding: a router that reassigns work
     // while never checking its own inboxes is still queue-blind, which is a
     // separate deliberate rule ('does not let forwarding mask a heartbeat that
@@ -362,8 +665,7 @@ export function recordHeartbeatQueueDrainTurn(
       futureDueCount: previous?.futureDueCount ?? 0,
       progressEventCount,
       forwardedEventCount,
-      pulseGetMyTasksOnly: pulseGetMyTasksCallCount > 0
-        && pulseGetMyTasksCallCount === turn.toolCalls.length,
+      pulseGetMyTasksOnly,
       pulseGetMyAlertsObserved: pulseGetMyAlertsCallCount > 0,
       pulseAlertTaskOrderValid: false,
       consecutiveReadyNoProgressHeartbeats: resolved.consecutiveReadyNoProgressHeartbeats,
@@ -410,8 +712,8 @@ export function recordHeartbeatQueueDrainTurn(
       futureDueCount: previous?.futureDueCount ?? 0,
       progressEventCount,
       forwardedEventCount,
-      pulseGetMyTasksOnly: pulseGetMyTasksCallCount === turn.toolCalls.length,
-      pulseGetMyAlertsObserved: true,
+      pulseGetMyTasksOnly,
+      pulseGetMyAlertsObserved: pulseGetMyAlertsCallCount > 0,
       pulseAlertTaskOrderValid: true,
       consecutiveReadyNoProgressHeartbeats: resolved.consecutiveReadyNoProgressHeartbeats,
       needsHelpAfter: DEFAULT_NEEDS_HELP_AFTER,
@@ -425,11 +727,20 @@ export function recordHeartbeatQueueDrainTurn(
     ...snapshot,
     progressEventCount,
     forwardedEventCount,
-    pulseGetMyTasksOnly: pulseGetMyTasksCallCount === turn.toolCalls.length,
-    pulseGetMyAlertsObserved: true,
+    pulseGetMyTasksOnly,
+    pulseGetMyAlertsObserved: pulseGetMyAlertsCallCount > 0,
     pulseAlertTaskOrderValid: true,
     observedAt,
   });
+}
+
+function pulseTaskStatusRows(text: string): Array<{ status: string; ownerAwareness: boolean }> {
+  return [...text.matchAll(/^[ \t]*Status:[ \t]*([a-z_ -]+)[^\r\n]*(?:\r?\n[ \t]+Owner action:[ \t]*([a-z-]+)(?=[ \t(]|$))?/gim)]
+    .map(match => ({
+      status: match[1]?.trim().toLowerCase().replace(/\s+/g, '_') ?? '',
+      ownerAwareness: match[2]?.toLowerCase() === 'awareness-only',
+    }))
+    .filter(row => Boolean(row.status));
 }
 
 export function parsePulseGetMyTasksResult(raw: string): Pick<HeartbeatQueueDrainInput, 'readyTaskCount' | 'blockedTaskCount' | 'futureDueCount'> {
@@ -451,10 +762,9 @@ export function parsePulseGetMyTasksResult(raw: string): Pick<HeartbeatQueueDrai
   // 4 + 4 — the operator read the cards as lying, and they were. Only the
   // line-leading `Status:` field is the task's status; the parenthesised
   // `(status: ...)` is workflow decoration on another line's tail.
-  const statusMatches = [...text.matchAll(/^\s*Status:\s*([a-z_ -]+)/gim)]
-    .map(match => match[1]?.trim().toLowerCase().replace(/\s+/g, '_') ?? '')
-    .filter(Boolean);
-  if (statusMatches.length > 0) {
+  const statusRows = pulseTaskStatusRows(text);
+  const statusMatches = statusRows.filter(row => !row.ownerAwareness).map(row => row.status);
+  if (statusRows.length > 0) {
     const blockedTaskCount = statusMatches.filter(status => status === 'blocked').length;
     // `backlog` is a Pulse *pull lane* ("pull ONE highest-priority item… do not
     // churn the whole backlog"), not actionable-now work. Backlog EPICs/standing
@@ -463,7 +773,11 @@ export function parsePulseGetMyTasksResult(raw: string): Pick<HeartbeatQueueDrai
     // agent sitting on a pile of backlog EPICs (e.g. aoi's Architecture backlog)
     // is falsely flagged needs_help every heartbeat. Treat them as holding items
     // alongside scheduled/deferred (non-actionable → never trips ready_no_progress).
-    const holdingStatuses = ['scheduled', 'deferred', 'future_due', 'not_yet_due', 'backlog'];
+    const holdingStatuses = [
+      'scheduled', 'deferred', 'future_due', 'not_yet_due', 'backlog',
+      'awaiting_deploy', 'awaiting_merge', 'awaiting_verification',
+      'verification', 'deploying', 'applying',
+    ];
     const futureStatusCount = statusMatches.filter(status => holdingStatuses.includes(status)).length;
     const futureDueCount = futureStatusCount + parseFutureDueCount(text);
     const readyTaskCount = statusMatches.length - blockedTaskCount - futureStatusCount;
@@ -487,6 +801,10 @@ export function parsePulseGetMyTasksResult(raw: string): Pick<HeartbeatQueueDrai
 
 function normalizeToolName(name: string): string {
   return name.replace(/^functions\./, '').replace(/^mcp__/, '').replace(/-/g, '_');
+}
+
+function isPulseGetMyWorkTool(name: string): boolean {
+  return name.endsWith('pulse_get_my_work') || name === 'pulse_get_my_work';
 }
 
 function isPulseGetMyTasksTool(name: string): boolean {
@@ -527,26 +845,49 @@ function isForwardingTool(name: string): boolean {
  * change something, which is the definition of progress here. Reads (`read`,
  * `glob`, `grep`) are deliberately NOT progress: an agent that only looks around
  * for several heartbeats really may be stuck.
+ *
+ * 2026-08-17 Sato: bash ALONE is not enough. A completed idle heartbeat that
+ * only shells (`check comments again`) was scored worked_task and fast-rearmed
+ * every 60s at ~330k tokens. Shell still counts when the same drain also
+ * mutated a file / Pulse / GitHub — that is the shion "involved task" shape.
  */
-function isProgressTool(name: string): boolean {
-  // Shizuha CLI write tools (tools/toolsets.ts WRITE_TOOLS).
+function isMutatingProgressTool(name: string): boolean {
   if (
-    name === 'bash'
-    || name === 'edit'
+    name === 'edit'
     || name === 'write'
     || name === 'notebook'
     || name === 'apply_patch'
-    || name === 'task'          // spawning a sub-agent is work being done
+    || name === 'task'
   ) {
     return true;
   }
-  return name === 'exec_command'
-    || name.endsWith('exec_command')
-    || name.endsWith('apply_patch')
+  return name.endsWith('apply_patch')
     || name.endsWith('pulse_add_comment')
     || name.endsWith('pulse_execute_transition')
+    || name.endsWith('pulse_create_task')
     || name.endsWith('pulse_link_pr')
+    || name.endsWith('pulse_update_task')
     || name.includes('github');
+}
+
+export function countMutatingProgressEvents(
+  turn: Pick<HeartbeatQueueDrainTurn, 'toolCalls' | 'toolResults'>,
+): number {
+  let mutating = 0;
+  let shell = 0;
+  for (let i = 0; i < turn.toolCalls.length; i++) {
+    if (turn.toolResults[i]?.isError) continue;
+    const toolName = normalizeToolName(turn.toolCalls[i]?.name ?? '');
+    if (isMutatingProgressTool(toolName)) mutating += 1;
+    else if (isShellProgressTool(toolName)) shell += 1;
+  }
+  return mutating > 0 ? mutating + shell : 0;
+}
+
+function isShellProgressTool(name: string): boolean {
+  return name === 'bash'
+    || name === 'exec_command'
+    || name.endsWith('exec_command');
 }
 
 function parseFutureDueCount(text: string): number {

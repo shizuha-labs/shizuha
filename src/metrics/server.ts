@@ -23,13 +23,30 @@ export function startMetricsServer(port = 9103): http.Server {
     }
   });
 
-  server.listen(port, '0.0.0.0', () => {
-    logger.info({ port }, 'Metrics server listening');
-  });
+  // SCLI-535: the fixed default port (9103) can already be held by another
+  // process (e.g. a primary gateway when a codex-bridge secondary spawns).
+  // Instead of emitting a raw EADDRINUSE stack and then running WITHOUT its own
+  // listener, bump the port and retry (bounded) so this process still gets a
+  // scrape endpoint. If every retry is exhausted, log a concise warning and
+  // continue without metrics — never a raw stack, never a crash.
+  const MAX_RETRIES = 5;
+  const attemptListen = (p: number, retries: number): void => {
+    server.once('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE' && retries > 0) {
+        logger.warn({ port: p }, 'Metrics port in use — retrying on next port');
+        attemptListen(p + 1, retries - 1);
+      } else if (err.code === 'EADDRINUSE') {
+        logger.warn({ port: p }, 'Metrics port in use — running without a metrics listener');
+      } else {
+        logger.warn({ err, port: p }, 'Metrics server error');
+      }
+    });
+    server.listen(p, '0.0.0.0', () => {
+      logger.info({ port: p }, 'Metrics server listening');
+    });
+  };
 
-  server.on('error', (err) => {
-    logger.warn({ err, port }, 'Metrics server error');
-  });
+  attemptListen(port, MAX_RETRIES);
 
   return server;
 }

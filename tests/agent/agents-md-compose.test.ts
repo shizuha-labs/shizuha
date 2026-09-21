@@ -47,7 +47,15 @@ describe('composeAgentsMd', () => {
 
   it('universal core has no shipping block', () => {
     expect(AGENT_UNIVERSAL_CORE).not.toContain('Shipping code');
-    expect(AGENT_UNIVERSAL_CORE).toContain('[HEARTBEAT]');
+    expect(AGENT_UNIVERSAL_CORE).toContain('[Heartbeat]');
+    expect(AGENT_UNIVERSAL_CORE).toContain('does not prefetch Pulse');
+    expect(AGENT_UNIVERSAL_CORE).toContain('No tool calls = the turn is over');
+    expect(AGENT_UNIVERSAL_CORE).not.toContain('from runtime prefetch or your call');
+    expect(AGENT_UNIVERSAL_CORE).toContain('Extra heartbeat injections are not a diagnosis');
+    expect(AGENT_UNIVERSAL_CORE).toContain('shizuha.log');
+    expect(AGENT_UNIVERSAL_CORE).toContain('Fix at the originating layer');
+    expect(AGENT_UNIVERSAL_CORE).toContain('Ship that origin patch in the same session');
+    expect(AGENT_UNIVERSAL_CORE).toContain('not a harness salvage');
   });
 
   it('review capability composes pulse-review but not shipping', () => {
@@ -71,5 +79,36 @@ describe('composeAgentsMd', () => {
     const body = fs.readFileSync(path.join(out, 'AGENTS.md'), 'utf8');
     expect(body).toContain('[HEARTBEAT]');
     expect(body).toContain('Approve only');
+  });
+
+  it('inlines heartbeat-protocol for every seat regardless of team capability', () => {
+    const dir = path.join(tmp, 'heartbeat-protocol');
+    fs.mkdirSync(dir);
+    fs.writeFileSync(
+      path.join(dir, 'SKILL.md'),
+      `---
+name: heartbeat-protocol
+agents_md: true
+starred: true
+critical: true
+tags:
+  - heartbeat
+---
+
+# Heartbeat Protocol
+call pulse_get_my_alerts then pulse_get_my_tasks
+`,
+    );
+    delete process.env['AGENT_EFFECTIVE_CAPABILITIES'];
+    const emptyGrant = composeAgentsMd({ capabilities: [], skillNames: [] });
+    expect(emptyGrant).toContain('agents_md directive: heartbeat-protocol');
+    expect(emptyGrant).toContain('pulse_get_my_tasks');
+    process.env['AGENT_EFFECTIVE_CAPABILITIES'] = 'merge';
+    const mergeGrant = composeAgentsMd({
+      capabilities: ['merge'],
+      skillNames: ['pulse-merge'],
+    });
+    expect(mergeGrant).toContain('agents_md directive: heartbeat-protocol');
+    expect(mergeGrant).toContain('pulse_get_my_tasks');
   });
 });

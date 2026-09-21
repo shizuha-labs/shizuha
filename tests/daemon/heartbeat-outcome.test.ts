@@ -5,17 +5,99 @@ import {
   evaluateHeartbeatQueueDrainOutcome,
   formatHeartbeatQueueDrainOutcomeLogLine,
   getHeartbeatQueueDrainOutcome,
+  heartbeatDrainSawPulseAlerts,
   heartbeatQueueDrainTelemetry,
+  heartbeatShouldForceTaskSnapshot,
+  heartbeatShouldInjectQueueToolsAfterNarration,
+  heartbeatShouldPrefetchCombinedInbox,
+  heartbeatShouldForceFirstReadyTask,
+  heartbeatInboxReplayContent,
+  shouldDiscardSalvagedInboxListing,
+  heartbeatLoopBreakMessage,
+  heartbeatTurnWasPulseListingOnly,
+  HEARTBEAT_INBOX_ALREADY_FETCHED,
+  HEARTBEAT_LISTING_LOOP_BREAK,
+  HEARTBEAT_GET_TASK_LOOP_BREAK,
+  lastSuccessfulPulseTasksContent,
+  firstReadyPulseTaskKeyFromSnapshot,
+  isPulseGetTaskToolName,
   ingestHeartbeatQueueDrainOutcomeLogLine,
+  isPulseGetMyAlertsToolName,
   parsePulseGetMyTasksResult,
   recordHeartbeatQueueDrainOutcome,
   recordHeartbeatQueueDrainTurn,
   recordObservedEmptyPulseQueue,
+  recordObservedWorkProgress,
+  clearFruitlessConsecutiveAfterSessionRotate,
 } from '../../src/daemon/heartbeat-outcome.js';
+
+const ownerAwarenessMcpFixture = `Found 1 task(s) — 1 active (0 ready/movable, 0 blocked/waiting, 1 awareness-only), 0 terminal.
+
+- **PLS-1227**: Answered ask retained for awareness
+  ID: 34910
+  Status: resolved_elsewhere | Priority: urgent
+  Owner action: awareness-only (retained ownership; no action required in this workflow state)
+  Workflow: simple (status: ?)
+  Assignee: rui@shizuha.com
+
+`;
 
 describe('heartbeat queue-drain outcome telemetry', () => {
   beforeEach(() => {
     clearHeartbeatQueueDrainOutcomesForTests();
+  });
+
+  it('honors the actual Pulse owner-awareness formatter in queue telemetry', () => {
+    expect(parsePulseGetMyTasksResult(ownerAwarenessMcpFixture)).toEqual({
+      readyTaskCount: 0, blockedTaskCount: 0, futureDueCount: 0,
+    });
+    expect(firstReadyPulseTaskKeyFromSnapshot(ownerAwarenessMcpFixture)).toBeNull();
+    expect(ownerAwarenessMcpFixture).toContain('Status: resolved_elsewhere');
+  });
+
+  it('does not re-escalate repeated actual awareness-only inbox snapshots', () => {
+    const calls = [{ name: 'mcp__shizuha-pulse__pulse_get_my_alerts' },
+      { name: 'mcp__shizuha-pulse__pulse_get_my_tasks' }];
+    const results = [{ content: 'No active alerts assigned to rui@shizuha.com.' },
+      { content: ownerAwarenessMcpFixture }];
+    for (let turn = 0; turn < 3; turn++) {
+      recordHeartbeatQueueDrainTurn('rui-awareness', { toolCalls: calls, toolResults: results });
+      expect(heartbeatQueueDrainTelemetry('rui-awareness')?.needs_help).toBe(false);
+      expect(heartbeatQueueDrainTelemetry('rui-awareness')?.ready_task_count).toBe(0);
+    }
+  });
+
+  it.each(['', '  Owner action: actionable\n', '  Owner action: unrecognized\n'])(
+    'keeps custom statuses conservatively actionable without explicit awareness metadata: %s', (metadata) => {
+      const text = ownerAwarenessMcpFixture
+        .replace('resolved_elsewhere', 'custom_owner_work')
+        .replace('  Owner action: awareness-only (retained ownership; no action required in this workflow state)\n', metadata);
+      expect(parsePulseGetMyTasksResult(text).readyTaskCount).toBe(1);
+      expect(firstReadyPulseTaskKeyFromSnapshot(text)).toBe('PLS-1227');
+    },
+  );
+
+  it('scopes awareness metadata to its item and rearms when that policy changes', () => {
+    const mixed = ownerAwarenessMcpFixture + `- **PLAT-999**: Real custom work
+  Status: custom_owner_work | Priority: normal
+  Workflow: custom (status: New)
+
+- **PLAT-1000**: Existing blocked work
+  Status: blocked | Priority: high
+`;
+    expect(parsePulseGetMyTasksResult(mixed)).toEqual({ readyTaskCount: 1, blockedTaskCount: 1, futureDueCount: 0 });
+    expect(firstReadyPulseTaskKeyFromSnapshot(mixed)).toBe('PLAT-999');
+    const actionable = ownerAwarenessMcpFixture.replace('Owner action: awareness-only', 'Owner action: actionable');
+    expect(parsePulseGetMyTasksResult(actionable).readyTaskCount).toBe(1);
+    expect(firstReadyPulseTaskKeyFromSnapshot(actionable)).toBe('PLS-1227');
+  });
+
+  it('does not treat an awareness phrase outside the immediate status metadata as policy', () => {
+    const text = ownerAwarenessMcpFixture
+      .replace('  Owner action: awareness-only (retained ownership; no action required in this workflow state)\n', '')
+      + '\nAn archived instruction said:\n  Owner action: awareness-only\n';
+    expect(parsePulseGetMyTasksResult(text).readyTaskCount).toBe(1);
+    expect(firstReadyPulseTaskKeyFromSnapshot(text)).toBe('PLS-1227');
   });
 
   it('classifies empty, blocked, future-due, worked, and forwarded outcomes', () => {
@@ -53,6 +135,88 @@ describe('heartbeat queue-drain outcome telemetry', () => {
       ready_task_count: 1,
       consecutive_ready_no_progress_heartbeats: 2,
     });
+  });
+
+  it('re-arms fruitless rotate after an empty-session wipe (aoi 2026-09-09)', () => {
+    recordHeartbeatQueueDrainOutcome('aoi', {
+      readyTaskCount: 4,
+      pulseGetMyTasksOnly: true,
+      needsHelpAfter: 2,
+      observedAt: '2026-09-09T16:01:13.000Z',
+    });
+    recordHeartbeatQueueDrainOutcome('aoi', {
+      readyTaskCount: 4,
+      pulseGetMyTasksOnly: true,
+      needsHelpAfter: 2,
+      observedAt: '2026-09-09T16:03:13.000Z',
+    });
+    expect(getHeartbeatQueueDrainOutcome('aoi')).toMatchObject({
+      outcome: 'needs_help',
+      consecutiveReadyNoProgressHeartbeats: 2,
+    });
+
+    clearFruitlessConsecutiveAfterSessionRotate('aoi');
+    expect(getHeartbeatQueueDrainOutcome('aoi')).toMatchObject({
+      outcome: 'needs_help',
+      consecutiveReadyNoProgressHeartbeats: 0,
+    });
+  });
+
+  it('clears needs_help when a non-heartbeat turn mutates Pulse (san/mio/nagi 2026-09-09)', () => {
+    recordHeartbeatQueueDrainOutcome('san', {
+      readyTaskCount: 6,
+      pulseGetMyTasksOnly: true,
+      needsHelpAfter: 2,
+      observedAt: '2026-09-09T09:56:00.000Z',
+    });
+    recordHeartbeatQueueDrainOutcome('san', {
+      readyTaskCount: 6,
+      pulseGetMyTasksOnly: true,
+      needsHelpAfter: 2,
+      observedAt: '2026-09-09T09:56:25.000Z',
+    });
+    expect(getHeartbeatQueueDrainOutcome('san')?.outcome).toBe('needs_help');
+
+    const cleared = recordObservedWorkProgress('san', {
+      toolCalls: [{ name: 'mcp__shizuha-pulse__pulse_add_comment' }],
+      toolResults: [{ content: 'Comment added (ID: 682078)', isError: false }],
+    }, '2026-09-09T16:07:17.000Z');
+    expect(cleared?.outcome).toBe('worked_task');
+    expect(heartbeatQueueDrainTelemetry('san')).toMatchObject({
+      outcome: 'worked_task',
+      needs_help: false,
+      consecutive_ready_no_progress_heartbeats: 0,
+      observed_at: '2026-09-09T16:07:17.000Z',
+    });
+  });
+
+  it('does not clear needs_help on bash-only non-heartbeat turns (Sato idle-shell)', () => {
+    recordHeartbeatQueueDrainOutcome('aoi', {
+      readyTaskCount: 4,
+      needsHelpAfter: 1,
+      observedAt: '2026-09-09T16:03:13.000Z',
+    });
+    expect(recordObservedWorkProgress('aoi', {
+      toolCalls: [{ name: 'bash' }],
+      toolResults: [{ content: '200', isError: false }],
+    })).toBeNull();
+    expect(getHeartbeatQueueDrainOutcome('aoi')?.outcome).toBe('needs_help');
+  });
+
+  it('counts pulse_create_task as mutating progress', () => {
+    const cleared = recordObservedWorkProgress('ichi', {
+      toolCalls: [{ name: 'mcp__shizuha-pulse__pulse_create_task' }],
+      toolResults: [{ content: 'Created PLAT-8856', isError: false }],
+    });
+    expect(cleared?.outcome).toBe('worked_task');
+  });
+
+  it('counts pulse_update_task as mutating progress', () => {
+    const cleared = recordObservedWorkProgress('nagi', {
+      toolCalls: [{ name: 'mcp__shizuha-pulse__pulse_update_task' }],
+      toolResults: [{ content: 'Updated: [PLAT-8348]', isError: false }],
+    });
+    expect(cleared?.outcome).toBe('worked_task');
   });
 
   it('serializes a later healthy outcome so consumers can clear needs_help', () => {
@@ -97,6 +261,24 @@ Found 3 task(s) — 3 actionable (+1 not yet due (>30d out), hidden by default).
 `);
 
     expect(parsed).toEqual({ readyTaskCount: 2, blockedTaskCount: 1, futureDueCount: 1 });
+  });
+
+  it('does not count awaiting_deploy as ready (Shion HIVE-1888 2026-09-15)', () => {
+    const parsed = parsePulseGetMyTasksResult(`Tasks for shion@agents.shizuha.io:
+
+Found 2 task(s) — 2 active (2 ready/movable, 0 blocked/waiting), 0 terminal.
+
+- **HIVE-1888**: Restore EndpointSlice visibility
+  ID: 27971
+  Status: awaiting_deploy | Priority: urgent
+  Workflow: Autonomous Bug (status: Awaiting Deploy)
+
+- **PLS-1165**: Execute PLS-1154 roster fix
+  ID: 33162
+  Status: in_progress | Priority: urgent
+  Workflow: simple (status: In Progress)
+`);
+    expect(parsed).toEqual({ readyTaskCount: 1, blockedTaskCount: 0, futureDueCount: 1 });
   });
 
   it('does not double-count the workflow (status: ...) decoration — shion 2->4', () => {
@@ -193,7 +375,7 @@ No actionable tasks found.
     expect(parsed.readyTaskCount).toBe(0);
   });
 
-  it('rejects a task-only Codex heartbeat that skipped assigned alerts', () => {
+  it('treats a task-only heartbeat as an observed queue, not queue-blind', () => {
     const toolCalls = [{ name: 'mcp__shizuha-pulse__pulse_get_my_tasks' }];
     const toolResults = [{ content: `Tasks for nagi@shizuha.com:
 Found 1 task(s) — 1 actionable.
@@ -203,25 +385,18 @@ Found 1 task(s) — 1 actionable.
 ` }];
 
     const first = recordHeartbeatQueueDrainTurn('codex-regression', { toolCalls, toolResults }, '2026-06-30T01:00:00.000Z');
-    const second = recordHeartbeatQueueDrainTurn('codex-regression', { toolCalls, toolResults }, '2026-06-30T01:05:00.000Z');
 
     expect(first).toMatchObject({
-      outcome: 'not_observed',
-      readyTaskCount: 0,
+      outcome: 'ready_no_progress',
+      readyTaskCount: 1,
       pulseGetMyTasksOnly: true,
       pulseGetMyAlertsObserved: false,
-      pulseAlertTaskOrderValid: false,
-    });
-    expect(second).toMatchObject({
-      outcome: 'needs_help',
-      readyTaskCount: 0,
-      pulseGetMyTasksOnly: true,
-      consecutiveReadyNoProgressHeartbeats: 2,
+      pulseAlertTaskOrderValid: true,
     });
   });
 
-  it('rejects a heartbeat that reads tasks before alerts', () => {
-    const first = recordHeartbeatQueueDrainTurn('wrong-order', {
+  it('does not require alerts-before-tasks order', () => {
+    const first = recordHeartbeatQueueDrainTurn('any-order', {
       toolCalls: [
         { name: 'mcp__shizuha-pulse__pulse_get_my_tasks' },
         { name: 'mcp__shizuha-pulse__pulse_get_my_alerts' },
@@ -233,12 +408,42 @@ Found 1 task(s) — 1 actionable.
     });
 
     expect(first).toMatchObject({
-      outcome: 'not_observed',
+      outcome: 'queue_empty',
       pulseGetMyAlertsObserved: true,
-      pulseAlertTaskOrderValid: false,
-      consecutiveReadyNoProgressHeartbeats: 1,
+      pulseAlertTaskOrderValid: true,
     });
-    expect(first.reason).toContain('out of order');
+  });
+
+  it('treats pulse_get_my_work as both inboxes and parses only the Tasks half', () => {
+    const outcome = recordHeartbeatQueueDrainTurn('combined-inbox', {
+      toolCalls: [{ name: 'mcp__shizuha-pulse__pulse_get_my_work' }],
+      toolResults: [{
+        content: [
+          'Your Pulse work (alerts + tasks, one snapshot). You choose what to advance.',
+          '',
+          '## Alerts',
+          'Active alerts for aoi@shizuha.com:',
+          '',
+          '- **PLAT-41**: Origin CI failed',
+          '  Status: firing | Priority: high',
+          '',
+          '## Tasks',
+          'Tasks for aoi@shizuha.com (showing 1 of 1 active, queue-ordered; limit=5):',
+          '',
+          '- **PLAT-7824**: tls-sync VAP',
+          '  Status: awaiting_deploy | Priority: urgent',
+        ].join('\n'),
+      }],
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: 'future_due',
+      readyTaskCount: 0,
+      blockedTaskCount: 0,
+      futureDueCount: 1,
+      pulseGetMyAlertsObserved: true,
+      pulseAlertTaskOrderValid: true,
+    });
   });
 
   it('uses the final queue snapshot when a heartbeat checks Pulse more than once', () => {
@@ -264,13 +469,13 @@ Found 2 task(s) — 2 actionable.
       toolCalls: [
         { name: 'mcp__shizuha-pulse__pulse_get_my_alerts' },
         { name: 'mcp__shizuha-pulse__pulse_get_my_tasks' },
-        { name: 'exec_command' },
+        { name: 'edit' },
         { name: 'mcp__shizuha-pulse__pulse_get_my_tasks' },
       ],
       toolResults: [
         { content: 'No active assigned alerts.' },
         { content: first },
-        { content: 'tests passed' },
+        { content: 'applied the failing test fix' },
         { content: final },
       ],
     });
@@ -331,7 +536,7 @@ Found 1 task(s) — 1 actionable.
     expect(getHeartbeatQueueDrainOutcome('daemon-codex-agent')).toMatchObject({
       outcome: 'ready_no_progress',
       readyTaskCount: 1,
-      pulseGetMyTasksOnly: false,
+      pulseGetMyTasksOnly: true,
       pulseGetMyAlertsObserved: true,
       pulseAlertTaskOrderValid: true,
     });
@@ -506,6 +711,183 @@ Found 1 task(s) — 1 actionable.
     const escalated = recordHeartbeatQueueDrainTurn('aya-ready', blindTurn, '2026-08-15T10:00:00.000Z', { pulseQueueObligated: false });
     expect(escalated.outcome).toBe('needs_help');
     expect(escalated.reason).toContain('1 known ready task');
+  });
+
+  it('Sato-class bash-only heartbeat did not observe Pulse alerts', () => {
+    expect(isPulseGetMyAlertsToolName('mcp__shizuha-pulse__pulse_get_my_alerts')).toBe(true);
+    expect(isPulseGetMyAlertsToolName('bash')).toBe(false);
+    expect(heartbeatDrainSawPulseAlerts([{ name: 'bash' }, { name: 'bash' }])).toBe(false);
+    expect(heartbeatDrainSawPulseAlerts([
+      { name: 'mcp__shizuha-pulse__pulse_get_my_alerts' },
+    ])).toBe(true);
+  });
+
+  it('never injects or prefetches Pulse — the model stops when it stops', () => {
+    const alerts = [{ name: 'mcp__shizuha-pulse__pulse_get_my_alerts' }];
+    const tasks = [{ name: 'mcp__shizuha-pulse__pulse_get_my_tasks' }];
+    const work = [{ name: 'mcp__shizuha-pulse__pulse_get_my_work' }];
+    expect(heartbeatShouldForceTaskSnapshot(true, alerts, alerts)).toBe(false);
+    expect(heartbeatShouldForceTaskSnapshot(true, [], alerts)).toBe(false);
+    expect(heartbeatShouldPrefetchCombinedInbox({ isHeartbeat: true })).toBe(false);
+    expect(heartbeatShouldPrefetchCombinedInbox({
+      isHeartbeat: true,
+      permissionMode: 'default',
+      talkSeat: false,
+    })).toBe(false);
+    expect(heartbeatShouldInjectQueueToolsAfterNarration(true, [])).toEqual({ tasks: false, firstReady: false });
+    expect(heartbeatShouldInjectQueueToolsAfterNarration(true, alerts)).toEqual({ tasks: false, firstReady: false });
+    expect(heartbeatShouldInjectQueueToolsAfterNarration(true, work)).toEqual({ tasks: false, firstReady: false });
+    expect(heartbeatShouldInjectQueueToolsAfterNarration(true, tasks)).toEqual({ tasks: false, firstReady: false });
+  });
+
+  it('stubs inbox listing tools after prefetch without touching get_task', () => {
+    expect(heartbeatInboxReplayContent('mcp__shizuha-pulse__pulse_get_my_work', false)).toBeNull();
+    expect(heartbeatInboxReplayContent('mcp__shizuha-pulse__pulse_get_my_work', true)).toBe(HEARTBEAT_INBOX_ALREADY_FETCHED);
+    expect(heartbeatInboxReplayContent('mcp__shizuha-pulse__pulse_get_my_alerts', true)).toBe(HEARTBEAT_INBOX_ALREADY_FETCHED);
+    expect(heartbeatInboxReplayContent('mcp__shizuha-pulse__pulse_get_my_tasks', true)).toBe(HEARTBEAT_INBOX_ALREADY_FETCHED);
+    expect(heartbeatInboxReplayContent('mcp__shizuha-pulse__pulse_get_task', true)).toBeNull();
+    expect(heartbeatInboxReplayContent('mcp__shizuha-pulse__pulse_execute_transition', true)).toBeNull();
+  });
+
+  it('discards salvaged pulse_get_my_work only when the inbox is already in the turn', () => {
+    expect(shouldDiscardSalvagedInboxListing('mcp__shizuha-pulse__pulse_get_my_work', true)).toBe(true);
+    expect(shouldDiscardSalvagedInboxListing('mcp__shizuha-pulse__pulse_get_my_alerts', true)).toBe(true);
+    expect(shouldDiscardSalvagedInboxListing('mcp__shizuha-pulse__pulse_get_my_work', false)).toBe(false);
+    expect(shouldDiscardSalvagedInboxListing('mcp__shizuha-pulse__pulse_get_task', true)).toBe(false);
+    expect(shouldDiscardSalvagedInboxListing('mcp__shizuha-hive__hive_list_fleet_agents', true)).toBe(false);
+  });
+
+  it('keeps the prefetch snapshot when a later get_my_work is the inbox stub (Ryo ping-pong)', () => {
+    const snapshot = [
+      'Your Pulse work (alerts + tasks, one snapshot). You choose what to advance.',
+      '',
+      '## Alerts',
+      'No active alerts assigned to ryo@agents.shizuha.io.',
+      '',
+      '## Tasks',
+      '- **PLAT-1**: ready work',
+      '  Status: open | Priority: high',
+    ].join('\n');
+    expect(lastSuccessfulPulseTasksContent(
+      [
+        { name: 'mcp__shizuha-pulse__pulse_get_my_work' },
+        { name: 'mcp__shizuha-pulse__pulse_get_my_work' },
+      ],
+      [{ content: snapshot }, { content: HEARTBEAT_INBOX_ALREADY_FETCHED }],
+    )).toContain('PLAT-1');
+    recordHeartbeatQueueDrainOutcome('ryo-stub', { readyTaskCount: 5 });
+    recordHeartbeatQueueDrainOutcome('ryo-stub', { readyTaskCount: 5 });
+    const outcome = recordHeartbeatQueueDrainTurn('ryo-stub', {
+      toolCalls: [
+        { name: 'mcp__shizuha-pulse__pulse_get_my_work' },
+        { name: 'mcp__shizuha-pulse__pulse_get_my_work' },
+      ],
+      toolResults: [
+        { content: snapshot },
+        { content: HEARTBEAT_INBOX_ALREADY_FETCHED },
+      ],
+      incompleteReason: 'progress_only',
+    });
+    expect(outcome).toMatchObject({
+      outcome: 'needs_help',
+      readyTaskCount: 1,
+      consecutiveReadyNoProgressHeartbeats: 3,
+      incompleteReason: 'progress_only',
+      pulseGetMyTasksOnly: true,
+    });
+  });
+
+  it('treats alerts+tasks and prefetch+stub as listing-only (fruitless-rotate skip)', () => {
+    expect(heartbeatTurnWasPulseListingOnly({
+      toolCalls: [
+        { name: 'mcp__shizuha-pulse__pulse_get_my_alerts' },
+        { name: 'mcp__shizuha-pulse__pulse_get_my_tasks' },
+      ],
+      toolResults: [{ content: 'none' }, { content: 'Tasks' }],
+    })).toBe(true);
+    expect(heartbeatTurnWasPulseListingOnly({
+      toolCalls: [
+        { name: 'mcp__shizuha-pulse__pulse_get_my_work' },
+        { name: 'mcp__shizuha-pulse__pulse_get_my_work' },
+      ],
+      toolResults: [{ content: 'snapshot' }, { content: HEARTBEAT_INBOX_ALREADY_FETCHED }],
+    })).toBe(true);
+    expect(heartbeatTurnWasPulseListingOnly({
+      toolCalls: [
+        { name: 'mcp__shizuha-pulse__pulse_get_my_work' },
+        { name: 'mcp__shizuha-pulse__pulse_get_task' },
+      ],
+      toolResults: [{ content: 'snapshot' }, { content: 'opened' }],
+    })).toBe(false);
+    expect(heartbeatLoopBreakMessage('mcp__shizuha-pulse__pulse_get_my_work')).toBe(HEARTBEAT_LISTING_LOOP_BREAK);
+    expect(heartbeatLoopBreakMessage('mcp__shizuha-pulse__pulse_get_my_alerts')).toBe(HEARTBEAT_LISTING_LOOP_BREAK);
+    expect(heartbeatLoopBreakMessage('mcp__shizuha-pulse__pulse_get_task')).toBe(HEARTBEAT_GET_TASK_LOOP_BREAK);
+    expect(HEARTBEAT_LISTING_LOOP_BREAK).not.toContain('Do not pulse_get_task');
+    expect(HEARTBEAT_LISTING_LOOP_BREAK).not.toContain('Call pulse_get_task');
+    expect(HEARTBEAT_LISTING_LOOP_BREAK).toContain('mcp__shizuha-pulse__pulse_get_task');
+    expect(HEARTBEAT_LISTING_LOOP_BREAK).toContain('mcp__shizuha-pulse__pulse_add_comment');
+    expect(HEARTBEAT_LISTING_LOOP_BREAK).toContain('mcp__shizuha-pulse__pulse_execute_transition');
+    expect(HEARTBEAT_INBOX_ALREADY_FETCHED).toContain('mcp__shizuha-pulse__pulse_add_comment');
+    expect(HEARTBEAT_INBOX_ALREADY_FETCHED).not.toContain(' or pulse_add_comment');
+    expect(HEARTBEAT_INBOX_ALREADY_FETCHED).not.toMatch(/stay silent|end silent|Standing by/i);
+    expect(HEARTBEAT_LISTING_LOOP_BREAK).not.toMatch(/stay silent|end silent|Standing by/i);
+    expect(HEARTBEAT_GET_TASK_LOOP_BREAK).toContain('mcp__shizuha-pulse__pulse_get_task');
+    expect(HEARTBEAT_GET_TASK_LOOP_BREAK).not.toContain('Do not pulse_get_task');
+  });
+
+  it('never opens a specific ticket for the model', () => {
+    const tasks = [{ name: 'mcp__shizuha-pulse__pulse_get_my_tasks' }];
+    const alerts = [{ name: 'mcp__shizuha-pulse__pulse_get_my_alerts' }];
+    expect(isPulseGetTaskToolName('mcp__shizuha-pulse__pulse_get_task')).toBe(true);
+    expect(isPulseGetTaskToolName('mcp__shizuha-pulse__pulse_get_my_tasks')).toBe(false);
+    expect(heartbeatShouldForceFirstReadyTask(false, tasks, tasks)).toBe(false);
+    expect(heartbeatShouldForceFirstReadyTask(true, alerts, tasks)).toBe(false);
+    expect(heartbeatShouldForceFirstReadyTask(true, tasks, tasks)).toBe(false);
+    expect(heartbeatShouldForceFirstReadyTask(
+      true,
+      [...tasks, { name: 'mcp__shizuha-pulse__pulse_get_task' }],
+      tasks,
+    )).toBe(false);
+    expect(heartbeatShouldForceFirstReadyTask(true, tasks, [{ name: 'bash' }])).toBe(false);
+    expect(heartbeatShouldForceFirstReadyTask(true, tasks, [])).toBe(false);
+  });
+
+  it('picks the first ready Pulse key and skips blocked items', () => {
+    const snapshot = [
+      'Tasks for saki@shizuha.com (showing top 5 of 8 active, queue-ordered; limit=5).',
+      '',
+      '- **PLAT-6226**: frozen Origin PR',
+      '  Status: blocked | Priority: urgent',
+      '',
+      '- **SCLI-401**: mcp-multiplexer accepts invalid service entries',
+      '  Status: open | Priority: high',
+      '',
+      '- **SCLI-404**: auth login EOF',
+      '  Status: open | Priority: high',
+    ].join('\n');
+    expect(firstReadyPulseTaskKeyFromSnapshot(snapshot)).toBe('SCLI-401');
+    expect(firstReadyPulseTaskKeyFromSnapshot('No active assigned tasks.')).toBe(null);
+  });
+
+  it('skips SCHEMA REPAIR todos when another ready item exists', () => {
+    const snapshot = [
+      'Tasks for revi@shizuha.com (showing top 5 of 18 active, queue-ordered; limit=5).',
+      '',
+      '- **HIVE-1953**: [SCHEMA REPAIR: missing_evidence_schema] [BLOCKER] HIVE-1952: Raise to Admin Ops',
+      '  Status: todo | Priority: urgent',
+      '',
+      '- **PLS-986**: Security exact-version verdict on PLS-695 contract',
+      '  Status: todo | Priority: urgent',
+    ].join('\n');
+    expect(firstReadyPulseTaskKeyFromSnapshot(snapshot)).toBe('PLS-986');
+  });
+
+  it('opens SCHEMA REPAIR when it is the only ready item', () => {
+    const snapshot = [
+      '- **HIVE-1953**: [SCHEMA REPAIR: missing_evidence_schema] retry typed evidence',
+      '  Status: todo | Priority: urgent',
+    ].join('\n');
+    expect(firstReadyPulseTaskKeyFromSnapshot(snapshot)).toBe('HIVE-1953');
   });
 
 });

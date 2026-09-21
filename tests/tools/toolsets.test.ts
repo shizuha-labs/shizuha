@@ -243,14 +243,16 @@ describe('Role-based profiles', () => {
     expect(result).toEqual(ALL_TOOLS);
   });
 
-  it('qa_engineer gets read tools + browser, no write/bash/edit', () => {
+  it('qa_engineer gets read tools + least-privilege write/execute (SCLI-577)', () => {
     const result = manager.filterTools('qa_engineer', ALL_TOOLS);
     expect(result).toContain('read');
     expect(result).toContain('glob');
     expect(result).toContain('mcp__pulse__list_tasks');
-    expect(result).not.toContain('write');
-    expect(result).not.toContain('bash');
-    expect(result).not.toContain('edit');
+    // SCLI-577: QA needs local write/execute for regression artifacts/fixtures.
+    expect(result).toContain('write');
+    expect(result).toContain('bash');
+    expect(result).toContain('edit');
+    // Still pulse/wiki/drive MCP only — no admin/id/mail/inventory.
     expect(result).not.toContain('mcp__inventory__list_items');
     expect(result).not.toContain('mcp__mail__send_email');
   });
@@ -333,5 +335,32 @@ describe('Role-based profiles', () => {
     expect(data).not.toContain('mcp__admin__list_users');
     expect(data).not.toContain('mcp__mail__send_email');
     expect(data).not.toContain('mcp__connect__list_posts');
+  });
+});
+
+describe('SCLI-577 qa_engineer toolset', () => {
+  it('qa_engineer exposes least-privilege write/execute primitives', () => {
+    const manager = new ToolsetManager();
+    const result = manager.filterTools('qa_engineer', ALL_TOOLS);
+    // Read baseline preserved.
+    expect(result).toContain('read');
+    expect(result).toContain('grep');
+    // SCLI-577: write/execute primitives for QA artifacts/fixtures.
+    expect(result).toContain('write');
+    expect(result).toContain('edit');
+    expect(result).toContain('bash');
+    // pulse/wiki/drive MCP only — no admin/id/mail/inventory.
+    expect(result).toContain('mcp__pulse__list_tasks');
+    expect(result).not.toContain('mcp__inventory__list_items');
+    expect(result).not.toContain('mcp__mail__send_email');
+  });
+
+  it('negative profile still refuses writes (safe toolset unchanged)', () => {
+    const manager = new ToolsetManager();
+    const result = manager.filterTools('safe', ALL_TOOLS);
+    expect(result).not.toContain('write');
+    expect(result).not.toContain('edit');
+    expect(result).not.toContain('bash');
+    expect(result).not.toContain('apply_patch');
   });
 });

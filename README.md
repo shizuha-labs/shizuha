@@ -11,7 +11,7 @@
 
 **Shizuha Code** is an AI coding agent you run yourself — TUI, `exec`, or a local web dashboard. Bring your own endpoint: Ollama, vLLM, llama.cpp, OpenRouter, OpenAI, Claude, or any OpenAI-compatible server.
 
-**No Shizuha account is required.** Hosted Shizuha Code plans (subscribe for curated models, the same shape as OpenCode Zen) are optional and come later. Today you only need a URL.
+**No Shizuha account is required** for your own endpoint. Optional hosted try-out: `shizuha login` then `shizuha --model cortex/big-pickle` (Cortex relays OpenCode Zen's exact $0 models). Check remaining with `shizuha usage` or `/usage`. Your own URL is never billed.
 
 See [docs/QUICKSTART.md](docs/QUICKSTART.md) for the 60-second path.
 
@@ -20,6 +20,7 @@ See [docs/QUICKSTART.md](docs/QUICKSTART.md) for the 60-second path.
 - **Multi-provider** — Claude (Anthropic), GPT/Codex (OpenAI), Gemini (Google), Ollama, llama.cpp, OpenRouter, and more
 - **34 built-in tools** — File ops, search, bash, web fetch, cron, memory, inter-agent messaging, TTS, image gen
 - **Web dashboard** — Real-time chat, agent management, settings, model switching (:8015 HTTPS + :8016 HTTP)
+- **Desktop + Live voice** — `shizuha desktop` (Windows / macOS / Linux). Hina-style speech-to-speech on the same local harness. See [docs/DESKTOP.md](docs/DESKTOP.md)
 - **Multi-agent** — Run multiple agents simultaneously with different models and configurations
 - **Plugin system** — Extend with custom tools, channels, hooks, services, and LLM providers
 - **Multi-channel** — HTTP/WebSocket, Telegram, Discord, WhatsApp, Slack, Signal, LINE, iMessage
@@ -62,6 +63,9 @@ shizuha --model openai:llama3.2
 shizuha up
 # https://localhost:8015 — first-run username `shizuha`,
 # one-time password is printed in the daemon console.
+
+# Desktop GUI + Live voice-to-voice (needs XAI_API_KEY or `shizuha login`)
+shizuha desktop
 ```
 
 Same command works for vLLM, llama.cpp, OpenRouter, or a self-hosted Cortex:
@@ -117,6 +121,7 @@ shizuha up
 |---------|-------------|
 | `shizuha` | Interactive TUI |
 | `shizuha plugins` | Show the composed plugin profile (`default` or `fleet`) |
+| `shizuha desktop` | Local GUI + Live voice-to-voice |
 | `shizuha up` | Start daemon + dashboard |
 | `shizuha down` | Stop daemon |
 | `shizuha status` | Show daemon and agent status |

@@ -1,6 +1,7 @@
 import React, { useMemo } from 'react';
 import { Box, Text } from 'ink';
 import { formatModelDisplay } from '../utils/modelDisplay.js';
+import { CLI_VERSION } from '../../shared/version.js';
 
 const TIPS: string[] = [
   'Ctrl+J to insert a newline in your message',
@@ -30,7 +31,7 @@ const GREETINGS: string[] = [
 // Header(2) + InputBox(3) + StatusBar(2) + margins/buffer(3) = 10
 const CHROME_LINES = 10;
 
-const VERSION = '0.1.0-beta';
+const VERSION = CLI_VERSION;
 
 interface WelcomeArtProps {
   columns: number;

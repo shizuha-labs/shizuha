@@ -27,8 +27,10 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { AgentInfo } from './types.js';
+import { pinPreparedStatements } from '../shared/sqlite-statement-cache.js';
 
 export type RuntimeKind = 'child_process' | 'docker' | 'k8s';
+export type AgentLifecycleState = 'enabled' | 'hibernated' | 'operator_stopped';
 export type AgentStateEventType =
   | 'created' | 'updated' | 'enabled' | 'disabled'
   | 'started' | 'stopped' | 'drift' | 'reconciled' | 'deleted';
@@ -164,6 +166,7 @@ export class AgentStateStore {
 
   constructor(filename = ':memory:') {
     this.db = new Database(filename);
+    pinPreparedStatements(this.db);
     // WAL improves reader/writer concurrency for the file-backed daemon store;
     // no-op but harmless for :memory: test instances.
     this.db.pragma('journal_mode = WAL');
@@ -300,6 +303,51 @@ export class AgentStateStore {
       this.db.prepare('UPDATE agent SET desired_enabled = ?, operator_disabled = ?, version = ?, updated_at = ? WHERE id = ?')
         .run(enabled ? 1 : 0, clearOperator ? 0 : row.operator_disabled, nextVersion, now, agentId);
       this.writeEvent(agentId, enabled ? 'enabled' : 'disabled', nextVersion, actor, clearOperator ? 'override-kill-switch' : null);
+      return this.getAgent(agentId)!;
+    });
+    return txn.immediate();
+  }
+
+  /**
+   * Persist Hive's typed lifecycle intent atomically.
+   *
+   * Automatic hibernation is scale-to-zero but remains wakeable.  It must not
+   * set the operator kill-switch; explicit stop must.  Keeping the three fields
+   * in one transaction prevents a scrape from observing a half-written state.
+   */
+  setLifecycleState(
+    actor: string,
+    agentId: string,
+    lifecycleState: AgentLifecycleState,
+    opts: { overrideKillSwitch?: boolean } = {},
+  ): AgentRow {
+    const txn = this.db.transaction((): AgentRow => {
+      const row = this.getAgent(agentId);
+      if (!row) throw new UnknownAgentError(agentId);
+      if (lifecycleState === 'enabled' && row.operator_disabled === 1 && !opts.overrideKillSwitch) {
+        throw new Error('agent is operator-disabled (kill-switch active); not started');
+      }
+      const desiredEnabled = lifecycleState === 'enabled' ? 1 : 0;
+      const operatorDisabled = lifecycleState === 'operator_stopped' ? 1 : 0;
+      if (
+        row.desired_enabled === desiredEnabled
+        && row.operator_disabled === operatorDisabled
+        && row.desired_status === lifecycleState
+      ) {
+        return row;
+      }
+      const nextVersion = row.version + 1;
+      const now = new Date().toISOString();
+      this.db.prepare(
+        'UPDATE agent SET desired_enabled = ?, operator_disabled = ?, desired_status = ?, version = ?, updated_at = ? WHERE id = ?',
+      ).run(desiredEnabled, operatorDisabled, lifecycleState, nextVersion, now, agentId);
+      this.writeEvent(
+        agentId,
+        lifecycleState === 'enabled' ? 'enabled' : 'disabled',
+        nextVersion,
+        actor,
+        lifecycleState,
+      );
       return this.getAgent(agentId)!;
     });
     return txn.immediate();

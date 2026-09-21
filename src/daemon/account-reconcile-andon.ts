@@ -2,7 +2,7 @@ import type { AgentInfo } from './types.js';
 import { resolveClusterManagerUsername } from './auto-andon.js';
 import { refreshDaemonAdminToken } from './agent-accounts.js';
 import { sendConnectDm } from '../platform/connect-dm.js';
-import { recordAgentAccountReconcileAndonOutcome } from '../metrics/registry.js';
+import { recordAgentAccountReconcileAndonOutcome } from '../metrics/daemon.js';
 
 export const ACCOUNT_RECONCILE_ANDON_RATE_LIMIT_MS = 6 * 60 * 60 * 1000;
 

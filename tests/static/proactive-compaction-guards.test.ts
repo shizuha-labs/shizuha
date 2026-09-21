@@ -17,6 +17,7 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   compactionThresholdFor,
+  compactionTargetFractionFor,
   effectiveContextTokens,
   largeWindowHeadroomTokens,
   needsCompaction,
@@ -182,12 +183,33 @@ describe('proactive compaction — static force:true invariant', () => {
     expect(source.slice(Math.max(0, manualAt - 500), manualAt)).toContain('force: true');
   });
 
+  it('keeps a reduced hierarchical projection when the maintenance deadline aborts a later pass', () => {
+    const source = readRepoFile('src/state/compaction.ts');
+    expect(source).toContain('Hierarchical compaction interrupted — keeping the last reduced projection');
+    expect(source).toContain('options?.abortSignal?.aborted && compactedTokens < totalTokens');
+  });
+
   it('treats overflow-recovery as a logged failure of the proactive path (not normal ops)', () => {
     const source = readRepoFile('src/tui/session.ts');
     expect(source).toContain('proactive compaction failed');
     expect(source).toContain('Context overflow reached provider');
     // Must not re-introduce the fixed 0.90-only post-turn gate (diverges from pre-turn).
     expect(source).not.toMatch(/_lastApiInputTokens\s*>\s*maxContextTokens\s*\*\s*0\.90/);
+  });
+
+  it('does not count screenshot data-URIs as prompt text, then strips stale images if still over', () => {
+    // shizuha2 e81682dd 2026-09-19: JSON.stringify of image_url base64 made
+    // prompt≈523191 vs max_model_len=500000 after compaction had already fit.
+    const vllm = readRepoFile('src/provider/vllm.ts');
+    expect(vllm).toContain('payloadForPromptTokenEstimate');
+    expect(vllm).toContain('countVisionImageParts');
+    expect(vllm).toContain('IMAGE_TOKEN_ESTIMATE');
+    expect(vllm).not.toMatch(/countTokens\(JSON\.stringify\(vMessages\)/);
+    const session = readRepoFile('src/tui/session.ts');
+    expect(session).toContain('stripStaleWorkingImages');
+    expect(session).toContain('omitted stale screenshots from working context');
+    const context = readRepoFile('src/prompt/context.ts');
+    expect(context).toContain('export function stripStaleWorkingImages');
   });
 
   it('does not re-introduce the 24K large-window headroom that allowed overflow', () => {
@@ -366,5 +388,80 @@ describe('resume compaction — semantic only with immutable suffix (2026-08-09)
     const compaction = readRepoFile('src/state/compaction.ts');
     expect(loop).not.toMatch(/MAX_MESSAGE_CHARS|output truncated to prevent context overflow/);
     expect(compaction).not.toMatch(/TASK_ANCHOR_MAX_CHARS|function truncateMiddle/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PLAT-9194 deterministic compaction band: trigger T_high=0.60, hierarchical
+// passes shrink to the band floor T_low=0.40. The old shape (trigger 0.75,
+// trim-to trigger*0.92 ≈ 0.69) re-filled to the trigger every cycle — the
+// observed 50K→358K sawtooth ratchet (kai seat, 2026-09-18, ~80K tok/h,
+// emergency-trim cache-break, TTFT 140s). Steady state must be the BAND.
+describe('PLAT-9194 deterministic compaction band [0.40, 0.60]', () => {
+  it('large-window trigger defaults to T_high = 0.60 of the announced window', () => {
+    expect(compactionThresholdFor(512_000)).toBeCloseTo(0.60, 5);
+    expect(Math.round(512_000 * compactionThresholdFor(512_000))).toBe(307_200);
+    expect(Math.round(262_144 * compactionThresholdFor(262_144))).toBe(157_286);
+  });
+
+  it('band floor defaults to T_low = 0.40 and sits strictly below the trigger', () => {
+    for (const window of [200_000, 262_144, 320_000, 512_000, 1_000_000]) {
+      const target = compactionTargetFractionFor(window);
+      const trigger = compactionThresholdFor(window);
+      expect(target).toBeCloseTo(0.40, 5);
+      expect(target).toBeLessThan(trigger);
+      expect(window * target).toBeLessThan(window * trigger);
+    }
+  });
+
+  it('a misconfigured high target is clamped strictly below the trigger', () => {
+    process.env['SHIZUHA_CORTEX_COMPACTION_TARGET_FRACTION'] = '0.90';
+    try {
+      for (const window of [262_144, 512_000]) {
+        const target = compactionTargetFractionFor(window);
+        expect(target).toBeLessThan(compactionThresholdFor(window));
+        expect(target).toBeCloseTo(compactionThresholdFor(window) * 0.95, 5);
+      }
+    } finally {
+      delete process.env['SHIZUHA_CORTEX_COMPACTION_TARGET_FRACTION'];
+    }
+  });
+
+  it('env overrides compose: trigger fraction override keeps the floor at 0.40 when valid', () => {
+    process.env['SHIZUHA_CORTEX_COMPACTION_TRIGGER_FRACTION'] = '0.50';
+    try {
+      expect(compactionThresholdFor(512_000)).toBeCloseTo(0.50, 5);
+      expect(compactionTargetFractionFor(512_000)).toBeCloseTo(0.40, 5);
+    } finally {
+      delete process.env['SHIZUHA_CORTEX_COMPACTION_TRIGGER_FRACTION'];
+    }
+  });
+
+  it('small windows keep the audited 0.70 trigger; the floor still applies', () => {
+    const small = 32_000;
+    expect(compactionThresholdFor(small)).toBeCloseTo(0.70, 5);
+    expect(compactionTargetFractionFor(small)).toBeCloseTo(0.40, 5);
+  });
+
+  it('the 48K trigger floor still guards a low absolute override', () => {
+    // The floor is reachable only through SHIZUHA_CORTEX_COMPACTION_TRIGGER_TOKENS
+    // (the default 0.60 fraction never dips below 48K on ≥200K windows).
+    process.env['SHIZUHA_CORTEX_COMPACTION_TRIGGER_TOKENS'] = '1000';
+    try {
+      const window = 512_000;
+      const trigger = compactionThresholdFor(window);
+      expect(window * trigger).toBe(48_000);
+      expect(window - window * trigger).toBeGreaterThanOrEqual(largeWindowHeadroomTokens(window) - 1);
+      // the band floor must still sit strictly below the floored trigger
+      expect(compactionTargetFractionFor(window)).toBeLessThan(trigger);
+    } finally {
+      delete process.env['SHIZUHA_CORTEX_COMPACTION_TRIGGER_TOKENS'];
+    }
+  });
+
+  it('source wires the band floor into the hierarchical-pass budget', () => {
+    const src = readFileSync(resolve(repoRoot, 'src/state/compaction.ts'), 'utf8');
+    expect(src).toMatch(/compactionTargetFractionFor\(maxTokens\)/);
+    expect(src, 'the old trim-to-trigger*0.92 ratchet must be gone').not.toMatch(/triggerTokens \* 0\.92/);
   });
 });

@@ -27,8 +27,9 @@ import {
   DEFAULT_CORTEX_MODEL,
   resolveCortexAuthToken,
 } from '../provider/registry.js';
+import { fetchCortexUsage } from '../provider/cortex-usage.js';
 // runner-proxy was removed 2026-04-20 — shizuha-agent's /ws/runner/ is retired
-import { readDaemonState, updateAgentConfig, getFailoverChain, readEnabledAgents } from './state.js';
+import { readAgentLifecycleStates, readDaemonState, updateAgentConfig, getFailoverChain, readEnabledAgents } from './state.js';
 import { assertAgentCredentialScope } from './agent-credential.js';
 // mail-sync.ts is no longer used — mail sync is handled by shizuha-mail service
 // which POSTs to /v1/webhooks/mail when new messages arrive
@@ -44,7 +45,8 @@ import {
   reportTokenRateLimited,
   reportTokenInvalid,
   getActiveClaudeToken,
-  setOpenAIKey,
+  openaiProviderSettingsView,
+  applyOpenAIProviderFromDashboard,
   setGoogleKey,
   removeProvider,
   saveCodexAccount,
@@ -131,6 +133,11 @@ import { checkRateLimit, recordFailure, resetFailures } from '../devices/rateLim
 import type { ChannelType } from '../gateway/types.js';
 import { EventLog, isDurableEvent, type ReplayedEvent } from './event-log.js';
 import { sendJsonOverSocket } from './ws-send.js';
+import {
+  pickVoiceS2SAgent,
+  probeVoiceS2S,
+  tryHandleVoiceS2SUpgrade,
+} from './voice-s2s-proxy.js';
 
 // (No JWT minting in the daemon. The dashboard talks to platform Pulse using
 // the operator's stored shizuha-id JWT — see getPulseServiceToken() below.)
@@ -735,7 +742,10 @@ function redactAgentEnv(env: Record<string, string> | undefined): Record<string,
   );
 }
 
-function serializeAgent(a: AgentInfo): Record<string, unknown> {
+function serializeAgent(
+  a: AgentInfo,
+  lifecycleState = readAgentLifecycleStates().get(a.id),
+): Record<string, unknown> {
   const state = readDaemonState();
   const agentState = state?.agents.find((s) => s.agentId === a.id);
   // Read the agent's platform user_id from its local cred file (populated by
@@ -773,6 +783,9 @@ function serializeAgent(a: AgentInfo): Record<string, unknown> {
     effectiveCapabilities: a.effectiveCapabilities ?? null,
     status: agentState?.status ?? 'unknown',
     enabled: agentState?.enabled ?? false,
+    localPort: a.localPort ?? null,
+    lifecycleState: lifecycleState
+      ?? (agentState?.enabled ? 'enabled' : 'operator_stopped'),
     pid: agentState?.pid,
     error: agentState?.error,
     lastActiveAt: getAgentLastActivity(a.id) ?? null,
@@ -2566,9 +2579,12 @@ class ChatbotBridge {
 
   /** Broadcast the full agent list (used after create/delete). */
   broadcastAgentsSnapshot(): void {
+    const lifecycleStates = readAgentLifecycleStates();
     this.broadcastAll({
       type: 'agents_snapshot',
-      agents: this.agents.map(serializeAgent),
+      agents: this.agents.map((agent) => (
+        serializeAgent(agent, lifecycleStates.get(agent.id))
+      )),
     });
   }
 
@@ -3129,8 +3145,14 @@ class ChatbotBridge {
   /** Handle an RPC request and return the result. */
   private async handleRpc(method: string, params: Record<string, unknown>): Promise<unknown> {
     switch (method) {
-      case 'agents.list':
-        return { agents: this.agents.map(serializeAgent) };
+      case 'agents.list': {
+        const lifecycleStates = readAgentLifecycleStates();
+        return {
+          agents: this.agents.map((agent) => (
+            serializeAgent(agent, lifecycleStates.get(agent.id))
+          )),
+        };
+      }
 
       case 'templates.list': {
         try {
@@ -4344,7 +4366,33 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
   // ── Agent list ──
 
   app.get('/v1/agents', async () => {
-    return { agents: config.agents.map(serializeAgent) };
+    const lifecycleStates = readAgentLifecycleStates();
+    return {
+      agents: config.agents.map((agent) => (
+        serializeAgent(agent, lifecycleStates.get(agent.id))
+      )),
+    };
+  });
+
+  app.get<{ Querystring: { agent?: string } }>('/v1/voice/s2s', async (request, reply) => {
+    const agent = pickVoiceS2SAgent(config.agents, String(request.query.agent || ''));
+    const port = Number(agent?.localPort);
+    if (!agent || !Number.isFinite(port) || port <= 0) {
+      return reply.code(404).send({
+        ok: false,
+        error: 'Speech-to-speech needs a running local agent gateway.',
+      });
+    }
+    const probe = await probeVoiceS2S(port);
+    return {
+      ok: probe.ok,
+      path: '/v1/voice/realtime',
+      transport: 's2s',
+      via: 'scli',
+      agent: agent.username,
+      model: probe.model ?? agent.model ?? null,
+      tools: probe.tools ?? [],
+    };
   });
 
   // ── Agent activity log (full transcript from session JSONL) ──
@@ -5135,9 +5183,14 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
   // ── Agent enable/disable ──
 
   app.post<{
-    Body: { agent_id: string; enabled: boolean; overrideKillSwitch?: boolean };
+    Body: {
+      agent_id: string;
+      enabled: boolean;
+      overrideKillSwitch?: boolean;
+      lifecycle_state?: 'hibernated' | 'operator_stopped';
+    };
   }>('/v1/agents/toggle', async (request, reply) => {
-    const { agent_id, enabled, overrideKillSwitch } = request.body ?? {};
+    const { agent_id, enabled, overrideKillSwitch, lifecycle_state } = request.body ?? {};
     if (!agent_id || typeof enabled !== 'boolean') {
       return reply.status(400).send({ error: 'agent_id and enabled (boolean) are required' });
     }
@@ -5150,12 +5203,21 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
       const result = await enableAndStartAgent(agent_id, { overrideKillSwitch: overrideKillSwitch === true });
       if (!result.ok) return reply.status(500).send({ error: result.error });
       setTimeout(() => chatBridge.broadcastAgentUpdate(agent_id), 1000);
-      return { status: 'enabled', agent_id };
+      return { status: 'enabled', lifecycle_state: 'enabled', agent_id };
     } else {
-      const result = disableAndStopAgent(agent_id);
+      if (lifecycle_state && !['hibernated', 'operator_stopped'].includes(lifecycle_state)) {
+        return reply.status(400).send({ error: 'lifecycle_state must be hibernated or operator_stopped' });
+      }
+      const result = disableAndStopAgent(agent_id, {
+        lifecycleState: lifecycle_state ?? 'operator_stopped',
+      });
       if (!result.ok) return reply.status(500).send({ error: result.error });
       chatBridge.broadcastAgentUpdate(agent_id);
-      return { status: 'disabled', agent_id };
+      return {
+        status: 'disabled',
+        lifecycle_state: lifecycle_state ?? 'operator_stopped',
+        agent_id,
+      };
     }
   });
 
@@ -5748,6 +5810,8 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
 
   // ── Settings / Runtime info ──
 
+  app.get('/v1/cortex/usage', async () => fetchCortexUsage());
+
   app.get('/v1/settings', async () => {
     const state = readDaemonState();
     const auth = getShizuhaAuthStatus();
@@ -5793,10 +5857,7 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
             lastRateLimitAt: t.lastRateLimitAt,
           })),
         },
-        openai: {
-          configured: !!creds.openai?.apiKey,
-          keyPrefix: creds.openai?.apiKey ? creds.openai.apiKey.slice(0, 10) + '...' : null,
-        },
+        openai: openaiProviderSettingsView(creds.openai),
         google: {
           configured: !!creds.google?.apiKey,
           keyPrefix: creds.google?.apiKey ? creds.google.apiKey.slice(0, 10) + '...' : null,
@@ -6699,15 +6760,18 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
     return { ok: true };
   });
 
-  // OpenAI: set API key
-  app.put<{ Body: { apiKey: string } }>('/v1/providers/openai', async (request, reply) => {
-    const { apiKey } = request.body ?? {};
-    if (!apiKey || typeof apiKey !== 'string' || apiKey.length < 10) {
-      return reply.status(400).send({ error: 'Valid API key is required' });
-    }
-    setOpenAIKey(apiKey);
-    return { ok: true };
-  });
+  // OpenAI / OpenAI-compatible: key and/or base URL + model. URL-only is
+  // valid for local Ollama/vLLM/llama.cpp — Shizuha ID is not required.
+  app.put<{ Body: { apiKey?: string; baseUrl?: string; defaultModel?: string } }>(
+    '/v1/providers/openai',
+    async (request, reply) => {
+      const result = applyOpenAIProviderFromDashboard(request.body ?? {});
+      if (!result.ok) {
+        return reply.status(400).send({ error: result.error });
+      }
+      return { ok: true };
+    },
+  );
 
   // Google: set API key
   app.put<{ Body: { apiKey: string } }>('/v1/providers/google', async (request, reply) => {
@@ -7236,6 +7300,7 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
       // within one gather cycle and there is no stale-cache split-brain.
       const state = readDaemonState();
       const enabledIds = readEnabledAgents();
+      const lifecycleStates = readAgentLifecycleStates();
       const runningIds = new Set(
         (state?.agents ?? []).filter((s) => s.status === 'running').map((s) => s.agentId),
       );
@@ -7243,7 +7308,13 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
       const capacityUnavailableIds = new Set(
         config.agents.filter((a) => isAgentInTokenPoolBackoff(a.id)).map((a) => a.id),
       );
-      return buildAgentHealth(config.agents, enabledIds, runningIds, capacityUnavailableIds);
+      return buildAgentHealth(
+        config.agents,
+        enabledIds,
+        runningIds,
+        capacityUnavailableIds,
+        lifecycleStates,
+      );
     });
   }
 
@@ -7256,6 +7327,17 @@ export async function startDashboard(config: DashboardConfig): Promise<void> {
   httpServer.on('upgrade', (request: import('http').IncomingMessage, socket: import('stream').Duplex, head: Buffer) => {
     const remoteIp = (request.socket as any).remoteAddress || '';
     const url = new URL(request.url ?? '/', `http://${request.headers.host}`);
+
+    if (tryHandleVoiceS2SUpgrade(request, socket, head, {
+      resolveAgent: (query) => pickVoiceS2SAgent(config.agents, query),
+      isAllowed: (req, ip) => {
+        const sessionToken = extractSessionToken(req.headers.cookie);
+        if (sessionToken && validateSession(sessionToken).valid) return true;
+        return isDashboardLocalhostIp(ip);
+      },
+    })) {
+      return;
+    }
 
     // Mini-Connect WS: /connect/ws/connect/{user,agent}/ — same protocol the
     // real platform speaks. Authenticated via JWT on the query string. When

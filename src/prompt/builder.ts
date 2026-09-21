@@ -171,7 +171,7 @@ async function composeSystemPrompt(ctx: PromptContext): Promise<string> {
   let maxProjectMemoryChars: number | undefined;
   let useLeanBasePrompt = false;
   if (ctx.model) {
-    const { getModelProfile } = await import('../provider/model-profile.js');
+    const { getModelProfile, resolveMinimalSystemPrompt } = await import('../provider/model-profile.js');
     const profile = getModelProfile(ctx.model);
     includeToolListInPrompt = profile.includeToolListInPrompt;
     maxProjectMemoryChars = profile.maxProjectMemoryChars;
@@ -222,7 +222,8 @@ async function composeSystemPrompt(ctx: PromptContext): Promise<string> {
     // useFullSystemPrompt=false = minimal prompt only
     if (!profile.useFullSystemPrompt) {
       const sections: string[] = [];
-      if (profile.minimalSystemPrompt) sections.push(profile.minimalSystemPrompt);
+      const mini = resolveMinimalSystemPrompt(profile, { role: ctx.role });
+      if (mini) sections.push(mini);
       sections.push(`Working directory: ${ctx.cwd}`);
       const memory = await loadMemory(ctx.cwd);
       if (memory) {

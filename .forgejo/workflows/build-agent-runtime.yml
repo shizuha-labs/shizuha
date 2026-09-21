@@ -13,6 +13,7 @@
 name: build-agent-runtime
 # PLAT-4740: CI re-fire after YAML-safe smoke renderer (supersedes e669884/ef5e520 failures).
 on:
+  workflow_dispatch:
   # The runtime contains the bundled SCLI itself, not only third-party harnesses.
   # Rebuild on every runtime-source landing so a bridge/daemon fix cannot remain
   # published as a standalone tarball while every fleet pod keeps old code.
@@ -33,9 +34,11 @@ on:
       # whether a build is promotable at all — a change to it changes the build
       # contract, so it must be able to trigger a rebuild on its own.
       - 'scripts/render-agent-runtime-smoke-job.py'
+      - 'scripts/verify-agent-runtime-startup.py'
       - 'scripts/agent_runtime_overlay.py'
       - 'scripts/render-agent-runtime-overlay-job.py'
       - 'scripts/wait-k8s-job-terminal.py'
+      - 'scripts/verify-runtime-release-concurrency.py'
       - 'scripts/render-agent-runtime-manifest-job.py'
   workflow_dispatch:
     inputs:
@@ -101,14 +104,20 @@ jobs:
       # not the branch head.
       - name: Skip if superseded by a newer push
         id: supersede
+        env:
+          # Bound through env rather than interpolated into the shell body
+          # (semgrep run-shell-injection / CWE-78, PLAT-4734).
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "push" ]; then
+          if [ "$EVENT_NAME" != "push" ]; then
             echo "superseded=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          HEAD_SHA="$(git ls-remote origin "refs/heads/${{ github.ref_name }}" | awk '{print $1}')"
-          if [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" != "${{ github.sha }}" ]; then
+          HEAD_SHA="$(git ls-remote origin "refs/heads/$REF_NAME" | awk '{print $1}')"
+          if [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" != "$GITHUB_SHA" ]; then
             echo "superseded by $HEAD_SHA — its own queued run builds the newest source; skipping"
             echo "superseded=true" >> "$GITHUB_OUTPUT"
           else
@@ -116,6 +125,10 @@ jobs:
           fi
       - name: Install kubectl + cluster access
         if: steps.supersede.outputs.superseded != 'true'
+        env:
+          # Bound through env rather than interpolated into the shell body
+          # (semgrep run-shell-injection / CWE-78, PLAT-4734).
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
           set -euo pipefail
           # PLAT-4781: a fetched-and-executed binary must be integrity-pinned —
@@ -132,7 +145,7 @@ jobs:
           echo "${KUBECTL_SHA256}  kubectl" | sha256sum -c -
           install -m 0755 kubectl /usr/local/bin/kubectl
           mkdir -p "$HOME/.kube"
-          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
       - name: Multi-arch build + push + manifest
         id: build
@@ -274,6 +287,37 @@ jobs:
             [ -n "$version" ] || { echo "::error::failed to resolve every harness version"; exit 1; }
             require_safe_token_or_die resolved_version "$version" "$VERSION_RE"
           done
+          # PLAT-8128: engine-compat guard. The image base is Node ENV NODE_MAJOR
+          # (Dockerfile.agent-runtime). A resolved-latest openclaw can declare
+          # engines.node above the base (2026.9.3 requires >=24.16.0 <25 ||
+          # >=26.1.0) and hard-fail the npm RUN after minutes of expensive parent
+          # layers, red-ing every push build until the base bumps. Resolved-latest
+          # builds therefore walk back to the newest PUBLISHED release whose
+          # engines the base accepts (scripts/harness_node_compat.py), loudly.
+          # Explicit version inputs are upgrade intent: they fail loudly instead
+          # of being silently substituted.
+          OPENCLAW_BASE_NODE_MAJOR="$(sed -nE 's/^ENV NODE_MAJOR=([0-9]+)$/\1/p' Dockerfile.agent-runtime)"
+          [ -n "$OPENCLAW_BASE_NODE_MAJOR" ] || { echo "::error::could not parse ENV NODE_MAJOR from Dockerfile.agent-runtime"; exit 1; }
+          if [ -z "${INPUT_OPENCLAW_VERSION:-}" ]; then
+            engines_response="$(mktemp)"
+            if curl --retry 12 --retry-all-errors --retry-delay 5 \
+                --connect-timeout 15 --max-time 120 -fsS \
+                "${NPM_META_REG}/openclaw/${OPENCLAW_VER}" -o "$engines_response"; then
+              if ! python3 scripts/harness_node_compat.py check --engines-file "$engines_response" --base-major "$OPENCLAW_BASE_NODE_MAJOR"; then
+                echo "::warning::openclaw ${OPENCLAW_VER} declares engines.node above the image base (Node major ${OPENCLAW_BASE_NODE_MAJOR}); selecting the newest compatible published release"
+                doc_response="$(mktemp)"
+                if ! curl --retry 12 --retry-all-errors --retry-delay 5 \
+                    --connect-timeout 15 --max-time 120 -fsS \
+                    "${NPM_REG}/openclaw" -o "$doc_response"; then
+                  echo "::error::openclaw packagedoc unavailable through the npm cache"; exit 1
+                fi
+                OPENCLAW_VER="$(python3 scripts/harness_node_compat.py pick-newest --doc-file "$doc_response" --base-major "$OPENCLAW_BASE_NODE_MAJOR")" \
+                  || { echo "::error::no Node-${OPENCLAW_BASE_NODE_MAJOR}-compatible openclaw release published"; exit 1; }
+                require_safe_token_or_die resolved_openclaw "$OPENCLAW_VER" "$VERSION_RE"
+                echo "openclaw walked back to ${OPENCLAW_VER} (Node-${OPENCLAW_BASE_NODE_MAJOR}-compatible)"
+              fi
+            fi
+          fi
           npm_exact_available_in_cache '%40anthropic-ai%2Fclaude-code' "$CC_VER" \
             || { echo "::error::authoritative Claude Code ${CC_VER} is unavailable through the npm cache"; exit 1; }
           npm_exact_available_in_cache '%40openai%2Fcodex' "$CODEX_VER" \
@@ -304,33 +348,66 @@ jobs:
           # never downloads or unpacks the multi-gigabyte browser/base rootfs.
           # Any installed dependency, Dockerfile, harness, or ancestry change
           # falls back to the existing full native Kaniko build.
-          OVERLAY_BASE_INDEX_DIGEST="sha256:07d955d1c51de47c79cbf844208dade74b6062f96c683fab47b5c99d30e90179"
-          OVERLAY_BASE_SOURCE_SHA="c989cdca3155a9dd7c8ad6256f803d503b6ec198"
-          OVERLAY_BASE_CC_VER="2.1.228"
-          OVERLAY_BASE_CODEX_VER="0.147.0"
-          OVERLAY_BASE_ANTIGRAVITY_VER="1.1.12"
-          OVERLAY_BASE_OPENCLAW_VER="2026.7.1-2"
+          # Last smoked multi-arch: harness-202609110337-f1f8d87 (Desired gen 36).
+          OVERLAY_BASE_INDEX_DIGEST="sha256:f9a64b8169408c9128f0da3d2e7df2fc58cb6ea9185009a0fc92d6fb9ec02730"
+          OVERLAY_BASE_SOURCE_SHA="f1f8d87674bd27652a2d9d96bc4a5973b4d5dbd8"
+          OVERLAY_BASE_CC_VER="2.1.268"
+          OVERLAY_BASE_CODEX_VER="0.154.0"
+          OVERLAY_BASE_ANTIGRAVITY_VER="1.2.0"
+          OVERLAY_BASE_OPENCLAW_VER="2026.9.4"
           OVERLAY_ELIGIBLE=false
+          overlay_eligible_with() {
+            python3 scripts/agent_runtime_overlay.py eligible \
+              --repo-root . \
+              --base-source-sha "$OVERLAY_BASE_SOURCE_SHA" \
+              --source-sha "$SOURCE_SHA" \
+              --claude-code "$1" \
+              --codex "$2" \
+              --antigravity "$3" \
+              --openclaw "$4" \
+              --base-claude-code "$OVERLAY_BASE_CC_VER" \
+              --base-codex "$OVERLAY_BASE_CODEX_VER" \
+              --base-antigravity "$OVERLAY_BASE_ANTIGRAVITY_VER" \
+              --base-openclaw "$OVERLAY_BASE_OPENCLAW_VER"
+          }
           # checkout@v4 uses fetch-depth=1. Deepen only this branch enough to
           # prove the immutable base is an ancestor; failure is a safe full-build
           # fallback, never permission to overlay an unrelated source tree.
           git fetch --quiet --deepen=256 origin "$SOURCE_BRANCH" || true
-          if python3 scripts/agent_runtime_overlay.py eligible \
-              --repo-root . \
-              --base-source-sha "$OVERLAY_BASE_SOURCE_SHA" \
-              --source-sha "$SOURCE_SHA" \
-              --claude-code "$CC_VER" \
-              --codex "$CODEX_VER" \
-              --antigravity "$ANTIGRAVITY_VER" \
-              --openclaw "$OPENCLAW_VER" \
-              --base-claude-code "$OVERLAY_BASE_CC_VER" \
-              --base-codex "$OVERLAY_BASE_CODEX_VER" \
-              --base-antigravity "$OVERLAY_BASE_ANTIGRAVITY_VER" \
-              --base-openclaw "$OVERLAY_BASE_OPENCLAW_VER"; then
+          if overlay_eligible_with "$CC_VER" "$CODEX_VER" "$ANTIGRAVITY_VER" "$OPENCLAW_VER"; then
             OVERLAY_ELIGIBLE=true
             echo "::notice::source-only OCI overlay eligible base=${OVERLAY_BASE_INDEX_DIGEST} source=${SOURCE_SHA}"
+          elif [ -z "${INPUT_CLAUDE_CODE_VERSION:-}" ] \
+              && [ -z "${INPUT_CODEX_VERSION:-}" ] \
+              && [ -z "${INPUT_ANTIGRAVITY_VERSION:-}" ] \
+              && [ -z "${INPUT_OPENCLAW_VERSION:-}" ] \
+              && overlay_eligible_with "$OVERLAY_BASE_CC_VER" "$OVERLAY_BASE_CODEX_VER" "$OVERLAY_BASE_ANTIGRAVITY_VER" "$OVERLAY_BASE_OPENCLAW_VER"; then
+            # npm / Antigravity latest drifted past the last smoked image.
+            # Source-only SCLI still overlays that rootfs; chasing latest here
+            # is a full Kaniko on gx10-3 (NFS origin + serving rank).
+            CC_VER="$OVERLAY_BASE_CC_VER"
+            CODEX_VER="$OVERLAY_BASE_CODEX_VER"
+            ANTIGRAVITY_VER="$OVERLAY_BASE_ANTIGRAVITY_VER"
+            OPENCLAW_VER="$OVERLAY_BASE_OPENCLAW_VER"
+            OVERLAY_ELIGIBLE=true
+            echo "::notice::source-only OCI overlay eligible base=${OVERLAY_BASE_INDEX_DIGEST} source=${SOURCE_SHA}; pinning harness to last smoked overlay base (npm latest drifted)"
           else
             echo "::notice::full native runtime build required: source ancestry, installed inputs, or harness pins differ from the reviewed overlay base"
+          fi
+
+          # The pinned base is immutable by contract, but the registry can
+          # still lose it (GC/rotation, PLAT-9043: run 6583 FATAL 404 in the
+          # overlay job). A missing base must downgrade to the full native
+          # build, never fail the release: the overlay script is right to
+          # refuse an unverifiable base, so gate eligibility on resolvability.
+          if [ "$OVERLAY_ELIGIBLE" = true ]; then
+            BASE_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "http://${REG}/v2/${IMG}/manifests/${OVERLAY_BASE_INDEX_DIGEST}" || echo 000)"
+            if [ "$BASE_STATUS" != "200" ]; then
+              echo "::notice::pinned overlay base ${OVERLAY_BASE_INDEX_DIGEST} not resolvable in registry (HTTP ${BASE_STATUS}); falling back to full native runtime build"
+              OVERLAY_ELIGIBLE=false
+            fi
           fi
 
           render_overlay_job() {
@@ -380,12 +457,19 @@ jobs:
                 tolerations:
                   - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
                   - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # amd64 kaniko on i9-ws times out pushing to the in-cluster
+                  # registry ClusterIP (ORIG-253 asymmetric pod-CIDR routing);
+                  # s1's overlay works but carries operator=unschedulable.
+                  # Tolerate the s1 hold for CI Jobs (do not remove the taint)
+                  # and exclude i9-ws below.
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
                 affinity:
                   nodeAffinity:
                     requiredDuringSchedulingIgnoredDuringExecution:
                       nodeSelectorTerms:
                       - matchExpressions:
                         - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
                 initContainers:
                   # busybox sh only (alpine/git) — POSIX, no bashisms.
                   - name: git-clone
@@ -505,33 +589,15 @@ jobs:
           # external job fails closed for investigation instead of being erased.
           # One-time migration for pre-fence builders. A new run can reach this
           # step only after Forgejo's cancel-in-progress:false group has made
-          # every older workflow run terminal. Once the live coalescer also
-          # proves this workflow protected, an old-source harness-* Job is an
+          # every older workflow run terminal. Once the exact native authority
+          # and this run's compiled queue-behind policy are proven, a harness-* Job is an
           # orphan with no runner left to observe/promote it. Capture its logs
           # and remove only that exact legacy name class before the donor-backed
           # candidate starts. New candidate-* Jobs are never handled here.
-          # The deploy-lane identity intentionally cannot read Deployments. Resolve
-          # one deterministic Ready Pod through its narrower Pod-list permission,
-          # then exec that exact object. Do not swallow exec/RBAC failures: an
-          # unreadable live policy is distinct from a readable unprotected policy.
-          live_coalescer_pod="$(kubectl get pods -n origin \
-            -l app=run-coalescer -o json | jq -r '
-              [.items[]
-                | select(.status.phase == "Running")
-                | select(any(.status.containerStatuses[]?; .ready == true))]
-              | sort_by(.metadata.name)
-              | .[0].metadata.name // empty
-            ')"
-          [ -n "$live_coalescer_pod" ] || {
-            echo "::error::no Ready run-coalescer pod found"; exit 1;
-          }
-          if ! live_coalescer="$(kubectl exec -n origin "$live_coalescer_pod" -- \
-            sh -c 'cat /app/server.py')"; then
-            echo "::error::could not read live run-coalescer policy from ${live_coalescer_pod}"
-            exit 1
-          fi
-          grep -F '"build-agent-runtime.yml"' <<<"$live_coalescer" >/dev/null \
-            || { echo "::error::live run-coalescer does not protect runtime releases"; exit 1; }
+          python3 scripts/verify-runtime-release-concurrency.py \
+            --run-id "$ORIGIN_RUN_ID" --source-sha "$SOURCE_SHA" \
+            --source-ref "refs/heads/${SOURCE_BRANCH}" \
+            --repository shizuha-labs/shizuha-beta
           legacy_orphans="$(kubectl get jobs -n build \
             -l app=ci-build,service=agent-runtime -o json | jq -r '
               .items[]
@@ -637,12 +703,41 @@ jobs:
             }
             trap cleanup_on_failure EXIT INT TERM
             python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
-            cleanup_build_pair
-            render_build_job amd64 | kubectl apply -f -
-            render_build_job arm64 | kubectl apply -f -
-            python3 "$BUILD_GUARD" wait-pair --namespace build \
-              --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
-              --timeout-seconds 1800
+            # The heavy kaniko multi-arch build (PLAT-5831) intermittently fails
+            # on transients — CDN/registry push contention, builder preemption —
+            # then always recovers green on the same commit (recurring false-reds
+            # with no source change; e.g. run 20368 failed / same-SHA run 20388
+            # succeeded). wait-pair already deletes failed Jobs on failure
+            # (cleanup_on_failure=true), freeing the job names for an identical
+            # re-apply, so a same-SHA retry is deterministic: kaniko re-runs the
+            # exact same SOURCE_SHA against the same content-addressed cache and
+            # overwrites only the per-RUN candidate tags, never the promoted
+            # immutable release tag. Keep the retry BOUNDED (one retry = two
+            # attempts) so a genuinely broken src still fails closed for
+            # investigation rather than looping forever.
+            runtime_build_with_same_sha_retry() {
+              local attempt rc=1
+              for attempt in 1 2; do
+                echo "::notice::runtime build attempt ${attempt}/2 arch=amd64,arm64 sha=${SOURCE_SHA}"
+                cleanup_build_pair || true
+                render_build_job amd64 | kubectl apply -f -
+                render_build_job arm64 | kubectl apply -f -
+                # Capture the guard rc inside the else branch: in bash, `$?`
+                # after a `fi` reads the if-statement's status (0), NOT the
+                # failed condition's rc — capturing here is the reliable form.
+                if python3 "$BUILD_GUARD" wait-pair --namespace build \
+                    --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+                    --timeout-seconds 1800; then
+                  return 0
+                else
+                  rc=$?
+                  echo "::notice::runtime build attempt ${attempt}/2 failed (rc=${rc}) on sha=${SOURCE_SHA}; retrying the same-SHA build"
+                fi
+              done
+              echo "::error::runtime build failed after 2 attempts on sha=${SOURCE_SHA}"
+              return "$rc"
+            }
+            runtime_build_with_same_sha_retry
             trap - EXIT INT TERM
           fi
 
@@ -684,43 +779,45 @@ jobs:
           render_smoke_job amd64 | kubectl apply -f -
           render_smoke_job arm64 | kubectl apply -f -
           wait_smoke_job() {
-            local ARCH="$1" WAIT_PID POD_PHASE WAIT_STATUS
+            local ARCH="$1" POD_PHASE
             SMOKE_JOB="ci-smoke-agentrt-${CANDIDATE_TAG}-${ARCH}"
-            # A cold agent-runtime pull can take more than ten minutes on a
-            # bandwidth-constrained node. Also, a successful Pod can precede
-            # the Job controller's Complete condition by tens of seconds; the
-            # old 600s job-only wait lost that race and rejected an exit-0
-            # smoke. Keep kubectl's event-driven Job wait as the primary
-            # observer, but accept the single-Pod success directly and fail
-            # promptly on its terminal failure.
-            kubectl wait -n build --for=condition=complete "job/${SMOKE_JOB}" --timeout=1800s &
-            WAIT_PID=$!
-            while kill -0 "$WAIT_PID" 2>/dev/null; do
+            # PLS-207/PLAT-1219 (PLAT-6970): `kubectl wait --for=condition=complete`
+            # NEVER returns on a FAILED job — when the job fails and is reaped
+            # (ttlSecondsAfterFinished), `kubectl get job` returns NotFound and the
+            # wait hangs for the full timeout. Poll for Complete OR Failed instead
+            # (shizuha-tasks#392 pattern), and keep the single-Pod success/failure
+            # fast path (a successful Pod can precede the Job controller's Complete
+            # condition by tens of seconds; a cold agent-runtime pull can take >10m).
+            local DEADLINE=$(( $(date +%s) + 1800 ))
+            while true; do
+              local COMPLETE FAILED
+              COMPLETE="$(kubectl get job -n build "${SMOKE_JOB}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
+              FAILED="$(kubectl get job -n build "${SMOKE_JOB}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
               POD_PHASE="$(kubectl get pods -n build -l "job-name=${SMOKE_JOB}" \
                 -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)"
               case "$POD_PHASE" in
                 Succeeded)
-                  kill "$WAIT_PID" 2>/dev/null || true
-                  wait "$WAIT_PID" 2>/dev/null || true
                   return 0
                   ;;
                 Failed)
-                  kill "$WAIT_PID" 2>/dev/null || true
-                  wait "$WAIT_PID" 2>/dev/null || true
                   echo "::error::${ARCH} runtime image smoke failed"
                   kubectl logs -n build "job/${SMOKE_JOB}" --all-containers --tail=120 || true
                   return 1
                   ;;
               esac
+              [ "${COMPLETE}" = "True" ] && return 0
+              if [ "${FAILED}" = "True" ]; then
+                echo "::error::${ARCH} runtime image smoke failed"
+                kubectl logs -n build "job/${SMOKE_JOB}" --all-containers --tail=120 || true
+                return 1
+              fi
+              if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+                echo "::error::${ARCH} runtime image smoke timed out after 1800s"
+                kubectl logs -n build "job/${SMOKE_JOB}" --all-containers --tail=120 || true
+                return 1
+              fi
               sleep 5
             done
-            WAIT_STATUS=0
-            wait "$WAIT_PID" || WAIT_STATUS=$?
-            if [ "$WAIT_STATUS" -ne 0 ]; then
-              echo "::error::${ARCH} runtime image smoke failed or timed out"
-              kubectl logs -n build "job/${SMOKE_JOB}" --all-containers --tail=120 || true
-              return "$WAIT_STATUS"
-            fi
           }
           wait_smoke_job amd64 &
           AMD64_SMOKE_WAIT_PID=$!
@@ -749,12 +846,20 @@ jobs:
             --candidate-tag "$CANDIDATE_TAG" \
             --tag "$TAG" \
             --image-repo "$IMG" \
-            --base-index-digest "$OVERLAY_BASE_INDEX_DIGEST" \
             --amd64-digest "$AMD64_CANDIDATE_DIGEST" \
             --arm64-digest "$ARM64_CANDIDATE_DIGEST" | kubectl apply -f -
-          kubectl wait -n build --for=condition=complete "job/ci-manifest-agentrt-${CANDIDATE_TAG}" --timeout=300s || {
-            echo "::error::manifest combine failed"; kubectl logs -n build "job/ci-manifest-agentrt-${CANDIDATE_TAG}" --tail=80 || true; exit 1
-          }
+          # PLS-207/PLAT-1219 (PLAT-6970): `kubectl wait --for=condition=complete`
+          # NEVER returns on a FAILED job — poll Complete OR Failed instead.
+          MANIFEST_DEADLINE=$(( $(date +%s) + 300 ))
+          while true; do
+            M_COMPLETE="$(kubectl get job -n build "ci-manifest-agentrt-${CANDIDATE_TAG}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
+            M_FAILED="$(kubectl get job -n build "ci-manifest-agentrt-${CANDIDATE_TAG}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+            [ "${M_COMPLETE}" = "True" ] && break
+            if [ "${M_FAILED}" = "True" ] || [ "$(date +%s)" -ge "${MANIFEST_DEADLINE}" ]; then
+              echo "::error::manifest combine failed or timed out"; kubectl logs -n build "job/ci-manifest-agentrt-${CANDIDATE_TAG}" --tail=80 || true; exit 1
+            fi
+            sleep 5
+          done
           # Warm the now-proven manifest on every agent-eligible node in
           # parallel. Without this, the deliberately serial agent replacement
           # also serialized multi-gigabyte image pulls across the fleet, making
@@ -833,8 +938,37 @@ jobs:
               JOB_FAILED="$(kubectl get job -n build "$PREPULL_JOB" \
                 -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
               if [ "$JOB_FAILED" = True ]; then
+                # nodeName bypasses the scheduler's retry. A 16Mi pre-pull on a
+                # node already at 99% requested memory (gx10-2 GLM 85Gi residency)
+                # FailedSchedules forever and used to fail the whole runtime
+                # release after both-arch smoke already published the tag.
+                SCHED_MSG="$(kubectl get pods -n build -l "job-name=${PREPULL_JOB}" \
+                  -o jsonpath='{.items[0].status.conditions[?(@.type=="PodScheduled")].message} {.items[0].status.reason} {.items[0].status.message}' 2>/dev/null || true)"
+                # The last two alternatives match KUBELET-emit forms, not just
+                # scheduler FailedScheduling text: nodeName-bound prepull pods
+                # never get a PodScheduled condition, so the rejection surfaces
+                # as status.reason=OutOfmemory / status.message="Node didn't
+                # have enough resource: memory" (PLAT-7203). Do not tighten
+                # this back to scheduler-only patterns.
+                if echo "$SCHED_MSG" | grep -Eqi 'Insufficient memory|didn.t satisfy plugin|OutOfmemory|didn.t have enough resource'; then
+                  echo "::notice::skipping runtime image pre-pull on ${NODE}: unschedulable (${SCHED_MSG})"
+                  kubectl delete job -n build "$PREPULL_JOB" --wait=false || true
+                  return 0
+                fi
                 echo "::error::runtime image fleet pre-pull failed on ${NODE}"
                 kubectl describe job -n build "$PREPULL_JOB" || true
+                # PLAT-7269: `describe job` alone hides the pod-level failure
+                # reason (run 5354: 1 Failed pod, `Events: <none>`, TTL-expired
+                # before triage). Dump the pod's describe (container statuses +
+                # events) and logs so the workflow log alone is attributable.
+                PREPULL_POD="$(kubectl get pods -n build -l "job-name=${PREPULL_JOB}" \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+                if [ -n "$PREPULL_POD" ]; then
+                  kubectl describe pod -n build "$PREPULL_POD" || true
+                  kubectl logs -n build "$PREPULL_POD" --all-containers --tail=40 || true
+                else
+                  echo "::warning::no pod found for job ${PREPULL_JOB} (TTL may have expired)"
+                fi
                 return 1
               fi
               # Readiness can change after PREPULL_NODES is snapshotted. A
@@ -852,6 +986,14 @@ jobs:
               if [ "$SECONDS" -ge "$DEADLINE" ]; then
                 echo "::error::runtime image fleet pre-pull timed out on ${NODE}"
                 kubectl describe job -n build "$PREPULL_JOB" || true
+                # PLAT-7269: same pod-level attribution as the Failed branch —
+                # a wedged prepull must be diagnosable from the workflow log.
+                PREPULL_POD="$(kubectl get pods -n build -l "job-name=${PREPULL_JOB}" \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+                if [ -n "$PREPULL_POD" ]; then
+                  kubectl describe pod -n build "$PREPULL_POD" || true
+                  kubectl logs -n build "$PREPULL_POD" --all-containers --tail=40 || true
+                fi
                 return 1
               fi
               sleep 5
@@ -877,12 +1019,17 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # DesiredRuntimeRelease promote currently rewrites the rt-fleet
-          # *controller* image to the new harness digest. After the k8s
-          # actuator left this tree, that would roll the live supervisor
-          # onto a writer-less bundle. Agent images may still be built;
-          # they must not become the controller pin.
-          if [ ! -f src/plugins/fleet/k8s-backend.ts ]; then
+          # Public SCLI ships a stub src/daemon/k8s-backend.ts. File presence
+          # is not proof of the writer. Auto-promote from a stub tree used
+          # to self-bind the rt-fleet controller onto a writer-less bundle
+          # and fail-close harness-roll.
+          WRITER=""
+          if [ -f src/plugins/fleet/k8s-backend.ts ]; then
+            WRITER=src/plugins/fleet/k8s-backend.ts
+          elif [ -f src/daemon/k8s-backend.ts ]; then
+            WRITER=src/daemon/k8s-backend.ts
+          fi
+          if [ -z "$WRITER" ] || grep -q 'k8s fleet backend is not included' "$WRITER"; then
             echo "::notice::skipping DesiredRuntimeRelease promote: k8s actuator is not in this tree (hive-runtime owns the writer; rt-fleet stays on the pinned digest)"
             exit 0
           fi

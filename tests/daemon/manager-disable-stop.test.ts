@@ -130,4 +130,17 @@ describe('disableAndStopAgent persisted-roster fallback', () => {
       enabled: false,
     });
   });
+
+  it('automatic hibernation stops the runtime without setting the operator kill-switch', () => {
+    __setDiscoveredAgentsForTest([]);
+
+    const result = disableAndStopAgent('agent-ichi', { lifecycleState: 'hibernated' });
+
+    expect(result).toEqual({ ok: true });
+    expect(store.getAgent('agent-ichi')).toMatchObject({
+      desired_enabled: 0,
+      operator_disabled: 0,
+      desired_status: 'hibernated',
+    });
+  });
 });

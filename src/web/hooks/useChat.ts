@@ -1577,6 +1577,27 @@ export function useChat(options: UseChatOptions = {}) {
     }
   }
 
+  const appendLocalMessage = useCallback((role: 'user' | 'assistant', content: string) => {
+    const text = String(content || '').replace(/\s+/g, ' ').trim();
+    if (!text) return;
+    const msg: ChatMessage = {
+      id: `voice-${role}-${generateUuidV4()}`,
+      role,
+      content: text,
+      status: 'complete',
+      source: 'voice',
+      createdAt: new Date().toISOString(),
+    };
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === role && last.source === 'voice'
+        && String(last.content || '').trim().toLowerCase() === text.toLowerCase()) {
+        return prev;
+      }
+      return [...prev, msg];
+    });
+  }, []);
+
   // ── Send message ──
 
   const sendMessage = useCallback(async (content: string, images?: ImageAttachment[]) => {
@@ -1990,6 +2011,7 @@ export function useChat(options: UseChatOptions = {}) {
     turnCount,
     wsConnected,
     sendMessage,
+    appendLocalMessage,
     cancelStream,
     clearMessages,
     clearAllMessages,

@@ -4,6 +4,8 @@ import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import type { TranscriptEntry } from '../state/types.js';
 import { renderMarkdown } from '../utils/markdown.js';
 import wrapAnsi from 'wrap-ansi';
+import { parseMouseWheel } from '../utils/mouse.js';
+import { resetTuiCanvas } from '../utils/interactiveScreen.js';
 
 interface TranscriptPagerProps {
   entries?: TranscriptEntry[];
@@ -98,14 +100,18 @@ export const TranscriptPager: React.FC<TranscriptPagerProps> = ({
         '',
       ];
     }
-    return content.split('\n');
+    const lines = content.split('\n');
+    while (lines.length > 1 && lines[lines.length - 1]!.trim() === '') {
+      lines.pop();
+    }
+    return lines;
   }, [content]);
 
   // Header + footer take 2 rows
   const pageSize = Math.max(1, rows - 2);
   const maxOffset = Math.max(0, allLines.length - pageSize);
   // Start at the end so the latest response is visible immediately (SCLI-382).
-  const [scrollOffset, setScrollOffset] = useState(maxOffset);
+  const [scrollOffset, setScrollOffset] = useState(() => maxOffset);
 
   // Keep offset valid when terminal resizes or content changes
   useEffect(() => {
@@ -114,12 +120,18 @@ export const TranscriptPager: React.FC<TranscriptPagerProps> = ({
 
   // Enter alternate screen on mount, leave on unmount
   useEffect(() => {
-    if (!manageAlternateScreen) return;
-    write('\x1b[?1049h'); // enter alternate screen
-    write('\x1b[?25l');   // hide cursor
+    if (manageAlternateScreen) {
+      write('\x1b[?1049h'); // enter alternate screen
+      write('\x1b[?25l');   // hide cursor
+    }
     return () => {
-      write('\x1b[?25h');   // show cursor
-      write('\x1b[?1049l'); // leave alternate screen
+      if (manageAlternateScreen) {
+        write('\x1b[?25h');
+        write('\x1b[?1049l');
+      }
+      // Do not 2J here: this cleanup runs AFTER Ink paints the prompt
+      // tree and would wipe header/status (ghost-blank). App onExit
+      // clears first, then setScreen, then this unmounts.
     };
   }, [manageAlternateScreen, write]);
 
@@ -145,7 +157,14 @@ export const TranscriptPager: React.FC<TranscriptPagerProps> = ({
 
   useInput((input, key) => {
     if (input === 'q' || key.escape) {
+      resetTuiCanvas();
       onExit();
+      return;
+    }
+    const wheel = parseMouseWheel(input);
+    if (wheel) {
+      const delta = wheel === 'up' ? -3 : 3;
+      setScrollOffset((prev) => Math.min(maxOffset, Math.max(0, prev + delta)));
       return;
     }
     if (input === 'j' || key.downArrow) {

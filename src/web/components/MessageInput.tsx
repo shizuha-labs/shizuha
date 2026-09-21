@@ -26,6 +26,9 @@ interface MessageInputProps {
   voiceCallDuration?: number;
   onStartVoiceCall?: () => void;
   onHangupVoiceCall?: () => void;
+  liveAvailable?: boolean;
+  liveActive?: boolean;
+  onToggleLive?: () => void;
 }
 
 const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
@@ -60,6 +63,9 @@ export function MessageInput({
   voiceCallDuration = 0,
   onStartVoiceCall,
   onHangupVoiceCall,
+  liveAvailable = false,
+  liveActive = false,
+  onToggleLive,
 }: MessageInputProps) {
   const [value, setValue] = useState('');
   const [images, setImages] = useState<ImageAttachment[]>([]);
@@ -220,6 +226,22 @@ export function MessageInput({
             className="hidden"
             onChange={handleFileSelect}
           />
+
+          {liveAvailable && (
+            <button
+              type="button"
+              data-live-path="s2s"
+              onClick={onToggleLive}
+              className={`flex-shrink-0 h-10 px-3 rounded-xl text-xs font-semibold tracking-wide transition-all cursor-pointer ${
+                liveActive
+                  ? 'bg-red-600 hover:bg-red-500 text-white'
+                  : 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-[0_0_18px_rgba(8,145,178,0.35)]'
+              }`}
+              title={liveActive ? 'End live voice' : 'Start live voice-to-voice'}
+            >
+              {liveActive ? 'End Live' : 'Live'}
+            </button>
+          )}
 
           {/* Microphone button (Talk Mode) */}
           {micSupported && (

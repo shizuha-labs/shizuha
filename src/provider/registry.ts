@@ -14,8 +14,11 @@ import { CopilotProvider } from './copilot.js';
 import { XaiProvider } from './xai.js';
 import { GroqProvider } from './groq.js';
 import { TogetherProvider } from './together.js';
+import { GrokVoiceProvider, isGrokVoiceOmniModel, normalizeGrokVoiceModel, resolveGrokVoiceAuth } from './grok-voice.js';
 import { readCredentials } from '../config/credentials.js';
 import { readShizuhaAuth } from '../config/shizuhaAuth.js';
+
+export { isGrokVoiceOmniModel, normalizeGrokVoiceModel } from './grok-voice.js';
 
 export const DEFAULT_CORTEX_BASE_URL = 'https://cortex.shizuha.com';
 export const DEFAULT_CORTEX_MODEL = 'GLM-4.7';
@@ -37,6 +40,19 @@ const CORTEX_MODEL_FAMILY_PREFIXES = [
   'grok-',     // Grok via managed Cortex xAI provider (prefer cortex over direct XAI_API_KEY)
 ];
 
+/** OpenCode Zen $0 rows relayed by Cortex (CTX-694). Exact upstream ids. */
+export const CORTEX_OPENCODE_ZEN_FREE_IDS = [
+  'big-pickle',
+  'deepseek-v4-flash-free',
+  'mimo-v2.5-free',
+  'hy3-free',
+  'laguna-s-2.1-free',
+  'nemotron-3-ultra-free',
+  'nemotron-3.5-lightning-free',
+] as const;
+
+export const DEFAULT_CORTEX_FREE_MODEL = 'big-pickle';
+
 /**
  * Returns true if the model ID routes to the Cortex gateway — either via the
  * legacy `cortex/` routing prefix (still accepted during migration) or a clean
@@ -53,10 +69,15 @@ const CORTEX_MODEL_FAMILY_PREFIXES = [
  */
 export function isCortexModelId(model: string): boolean {
   if (!model) return false;
+  // Voice-omni IDs share the grok- prefix but MUST NOT go to /v1/chat/completions.
+  if (isGrokVoiceOmniModel(model)) return false;
   const lower = model.toLowerCase();
   if (lower.startsWith('cortex/')) return true; // legacy prefix — still routes during transition
   // Cortex managed-xAI offer aliases keep the vendor/model shape as the model id.
   if (lower.startsWith('xai/grok-')) return true;
+  if (lower.startsWith('opencode/') || lower.startsWith('opencode-zen/')) return true;
+  const bare = lower.replace(/^(cortex|opencode|opencode-zen)\//, '');
+  if ((CORTEX_OPENCODE_ZEN_FREE_IDS as readonly string[]).includes(bare)) return true;
   return CORTEX_MODEL_FAMILY_PREFIXES.some((prefix) => lower.startsWith(prefix));
 }
 
@@ -71,6 +92,53 @@ export function resolveCortexBaseUrl(config?: ShizuhaConfig): string {
     ?? config?.providers.cortex?.baseUrl
     ?? readCredentials().cortex?.baseUrl
     ?? DEFAULT_CORTEX_BASE_URL;
+}
+
+/**
+ * SCLI-692: the seat's OWN agent identity token, read from the same
+ * token file the agent runtime maintains (`~/.shizuha/auth/token-<username>.json`,
+ * legacy `token-agent.json` / `token.json`). This is the agent's own Cortex
+ * account — never the human's auth.json — so the "every agent uses its OWN
+ * Cortex account" directive holds. Needed because the pod-level
+ * CORTEX_API_KEY lives in the runtime's (PID 1) environment and is NOT
+ * propagated to tool subprocesses, which left `shizuha exec` one-shots
+ * spawned from agent tool contexts unauthenticated (vLLM 401).
+ */
+export function readAgentOwnToken(): string | undefined {
+  try {
+    const tokenDir = path.join(
+      process.env['HOME'] ?? '/root', '.shizuha', 'auth',
+    );
+    const username = nonEmptyEnv('SHIZUHA_AGENT_USERNAME') ?? 'agent';
+    const candidates = [
+      path.join(tokenDir, `token-${username}.json`),
+      path.join(tokenDir, 'token-agent.json'),
+      path.join(tokenDir, 'token.json'),
+    ];
+    for (const file of candidates) {
+      try {
+        if (!fs.statSync(file).isFile()) continue;
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        const token = typeof parsed?.accessToken === 'string' ? parsed.accessToken : '';
+        if (!token) continue;
+        const expiresAt = typeof parsed?.expiresAt === 'string'
+          ? Date.parse(parsed.expiresAt)
+          : NaN;
+        // 60s skew: a token that expires within a minute is treated as
+        // expired — the runtime refreshes the file, a stale read must not
+        // mint a doomed Authorization header.
+        if (Number.isFinite(expiresAt) && expiresAt <= Date.now() + 60_000) {
+          continue;
+        }
+        return token;
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return undefined;
 }
 
 export function resolveCortexAuthToken(config?: ShizuhaConfig): string | undefined {
@@ -94,7 +162,12 @@ export function resolveCortexAuthToken(config?: ShizuhaConfig): string | undefin
       ?? nonEmptyEnv('CORTEX_API_KEY_SHARED_FALLBACK')
       ?? config?.providers.cortex?.apiKey
       ?? readCredentials().cortex?.apiKey
-      ?? nonEmptyEnv('CORTEX_OAUTH_TOKEN');
+      ?? nonEmptyEnv('CORTEX_OAUTH_TOKEN')
+      // SCLI-692: the seat's own agent identity token — the pod-level
+      // CORTEX_API_KEY is not propagated to tool subprocesses, so an exec
+      // one-shot spawned from an agent tool context would otherwise go out
+      // unauthenticated (vLLM 401).
+      ?? readAgentOwnToken();
   }
   return nonEmptyEnv('CORTEX_OAUTH_TOKEN')
     ?? freshShizuhaAccessToken()
@@ -231,7 +304,7 @@ const MODEL_PREFIX_MAP: Array<[string, string]> = [
 const KNOWN_PROVIDER_NAMES = new Set<string>([
   'anthropic', 'openai', 'google', 'openrouter', 'ollama', 'llamacpp', 'vllm',
   'codex', 'copilot', 'cortex', 'litellm', 'deepseek', 'mistral', 'xai',
-  'groq', 'together',
+  'groq', 'together', 'grok-voice',
 ]);
 
 /** Short model aliases used by shizuha-agent platform */
@@ -251,6 +324,14 @@ const MODEL_ALIASES: Record<string, string> = {
 export function normalizeModelName(model: string): string {
   return MODEL_ALIASES[model] ?? model;
 }
+
+/**
+ * SCLI-588: selectors that were valid in an older contract but are superseded
+ * by dynamic model discovery. They must fail with model_not_found locally and
+ * finitely — never route to a provider (which hangs trying to pull a garbage
+ * selector) or create session state.
+ */
+export const RESERVED_INVALID_MODELS = new Set<string>(['stable']);
 
 /** Models known to be Ollama (or fallback for unknown models) */
 const OLLAMA_MODELS = new Set([
@@ -462,6 +543,16 @@ export class ProviderRegistry {
       ),
     );
 
+    // Grok Voice Think Fast (speech-to-speech + function tools). Always
+    // registered: auth is resolved at chat() via XAI_API_KEY or Cortex mint.
+    this.providers.set('grok-voice', new GrokVoiceProvider({
+      resolveAuth: (model) => resolveGrokVoiceAuth({
+        model,
+        cortexBaseUrl: resolveCortexBaseUrl(config),
+        cortexToken: resolveCortexAuthToken(config),
+      }),
+    }));
+
     // Ollama is always available (local)
     this.providers.set('ollama', new OllamaProvider(pc.ollama?.baseUrl));
   }
@@ -478,6 +569,10 @@ export class ProviderRegistry {
       return creds.openai?.defaultModel
         ? `openai:${creds.openai.defaultModel}`
         : 'openai:default';
+    }
+    // Hosted Code try-out: Cortex-relayed OpenCode Zen free models.
+    if (this.providers.has('cortex') && resolveCortexAuthToken(this.lastConfig)) {
+      return `cortex/${DEFAULT_CORTEX_FREE_MODEL}`;
     }
     // Prefer Codex first (self-contained, auto-refreshable, free with ChatGPT).
     // Claude Code OAuth is fragile (expires, requires Claude Code running).
@@ -520,6 +615,30 @@ export class ProviderRegistry {
 
     // Resolve short aliases (e.g., "opus" → "claude-opus-4-7")
     model = MODEL_ALIASES[model] ?? model;
+
+    // SCLI-588: reserved selectors superseded by dynamic model discovery must
+    // fail with model_not_found locally and finitely, never route to a provider
+    // (the Ollama default would hang trying to pull a garbage selector) or
+    // create session state. `cortex/stable` and `stable` both reject.
+    const bareForReserved = model.replace(/^(cortex|opencode|opencode-zen)\//, '');
+    if (RESERVED_INVALID_MODELS.has(model) || RESERVED_INVALID_MODELS.has(bareForReserved)) {
+      throw new Error(
+        `model_not_found: "${model}" is not a valid model. ` +
+        `Model discovery is dynamic — use /model to pick a configured provider/model, ` +
+        `or relaunch with a valid --model (e.g. cortex/DeepSeek-V4-Flash).`,
+      );
+    }
+
+    // Voice-omni models use the realtime WebSocket, not Cortex chat/completions
+    // and not the xAI Chat Completions XaiProvider. Must win over `xai:` /
+    // `xai/grok-` / `cortex/` / the grok- prefix map.
+    if (isGrokVoiceOmniModel(model)) {
+      const voice = this.providers.get('grok-voice');
+      if (voice) return { provider: voice, resolvedModel: normalizeGrokVoiceModel(model) };
+      throw new Error(
+        'Grok Voice Think Fast is not available in this runtime. Rebuild SCLI / agent-runtime.',
+      );
+    }
 
     // Explicit `provider:model` override (SCLI-23) — deterministic routing that
     // bypasses every implicit heuristic below. This is what lets the SAME model

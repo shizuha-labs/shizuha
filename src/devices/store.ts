@@ -16,17 +16,56 @@ function emptyStore(): DeviceStoreData {
   return { devices: [], pendingCodes: [] };
 }
 
-export function readDeviceStore(): DeviceStoreData {
-  try {
-    const raw = fs.readFileSync(devicesFilePath(), 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<DeviceStoreData>;
-    return {
-      devices: Array.isArray(parsed.devices) ? parsed.devices : [],
-      pendingCodes: Array.isArray(parsed.pendingCodes) ? parsed.pendingCodes : [],
-    };
-  } catch {
-    return emptyStore();
+/**
+ * SCLI-422 — a present-but-corrupt device registry must never be rendered as
+ * an empty registry. Raised when devices.json exists but cannot be read or
+ * parsed as a valid DeviceStoreData root. The message names the file and the
+ * recovery class without printing file contents or a raw stack.
+ */
+export class DeviceStoreCorruptError extends Error {
+  constructor(filePath: string, reason: string) {
+    super(
+      `Device store ${filePath} is ${reason}. ` +
+        `Recover by removing or repairing this file — paired devices will need to be re-paired.`,
+    );
+    this.name = 'DeviceStoreCorruptError';
   }
+}
+
+function isValidStoreRoot(value: unknown): value is Partial<DeviceStoreData> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const root = value as Record<string, unknown>;
+  if ('devices' in root && !Array.isArray(root.devices)) return false;
+  if ('pendingCodes' in root && !Array.isArray(root.pendingCodes)) return false;
+  return true;
+}
+
+export function readDeviceStore(): DeviceStoreData {
+  const filePath = devicesFilePath();
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      // No registry yet — legitimate first-run empty store.
+      return emptyStore();
+    }
+    throw new DeviceStoreCorruptError(filePath, 'unreadable');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new DeviceStoreCorruptError(filePath, 'not valid JSON');
+  }
+  if (!isValidStoreRoot(parsed)) {
+    throw new DeviceStoreCorruptError(filePath, 'not a valid device-store object');
+  }
+  const root = parsed as Partial<DeviceStoreData>;
+  return {
+    devices: Array.isArray(root.devices) ? root.devices : [],
+    pendingCodes: Array.isArray(root.pendingCodes) ? root.pendingCodes : [],
+  };
 }
 
 function writeDeviceStore(store: DeviceStoreData): void {

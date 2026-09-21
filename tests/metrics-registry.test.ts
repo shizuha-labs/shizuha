@@ -77,8 +77,8 @@ describe('PLAT-1309 agent-state reconciler drift/convergence metrics', () => {
       recordReconcileRepairBackoff,
       recordReconcileRepairDeferral,
       clearReconcileRepairBackoff,
-      renderMetricsFromFiles,
-    } = await import('../src/metrics/registry.js');
+    } = await import('../src/metrics/daemon.js');
+    const { renderMetricsFromFiles } = await import('../src/metrics/registry.js');
 
     // ENFORCE mode published once at daemon init.
     setReconcileMode('enforce');
@@ -129,8 +129,8 @@ describe('PLAT-3170 k8s GitHub auth fail-loud metrics', () => {
     const {
       recordK8sGithubAuthProbe,
       recordK8sGithubAuthAndonSendFailure,
-      renderMetricsFromFiles,
-    } = await import('../src/metrics/registry.js');
+    } = await import('../src/metrics/daemon.js');
+    const { renderMetricsFromFiles } = await import('../src/metrics/registry.js');
 
     recordK8sGithubAuthProbe([
       {
@@ -165,8 +165,8 @@ describe('PLAT-4006 account reconcile fail-loud metrics', () => {
   it('exports daemon-side account reconcile ANDON notifier outcomes', async () => {
     const {
       recordAgentAccountReconcileAndonOutcome,
-      renderMetricsFromFiles,
-    } = await import('../src/metrics/registry.js');
+    } = await import('../src/metrics/daemon.js');
+    const { renderMetricsFromFiles } = await import('../src/metrics/registry.js');
 
     recordAgentAccountReconcileAndonOutcome('sent');
     recordAgentAccountReconcileAndonOutcome('failed');
@@ -185,8 +185,8 @@ describe('PLAT-5335 runtime-roll deferral metric', () => {
     const {
       setRuntimeRollDeferralStartTimestamp,
       clearRuntimeRollDeferralStartTimestamp,
-      renderMetricsFromFiles,
-    } = await import('../src/metrics/registry.js');
+    } = await import('../src/metrics/daemon.js');
+    const { renderMetricsFromFiles } = await import('../src/metrics/registry.js');
 
     setRuntimeRollDeferralStartTimestamp('sara', 'bridge-busy', 'drain-v1', 1_800_000);
     let out = await renderMetricsFromFiles([]);
@@ -206,3 +206,4 @@ describe('PLAT-5335 runtime-roll deferral metric', () => {
     expect(out).not.toContain('shizuha_runtime_roll_deferral_start_timestamp_seconds{agent="sara"');
   });
 });
+

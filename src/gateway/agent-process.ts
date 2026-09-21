@@ -19,7 +19,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import type { AgentEvent } from '../events/types.js';
 import type { Message, ContentBlock, MCPServerConfig } from '../agent/types.js';
-import type { ToolDefinition } from '../tools/types.js';
+import type { ToolDefinition, ToolContext } from '../tools/types.js';
 import type { PermissionMode } from '../permissions/types.js';
 import type { LLMProvider } from '../provider/types.js';
 import type { Channel, ChannelType, InboundMessage, GatewayConfig } from './types.js';
@@ -27,8 +27,17 @@ import { DEFAULT_FAN_OUT } from './types.js';
 import { Inbox } from './inbox.js';
 import { DeliveryQueue } from './delivery-queue.js';
 import { MaintenanceReaper } from './reaper.js';
+import { WorkspaceGc } from '../workspace-gc.js';
 import { BackgroundTaskRegistry } from '../tasks/registry.js';
 import { isCortexModelId } from '../provider/registry.js';
+import { GROK_VOICE_UPSTREAM_MODEL, grokVoiceAuthConfigured, isGrokVoiceOmniModel } from '../provider/grok-voice.js';
+import type { VoiceS2SHost } from '../voice-s2s/session.js';
+import {
+  clipVoiceToolOutput,
+  resolveVoiceS2SProfile,
+  resolveVoiceS2SToolName,
+  selectVoiceS2STools,
+} from '../voice-s2s/tools.js';
 import {
   HIVE_XAI_GROK_MODEL,
   hiveDirectXaiUpstreamModel,
@@ -37,6 +46,8 @@ import {
   type HiveXaiLease,
 } from '../auth/xai-broker.js';
 import { isTransientProviderFailure } from '../provider/transient-errors.js';
+import { resolveEffectiveContextWindow, resolveModelContextWindow } from '../provider/context-window.js';
+import { fetchBrokerToken } from '../auth/broker-token.js';
 import type { HookEngine } from '../hooks/engine.js';
 import { CronStore } from '../cron/store.js';
 import { CronScheduler } from '../cron/scheduler.js';
@@ -73,10 +84,22 @@ import {
   formatHeartbeatQueueDrainOutcomeLogLine,
   getHeartbeatQueueDrainOutcome,
   heartbeatQueueDrainTelemetry,
+  heartbeatLoopBreakMessage,
+  isPulseGetMyTasksToolName,
+  isPulseGetMyWorkToolName,
+  heartbeatSnapshotHasReadyWork,
   recordHeartbeatQueueDrainTurn,
   recordObservedEmptyPulseQueue,
+  recordObservedWorkProgress,
+  clearFruitlessConsecutiveAfterSessionRotate,
   type HeartbeatQueueDrainOutcome,
+  type HeartbeatQueueDrainRecord,
 } from '../shared/heartbeat-outcome.js';
+import {
+  formatHeartbeatBudgetSkipLogLine,
+  heartbeatBudgetSkipTelemetry,
+  recordHeartbeatBudgetSkip,
+} from '../shared/heartbeat-budget-skip.js';
 import { setActiveTelemetryWindow, createTurnTelemetrySink } from '../agent/loop.js';
 import { incompleteTurnError } from '../agent/incomplete-turn.js';
 import {
@@ -92,13 +115,16 @@ import {
   LEAN_FIRST_HEARTBEAT_MS,
   DEFAULT_HEARTBEAT_DEBOUNCE_MS,
   DEFAULT_IDLE_HEARTBEAT_MS,
+  resolveIdleHeartbeatMs,
   LEAN_CONVERSATIONAL_MCP_TOOL_NAMES,
+  WORK_HEARTBEAT_MCP_TOOL_NAMES,
   isLeanConversationalEnv,
   leanConversationalSkillNames,
   talkSeatSuppressesTools,
   talkSeatTurnTimeoutMs,
 } from '../platform/lean-conversational.js';
-import { estimatePromptTokenBudget, heartbeatBudgetConfig } from '../agent/heartbeat-hygiene.js';
+import { HEARTBEAT_TRIGGER } from '../agent-base-instructions.js';
+import { estimatePromptTokenBudget } from '../agent/heartbeat-hygiene.js';
 import {
   buildProviderPrefixSnapshot,
   compareProviderPrefixSnapshots,
@@ -131,53 +157,84 @@ interface PrefixPrewarmOptions {
   rehomeIntent?: boolean;
 }
 
-/** Idle-heartbeat nudge (SCLI-49). Module-level so setup can pre-activate the
- *  MCP tools it names (PLAT-4189 follow-up: activating a deferred MCP tool
- *  mid-session rewrites the prompt head and busts the vLLM prefix cache). */
-const IDLE_HEARTBEAT_NUDGE = '[HEARTBEAT] You have been idle. Call mcp__shizuha-pulse__pulse_get_my_alerts FIRST, then '
-  + 'mcp__shizuha-pulse__pulse_get_my_tasks. After both results, WORK THROUGH ALL ready items in priority order across alerts and tasks; alerts win ties but never preempt higher-priority task WIP. Take the selected item to a real outcome '
-  + '(alert recovery, task result, transition, or PR), then re-check mcp__shizuha-pulse__pulse_get_my_alerts before calling mcp__shizuha-pulse__pulse_get_my_tasks AGAIN and pick '
-  + 'up the next ready task. Repeat until no ready non-blocked task remains. Never stop while you '
-  + 'still have a ready task assigned. If a task is invalid (false-positive, duplicate, '
-  + 'nonsensical), reject/close it with a reason. '
-  // Operator 2026-08-05, on banto sitting at "needs help" for 49 heartbeats:
-  //   our workflows clearly tell agents to transition/assign the tasks to
-  //   relevant team if they aren't on them .. or create blocker tasks and block
-  //   current task but don't have the task open to them if they really can't do
-  //   anything with such tasks .. if banto would have only blocked tasks then
-  //   hive would immediately see it and hibernate it, freeing the slot
-  // The nudge covered INVALID tasks but said nothing about a VALID task the
-  // agent cannot action itself (banto's are requests for operator/CA-held tax
-  // evidence). So it re-read the same two tasks every 60s, forever, doing
-  // nothing — and a ready-but-untouched queue is exactly what the needs-help
-  // detector is built to flag. A ready task you cannot act on must not stay
-  // ready.
-  + 'If a task is VALID but you cannot action it yourself — it needs another '
-  + "team's access, a decision, or something only a human holds — do NOT leave "
-  + 'it ready and do NOT stall on it: either reassign/transition it to the team '
-  + 'or owner who can act, or create a blocker task and block this one behind '
-  + 'it. Leaving work ready that you will never progress strands the task and '
-  + 'holds your seat open for nothing. '
-  // Live proof of the cost, 2026-08-05: rei (WIP cap 1) held one in_review
-  // item whose sign-off it had already posted; the resolver denied every new
-  // assignment (`wip_capacity_denied load=1 cap=1`) and the review team's
-  // ~60-task queue could not distribute AT ALL. ren reasoned the same way
-  // ("my part is done, it awaits the architect — routed correctly") and kept
-  // the task parked. Correct reasoning, wrong conclusion: done-your-part means
-  // hand it off, not hold it.
-  + 'The same applies when YOUR part is done but the task still sits on your '
-  + 'queue awaiting another role (a review you have signed off, an approval '
-  + 'another lane must fire): reassign it to that role or team NOW. A '
-  + 'finished-your-part task parked on you occupies your WIP slot and starves '
-  + "your team's queue. "
-  + 'If mcp__shizuha-pulse__pulse_get_my_tasks returns no ready tasks, END THE '
-  + 'TURN IMMEDIATELY — never call it a second time in the same turn without completing a task in '
-  + 'between. Only when nothing is ready: do nothing and stay silent.';
+/** Idle-heartbeat nudge — same string as HEARTBEAT_TRIGGER (one contract). */
+
+export interface IdleHeartbeatPreflight {
+  ready?: boolean;
+  reason?: string;
+  snapshotLines?: string[];
+}
+
+export function shouldArmFirstWarmHeartbeat(firstHeartbeatMs: number): boolean {
+  return Number.isFinite(firstHeartbeatMs) && firstHeartbeatMs > 0 && firstHeartbeatMs < 60_000;
+}
+
+/** First boot beat is allowed before the idle floor. Lean uses it as a
+ *  silent prefix warm; work agents use it as a Pulse-preflighted first turn. */
+export function idleHeartbeatFirstBeatDue(input: {
+  firstHeartbeatPending: boolean;
+  running: boolean;
+  now: number;
+  nextDueAt: number;
+  talkedSinceBoot: boolean;
+  busy: boolean;
+  pendingHeartbeat: boolean;
+}): boolean {
+  return input.firstHeartbeatPending
+    && input.running
+    && input.now >= input.nextDueAt
+    && !input.talkedSinceBoot
+    && !input.busy
+    && !input.pendingHeartbeat;
+}
+
+export function formatPulseQueueSnapshotLines(payload: unknown, limit = 5): string[] {
+  const rows = itemRows(payload)
+    .filter(isReadyPulseItemForIdleHeartbeat)
+    .slice(0, Math.max(1, limit));
+  const lines: string[] = [];
+  for (const row of rows) {
+    const key = String(row?.item_key || row?.key || row?.id || '').trim();
+    const status = String(row?.status || '').trim();
+    const priority = String(row?.priority || '').trim();
+    const title = String(row?.title || row?.summary || '').trim();
+    if (!key && !title) continue;
+    const bits = [key || 'task', status, priority].filter(Boolean).join(' ');
+    lines.push(title ? `- ${bits} — ${title}` : `- ${bits}`);
+  }
+  return lines;
+}
+
+export function formatIdleHeartbeatNudge(_preflight: IdleHeartbeatPreflight): string {
+  // Do not dump the Pulse snapshot into the user message.
+  return HEARTBEAT_TRIGGER;
+}
+
 const IDLE_HEARTBEAT_TERMINAL_STATUSES = new Set([
   'completed', 'cancelled', 'closed', 'done', 'resolved', 'rejected',
   'duplicate', 'wont_fix', 'merged', 'failed', 'expired', 'deferred',
 ]);
 const IDLE_HEARTBEAT_WAITING_STATUSES = new Set(['blocked', 'scheduled', 'backlog']);
+
+/**
+ * Hive tenant grants are `pulse:komal-soni` (service:org). PVC / derived
+ * `.mcp.json` keys stay `shizuha-pulse` (logical `pulse`). Exact-set match
+ * dropped every platform server for Sato 2026-08-18 — zero MCP children,
+ * no ToolSearch, 1186 bash HTTP wrappers, 108M input tokens.
+ *
+ * A grant matches the unscoped server when it is the bare service or any
+ * `service:scope` suffix. `id` does not match `identity:…`.
+ */
+export function platformMcpServiceGranted(logicalName: string, allowed: Iterable<string>): boolean {
+  const name = logicalName.trim();
+  if (!name) return false;
+  for (const raw of allowed) {
+    const entry = raw.trim();
+    if (!entry) continue;
+    if (entry === name || entry.startsWith(`${name}:`)) return true;
+  }
+  return false;
+}
 
 /**
  * Apply the effective platform-service allow-list to gateway MCP configs.
@@ -211,13 +268,15 @@ export function scopeGatewayPlatformMcpConfigs(
           !!service
           && typeof service === 'object'
           && typeof (service as Record<string, unknown>).name === 'string'
-          && allowed.has((service as Record<string, unknown>).name as string)
+          && platformMcpServiceGranted((service as Record<string, unknown>).name as string, allowed)
         ));
         for (const service of services) {
           const name = service && typeof service === 'object'
             ? (service as Record<string, unknown>).name
             : undefined;
-          if (typeof name === 'string' && !allowed.has(name)) dropped.push(`shizuha-${name}`);
+          if (typeof name === 'string' && !platformMcpServiceGranted(name, allowed)) {
+            dropped.push(`shizuha-${name}`);
+          }
         }
         if (permitted.length === 0) {
           dropped.push('shizuha-mcp(empty-after-scope)');
@@ -235,11 +294,98 @@ export function scopeGatewayPlatformMcpConfigs(
       continue;
     }
     const logicalName = config.name.slice('shizuha-'.length);
-    if (allowed.has(logicalName)) scoped.push(config);
+    if (platformMcpServiceGranted(logicalName, allowed)) scoped.push(config);
     else dropped.push(config.name);
   }
 
   return { configs: scoped, dropped };
+}
+
+/**
+ * PLAT-9226: collapse platform-managed per-service `shizuha-*` HTTP entries
+ * into the SINGLE `shizuha-mcp` stdio multiplexer entry when the
+ * SHIZUHA_MCP_MULTIPLEXER flag (PLAT-3119) is ON.
+ *
+ * Why this exists: the flag was honored only inside `getPlatformMcpConfigs`,
+ * which on the gateway path runs solely in the PLAT-3195 derivation fallback —
+ * and that fallback never fires on fleet pods because the platform-delivered
+ * `agentCfg.mcp.servers` always carries the per-service entries. Result: one
+ * `mcp-proxy` subprocess per service (7 children observed live on
+ * agent-shizuha-115) instead of the single multiplexer. This gives the gateway
+ * path the same emission shape as `getPlatformMcpConfigs`:
+ *   - command/prefixArgs from `resolveProxyLauncher()`, subcommand
+ *     `mcp-multiplexer`, upstream service list as the `--services` JSON arg;
+ *   - bearer credentials are deliberately NOT baked into the long-lived
+ *     service JSON — the multiplexer reads broker/token-file/env FRESH on
+ *     every (re)connect (the 24h token-cliff contract). Only non-secret
+ *     routing scope (`X-Organization-ID`) is kept per service; the spawn-time
+ *     `MCP_UPSTREAM_BEARER` seed + `MCP_UPSTREAM_BEARER_FILE` env mirror the
+ *     per-service proxy entries the gateway-mcp block emits.
+ *
+ * The SCLI-44 scoper (`scopeGatewayPlatformMcpConfigs`) already scopes an
+ * embedded `shizuha-mcp` manifest, and the gateway-mcp block already leaves
+ * stdio entries untouched — so the collapsed entry flows through both
+ * unchanged. Flag OFF (or nothing to collapse) → the input array is returned
+ * as-is. Exported for tests.
+ */
+export function collapsePlatformMcpToMultiplexer(
+  configs: MCPServerConfig[],
+  opts: {
+    useMultiplexer: boolean;
+    launcher: { command: string; prefixArgs: string[] };
+    bearerFile?: string;
+  },
+): { configs: MCPServerConfig[]; collapsed: string[] } {
+  const collapsed: string[] = [];
+  if (!opts.useMultiplexer) return { configs, collapsed };
+  // Never double-emit: an aggregate entry (PLAT-3195 derivation path or a
+  // platform-delivered aggregate) already represents the multiplexer.
+  if (configs.some((s) => s.name === 'shizuha-mcp')) return { configs, collapsed };
+  // Only URL-bearing platform entries are collapsible: stdio `shizuha-*`
+  // entries are already-local processes with no upstream URL to hand the
+  // multiplexer (the gateway-mcp block leaves those untouched too).
+  const upstreams = configs.filter(
+    (s): s is MCPServerConfig & { url: string } => (
+      s.name.startsWith('shizuha-') && s.transport !== 'stdio' && !!s.url
+    ),
+  );
+  if (upstreams.length === 0) return { configs, collapsed };
+
+  const services: Array<{ name: string; url: string; headers: Record<string, string> }> = [];
+  let seedBearer = '';
+  let organizationId = '';
+  for (const s of upstreams) {
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(s.headers ?? {})) {
+      if (typeof v !== 'string') continue;
+      const key = k.toLowerCase();
+      if (key === 'x-organization-id' && v.trim()) {
+        headers['X-Organization-ID'] = v;
+        if (!organizationId) organizationId = v.trim();
+      } else if (key === 'authorization' && !seedBearer) {
+        seedBearer = v.replace(/^Bearer\s+/i, '').trim();
+      }
+    }
+    services.push({ name: s.name.slice('shizuha-'.length), url: s.url, headers });
+  }
+
+  const multiplexerEntry: MCPServerConfig = {
+    name: 'shizuha-mcp',
+    transport: 'stdio',
+    command: opts.launcher.command,
+    args: [...opts.launcher.prefixArgs, 'mcp-multiplexer', '--services', JSON.stringify(services)],
+    env: {
+      ...(seedBearer ? { MCP_UPSTREAM_BEARER: seedBearer } : {}),
+      ...(opts.bearerFile ? { MCP_UPSTREAM_BEARER_FILE: opts.bearerFile } : {}),
+      ...(organizationId ? { MCP_UPSTREAM_ORG: organizationId } : {}),
+    },
+    platformManaged: true,
+  };
+  const collapsedNames = new Set(upstreams.map((s) => s.name));
+  return {
+    configs: [...configs.filter((s) => !collapsedNames.has(s.name)), multiplexerEntry],
+    collapsed: [...collapsedNames],
+  };
 }
 
 /** User-facing copy for a failed provider turn; raw diagnostics stay in logs/hooks. */
@@ -315,12 +461,116 @@ export function resolvePulseToken(env: NodeJS.ProcessEnv = process.env): string 
   return '';
 }
 
-function pulseBaseUrl(): string {
-  return resolvePulseBaseUrl();
+/**
+ * Fresh Pulse JWT for the idle-heartbeat preflight.
+ *
+ * MCP already prefers the broker sidecar (`GET /token`) so platform calls
+ * survive the 24h file-token cliff. The gateway preflight used the stale
+ * file and fail-opened on 401 (Hiro 2026-08-17: expired RS256 → 3×110k
+ * DeepSeek turns every 2 min to restate `all_blocked`).
+ */
+export async function resolvePulseTokenFresh(
+  env: NodeJS.ProcessEnv = process.env,
+  fetchBroker: typeof fetchBrokerToken = fetchBrokerToken,
+): Promise<string> {
+  try {
+    const broker = await fetchBroker(4_000);
+    if (broker?.accessToken) return broker.accessToken;
+  } catch { /* broker absent / not ready — fall back to file/env */ }
+  return resolvePulseToken(env);
 }
 
-function pulseToken(): string {
-  return resolvePulseToken();
+export function pulsePreflightShouldRetryUnauthorized(
+  status: number,
+  previousToken: string,
+  nextToken: string,
+): boolean {
+  return status === 401 && nextToken.length > 0 && nextToken !== previousToken;
+}
+
+/** After this many fruitless ready heartbeats, rotate the eternal session. */
+export const FRUITLESS_SESSION_RESET_AFTER = 3;
+
+/** Strip the `cortex/` listing prefix so `cortex/X` and `X` compare equal. */
+export function canonicalSessionModel(model: string): string {
+  return (model || '').trim().replace(/^cortex\//i, '');
+}
+
+type CompactionFailureCategory = 'quality' | 'capacity' | 'provider' | 'validation' | 'persistence' | 'internal' | 'interrupted' | 'stale';
+
+/** Maintenance is unacknowledged on failure, but its cause remains distinct. */
+class GatewayCompactionFailure extends Error {
+  readonly code: string;
+  constructor(
+    cause: unknown,
+    readonly generation: number,
+    readonly sessionId: string | null,
+    readonly category: CompactionFailureCategory,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = 'GatewayCompactionFailure';
+    const codes: Record<CompactionFailureCategory, string> = {
+      quality: 'COMPACTION_QUALITY_FAILED', capacity: 'COMPACTION_CAPACITY_FAILED',
+      provider: 'COMPACTION_PROVIDER_FAILED', validation: 'COMPACTION_VALIDATION_FAILED',
+      persistence: 'COMPACTION_PERSISTENCE_FAILED', internal: 'COMPACTION_INTERNAL_FAILED',
+      interrupted: 'COMPACTION_INTERRUPTED', stale: 'COMPACTION_STALE_RESULT',
+    };
+    this.code = codes[category];
+  }
+}
+
+export function shouldResetFruitlessHeartbeatSession(outcome?: {
+  outcome?: string;
+  readyTaskCount?: number;
+  progressEventCount?: number;
+  consecutiveReadyNoProgressHeartbeats?: number;
+  incompleteReason?: string;
+  pulseGetMyTasksOnly?: boolean;
+} | null): boolean {
+  if (!outcome) return false;
+  // Failed tool generation is not evidence that useful session history is
+  // corrupt. The rejected response never entered that history in the first
+  // place; wiping it on the next heartbeat cannot repair this failure.
+  if (outcome.incompleteReason === 'required_tool_not_called'
+    || outcome.incompleteReason === 'progress_only'
+    || outcome.incompleteReason === 'reasoning_only'
+    || outcome.incompleteReason === 'degenerate_generation'
+    || outcome.incompleteReason === 'semantic_compaction_failed') return false;
+  // Listing-only observation is not a poisoned session. Prefetch already put
+  // the snapshot in history; rotating wipes it and the next beat re-fetches.
+  if (outcome.pulseGetMyTasksOnly) return false;
+  return outcome.outcome === 'needs_help'
+    && (outcome.readyTaskCount ?? 0) > 0
+    && (outcome.progressEventCount ?? 0) === 0
+    && (outcome.consecutiveReadyNoProgressHeartbeats ?? 0) >= FRUITLESS_SESSION_RESET_AFTER;
+}
+
+/** Cron watches must not postpone the Pulse idle checkpoint. */
+export function shouldTouchIdleActivityForSource(source?: string): boolean {
+  return source !== 'cron';
+}
+
+/**
+ * Interval `schedule_job` watches are self-contained recipes. Persisting
+ * their curl transcripts into the eternal Pulse session is what ballooned
+ * Aoi from a working 50k architect turn to a self-reported 300k degraded
+ * state. ScheduleWakeup loops (`metadata.selfInvocation`) stay in-session
+ * — they ARE the work.
+ */
+export function cronJobShouldIsolateFromEternalSession(msg: {
+  source?: string;
+  metadata?: Record<string, unknown>;
+}): boolean {
+  return msg.source === 'cron' && msg.metadata?.['selfInvocation'] !== true;
+}
+
+export function trimIsolatedCronTranscript<T>(messages: readonly T[], snapshotCount: number): T[] {
+  if (snapshotCount < 0 || messages.length <= snapshotCount) return [...messages];
+  return messages.slice(0, snapshotCount);
+}
+
+function pulseBaseUrl(): string {
+  return resolvePulseBaseUrl();
 }
 
 export function idleHeartbeatAgentPulseEmails(username?: string, env: NodeJS.ProcessEnv = process.env): string[] {
@@ -342,10 +592,23 @@ function itemRows(payload: unknown): any[] {
 }
 
 export function isReadyPulseItemForIdleHeartbeat(row: any): boolean {
+  if (row?.owner_action_policy === 'awareness') return false;
   const status = String(row?.status ?? '').toLowerCase();
   if (!status) return true;
   if (IDLE_HEARTBEAT_TERMINAL_STATUSES.has(status)) return false;
   if (IDLE_HEARTBEAT_WAITING_STATUSES.has(status)) return false;
+  // PLAT-7611: a recurring task whose due date is still in the future is NOT
+  // ready work. The readiness predicate keyed on workflow status alone, so
+  // every not-yet-due recurring cadence claimed "READY WORK exists" each beat
+  // while pulse_get_my_tasks correctly hid it (PLAT-1148 claimed ready on 3
+  // consecutive beats due 09-07; HIVE-1950 on 2 beats due 09-06 — the latter
+  // provisions a paid customer seat, so an early execution is a real cost,
+  // not just noise). Match the API's own ready/movable classification:
+  // recurring work becomes ready when it comes due, not before.
+  if (row?.is_recurring) {
+    const due = Date.parse(String(row?.due_date ?? ''));
+    if (Number.isFinite(due) && due > Date.now()) return false;
+  }
   return true;
 }
 
@@ -384,15 +647,16 @@ export function shouldFastRearmIdleHeartbeat(input: {
   forwardedEventCount?: number;
   consecutiveReadyNoProgressHeartbeats?: number;
 }): boolean {
+  // Operator directive 2026-09-15: agents must continuously seek and drain
+  // ready work — a 30-min idle cadence left the fleet silent (1/16 admitted)
+  // with ready tasks queued. Re-arm before the full idle cadence whenever the
+  // heartbeat found ready work. The spin class this guard was built for
+  // (banto 49×/min wrap-up churn) is prevented by the no-progress cap and by
+  // falling back to the normal cadence after a loop break so needs_help can
+  // surface — NOT by starving every seat of the work-seeking beat.
   if (input.sawLoopBreak) return false;
-  const ready = Math.max(0, input.readyTaskCount ?? 0);
-  const progress = Math.max(0, input.progressEventCount ?? 0)
-    + Math.max(0, input.forwardedEventCount ?? 0);
-  // Real progress always re-arms: that is an agent draining its queue.
-  if (progress > 0) return true;
-  const fruitless = Math.max(0, input.consecutiveReadyNoProgressHeartbeats ?? 0);
-  if (fruitless >= FAST_REARM_NO_PROGRESS_LIMIT) return false;
-  return ready > 0;
+  if ((input.consecutiveReadyNoProgressHeartbeats ?? 0) >= FAST_REARM_NO_PROGRESS_LIMIT) return false;
+  return (input.readyTaskCount ?? 0) > 0;
 }
 
 const MCP_TOOL_NAME_RE = /\bmcp__[A-Za-z0-9_-]+(?:__[A-Za-z0-9_-]+)+\b/g;
@@ -464,6 +728,22 @@ export function activateExplicitlyMentionedMcpToolsForModel<T extends { name: st
 
   const activated = addExplicitlyMentionedMcpTools(activeDefs, allDefs, mentioned);
   return { ...activated, availableAppendOnly: [] };
+}
+
+/**
+ * MCP reconnect/evict must not rewrite the declared tools[] on append-only
+ * models. Evicted names stay in the prompt head (calls fail until reconnect)
+ * rather than changing the prefix hash and cold-prefilling a warm session.
+ * Operator invariant (agent-kei 2026-09-04): only compaction may miss cache.
+ */
+export function retainDeclaredMcpToolsOnRefresh<T extends { name: string }>(
+  toolDefs: T[],
+  liveNames: Set<string>,
+  appendOnly: boolean,
+): { toolDefs: T[]; removed: number } {
+  if (appendOnly) return { toolDefs, removed: 0 };
+  const next = toolDefs.filter((d) => !d.name.startsWith('mcp__') || liveNames.has(d.name));
+  return { toolDefs: next, removed: toolDefs.length - next.length };
 }
 
 export function appendInlineMcpSchemasToMessage(
@@ -610,6 +890,31 @@ function stableRecoveryFeedKey(message: InboundMessage): string {
   })).digest('hex');
 }
 
+/** Hive k8s PVC. Image default cwd is /home/agent (overlay) — hibernate wipes it. */
+export const HIVE_AGENT_WORKSPACE_CWD = '/home/agent/.shizuha';
+
+/**
+ * Eternal-session sqlite lives at `{cwd}/.shizuha-state.db`. Hive agents whose
+ * pod did not pass `--cwd` (scout 2026-09-01, no broker sidecar) wrote that
+ * file on the overlay and created a new session after every hibernate, which
+ * cold-prefills and cannot hit the previous KV prefix.
+ */
+export function resolveAgentWorkspaceCwd(
+  explicit?: string,
+  env: NodeJS.Dict<string> = process.env,
+  exists: (p: string) => boolean = (p) => {
+    try { return fs.existsSync(p) && fs.statSync(p).isDirectory(); } catch { return false; }
+  },
+): string {
+  const trimmed = (explicit ?? '').trim();
+  if (trimmed) return trimmed;
+  const isHive = Boolean(
+    (env['SHIZUHA_AGENT_ID'] || env['AGENT_ID'] || env['SHIZUHA_AGENT_USERNAME'] || env['AGENT_USERNAME'] || '').trim(),
+  );
+  if (isHive && exists(HIVE_AGENT_WORKSPACE_CWD)) return HIVE_AGENT_WORKSPACE_CWD;
+  return process.cwd();
+}
+
 export class AgentProcess {
   private inbox = new Inbox();
   private channels = new Map<string, Channel>();
@@ -621,8 +926,11 @@ export class AgentProcess {
   private readonly bootAt = this.lastActivityAt;
   private lastHeartbeatAt = 0;
   private idleHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly idleHeartbeatMs = Number(process.env['SHIZUHA_IDLE_HEARTBEAT_MS'] ?? DEFAULT_IDLE_HEARTBEAT_MS);
-  private readonly heartbeatDebounceMs = Number(process.env['SHIZUHA_HEARTBEAT_DEBOUNCE_MS'] ?? DEFAULT_HEARTBEAT_DEBOUNCE_MS);
+  private readonly idleHeartbeatMs = resolveIdleHeartbeatMs(process.env['SHIZUHA_IDLE_HEARTBEAT_MS']);
+  private readonly heartbeatDebounceMs = resolveIdleHeartbeatMs(
+    process.env['SHIZUHA_HEARTBEAT_DEBOUNCE_MS'],
+    DEFAULT_HEARTBEAT_DEBOUNCE_MS,
+  );
   // Lean talk seats fire one silent prefix-warm ~8s after boot (empty Pulse
   // still hits the model so the system prefix is resident). After that the
   // idle cadence is 30m and a just-talked seat is never injected.
@@ -713,6 +1021,9 @@ export class AgentProcess {
   private sessionId: string | null = null;
   /** Transcript generation currently allowed to emit/persist output. */
   private sessionGeneration = 0;
+  private readonly toolAttemptOwner = crypto.randomUUID();
+  private activeCompactionAbort: AbortController | null = null;
+  private lastCompactionFailure: { category: CompactionFailureCategory; code: string; cause_code?: string; status?: number } | null = null;
 
   // Core dependencies — lazily initialized
   private store: any = null;
@@ -727,6 +1038,7 @@ export class AgentProcess {
   private taskRegistry = new BackgroundTaskRegistry();
   private deliveryQueue: DeliveryQueue | null = null;
   private reaper: MaintenanceReaper | null = null;
+  private workspaceGc: WorkspaceGc | null = null;
   private hookEngine: HookEngine | null = null;
   private cronStore: CronStore | null = null;
   private pluginLoader: import('../plugins/loader.js').PluginLoader | null = null;
@@ -747,12 +1059,21 @@ export class AgentProcess {
   private model: string;
   private cwd: string;
   private maxContextTokens = 0;
+  private configuredMaxContextTokens?: number;
+  private contextWindowSource?: { model: string; provider: LLMProvider };
   private maxOutputTokens = 0;
   private temperature = 0;
   private permissionMode: string;
   private thinkingLevel?: string;
   private reasoningEffort?: string;
   private loopDetectorConfig?: Partial<import('../agent/loop-detector.js').LoopDetectorConfig>;
+  /**
+   * Process-lifetime detector. Heartbeats must share history so same-tool
+   * ABAB (pulse_get_task A / pulse_get_task B) can reach warn/break across
+   * idle beats. A real user message resets; loop-break inject still resets
+   * so the injected ticket is not immediately re-broken.
+   */
+  private loopDetector = new LoopDetector();
   private sandboxConfig?: import('../sandbox/types.js').SandboxConfig;
 
   // Model fallback chain — ordered list of (method, model) pairs with optional per-entry settings.
@@ -780,7 +1101,7 @@ export class AgentProcess {
 
   constructor(private config: GatewayConfig) {
     this.model = config.model ?? 'codex-mini-latest';
-    this.cwd = config.cwd ?? process.cwd();
+    this.cwd = resolveAgentWorkspaceCwd(config.cwd);
     this.permissionMode = config.permissionMode ?? 'autonomous';
     this.fanOut = { ...DEFAULT_FAN_OUT, ...config.fanOut };
   }
@@ -818,6 +1139,149 @@ export class AgentProcess {
       quota_ok: !quotaUnavailable,
       in_backoff: quotaUnavailable,
     };
+  }
+
+  /**
+   * Live speech-to-speech host. Same ToolRegistry as a Connect text turn —
+   * Voice/Home must not reimplement Pulse/Wiki stubs.
+   */
+  getVoiceS2SHost(): VoiceS2SHost | null {
+    if (!this.running || !this.toolRegistry) return null;
+    const overlay = isGrokVoiceOmniModel(this.model)
+      ? this.model
+      : (grokVoiceAuthConfigured() ? GROK_VOICE_UPSTREAM_MODEL : '');
+    if (!overlay) return null;
+    const profile = resolveVoiceS2SProfile();
+    const tools = selectVoiceS2STools(this.toolRegistry.definitions(), { profile });
+    return {
+      model: overlay,
+      profile,
+      instructions: this.systemPrompt || `You are ${this.config.agentName || this.config.agentUsername || 'the assistant'}.`,
+      tools,
+      executeTool: (name, input) => this.executeVoiceS2STool(name, input),
+    };
+  }
+
+  async executeVoiceS2STool(name: string, input: Record<string, unknown>): Promise<string> {
+    if (!this.toolRegistry) return `Tool ${name} is unavailable (agent not initialized).`;
+    const available = this.toolRegistry.list().map((tool: { name: string }) => tool.name);
+    const resolved = resolveVoiceS2SToolName(available, name);
+    if (!resolved) {
+      const advertised = selectVoiceS2STools(this.toolRegistry.definitions(), {
+        profile: resolveVoiceS2SProfile(),
+      }).map((tool: { name: string }) => tool.name);
+      return `${name} is not on this SCLI voice session. Available: ${advertised.join(', ')}`;
+    }
+    const handler = this.toolRegistry.get(resolved);
+    if (!handler) return `Tool ${resolved} is registered but has no handler.`;
+    const result = await handler.execute(input, {
+      cwd: this.cwd,
+      sessionId: this.sessionId || `voice-s2s-${Date.now()}`,
+      taskRegistry: this.taskRegistry,
+      sandbox: this.sandboxConfig,
+    });
+    const text = typeof result?.content === 'string' ? result.content : JSON.stringify(result?.content ?? result);
+    if (result?.isError) return clipVoiceToolOutput(`Tool ${resolved} error: ${text}`);
+    return clipVoiceToolOutput(text);
+  }
+
+  /**
+   * Saki 2026-08-18 / Aoi 2026-09-10: after a heartbeat took alerts only
+   * (or narrated with no inbox), inject pulse_get_my_work so the next
+   * model turn sees both inboxes. Do not open a specific ticket.
+   */
+  private async executeHeartbeatTool(name: string, input: Record<string, unknown>, msg: InboundMessage) {
+    const handler = this.toolRegistry.get(name);
+    const identity = { sessionId: this.sessionId!, generation: `heartbeat:${crypto.randomUUID()}`, ownerId: this.toolAttemptOwner,
+      inboundMessageId: msg.id, executionId: msg.threadId, sessionEpoch: this.sessionGeneration };
+    const toolUseId = `forced-heartbeat-${input['task_id'] ? 'task' : 'tasks'}-${Date.now()}`;
+    const agentName = this.config.agentName ?? this.config.agentId ?? 'unknown';
+    const checkpoint = (action: () => void) => {
+      try {
+        if (this.sessionId !== identity.sessionId || this.sessionGeneration !== identity.sessionEpoch) {
+          throw new Error('Tool attempt session generation changed');
+        }
+        action();
+      } catch (cause) {
+        throw Object.assign(new Error('Tool execution checkpoint could not be committed'), { code: 'TOOL_CHECKPOINT_FAILED', retryable: false, cause });
+      }
+    };
+    let recovered: import('../tools/types.js').ToolResult | null = null;
+    checkpoint(() => { recovered = this.store.recoveredHeartbeatTool(identity, name, input); });
+    if (recovered) {
+      const result = recovered as import('../tools/types.js').ToolResult;
+      return { name, content: result.content, isError: Boolean(result.isError), input };
+    }
+    checkpoint(() => this.store.beginToolAttempt(identity, toolUseId, name, input, 1));
+    let auditId: string | undefined;
+    checkpoint(() => { auditId = this.auditLogger?.logBefore(agentName, name, input); });
+    const startedAt = Date.now();
+    let result: import('../tools/types.js').ToolResult;
+    try {
+      result = await handler.execute(input, { cwd: this.cwd, sessionId: this.sessionId!, taskRegistry: this.taskRegistry, sandbox: this.sandboxConfig });
+    } catch (error) {
+      result = { toolUseId, content: (error as Error).message, isError: true };
+    }
+    const content = typeof result?.content === 'string' ? result.content : JSON.stringify(result?.content ?? result ?? '');
+    const isError = Boolean(result?.isError);
+    checkpoint(() => this.store.completeToolAttempt(identity, toolUseId, 1, { ...result, toolUseId, content, durationMs: Date.now() - startedAt }));
+    checkpoint(() => {
+      if (auditId && this.auditLogger) {
+        if (isError) this.auditLogger.logError(auditId, agentName, name, content, Date.now() - startedAt);
+        else this.auditLogger.logAfter(auditId, agentName, name, content, Date.now() - startedAt);
+      }
+    });
+    checkpoint(() => this.messages.push(...this.store.finalizeToolTurn(identity, [
+      { role: 'assistant', content: [{ type: 'tool_use', id: toolUseId, name, input }], timestamp: Date.now() },
+      { role: 'user', content: [{ type: 'tool_result', toolUseId, content, isError }], timestamp: Date.now() },
+    ])));
+    return { name, content, isError, input };
+  }
+
+  private async injectHeartbeatTaskSnapshot(msg: InboundMessage, opts?: { workOnly?: boolean }): Promise<{ name: string; content: unknown; isError: boolean } | null> {
+    if (!this.toolRegistry) return null;
+    const listed = typeof this.toolRegistry.list === 'function'
+      ? this.toolRegistry.list()
+      : typeof this.toolRegistry.definitions === 'function'
+        ? this.toolRegistry.definitions()
+        : [];
+    const available = listed.map((tool: { name: string }) => tool.name);
+    const name = available.find((entry: string) => isPulseGetMyWorkToolName(entry))
+      || (opts?.workOnly ? undefined : available.find((entry: string) => isPulseGetMyTasksToolName(entry)));
+    if (!name) {
+      logger.warn({ available: available.slice(0, 12) }, 'Heartbeat task snapshot: pulse_get_my_work not registered');
+      return null;
+    }
+    const handler = this.toolRegistry.get(name);
+    if (!handler?.execute) {
+      logger.warn({ name }, 'Heartbeat task snapshot: no handler');
+      return null;
+    }
+    return this.executeHeartbeatTool(name, {}, msg);
+  }
+
+  /**
+   * Saki 2026-08-18: after get_my_tasks exists, the model re-calls it until
+   * loop-break aborts. Open the first ready item in-process so the next
+   * model turn sees the ticket, not another queue listing.
+   */
+  private async injectHeartbeatFirstReadyTask(
+    taskId: string,
+    msg: InboundMessage,
+  ): Promise<{ name: string; content: unknown; isError: boolean; input: { task_id: string } } | null> {
+    if (!this.toolRegistry || !taskId) return null;
+    const available = this.toolRegistry.list().map((tool: { name: string }) => tool.name);
+    const name = available.find((entry: string) => /pulse_get_task(?!s)/i.test(entry));
+    if (!name) {
+      logger.warn({ available: available.slice(0, 12) }, 'Heartbeat first-ready task: pulse_get_task not registered');
+      return null;
+    }
+    const handler = this.toolRegistry.get(name);
+    if (!handler?.execute) {
+      logger.warn({ name }, 'Heartbeat first-ready task: no handler');
+      return null;
+    }
+    return { ...await this.executeHeartbeatTool(name, { task_id: taskId }, msg), input: { task_id: taskId } };
   }
 
   /** Register a channel with the gateway. */
@@ -936,7 +1400,6 @@ export class AgentProcess {
     const { StateStore } = await import('../state/store.js');
     const { loadConfig, loadAgentConfig, loadAgentClaudeMd } = await import('../config/loader.js');
     const { buildSystemPrompt } = await import('../prompt/builder.js');
-    const { resolveEffectiveContextWindow } = await import('../provider/context-window.js');
     const { AgentEventEmitter } = await import('../events/emitter.js');
     const { MCPManager } = await import('../tools/mcp/manager.js');
     const { registerMCPTools } = await import('../tools/mcp/bridge.js');
@@ -957,6 +1420,16 @@ export class AgentProcess {
       logger.warn({ err }, 'AGENTS.md compose failed — continuing without rewrite');
     }
 
+    try {
+      const { upgradeStaleHeartbeatTemplate } = await import('../daemon/heartbeat-template.js');
+      const heartbeatUpgrade = upgradeStaleHeartbeatTemplate(this.cwd);
+      if (heartbeatUpgrade === 'upgraded') {
+        logger.warn({ cwd: this.cwd }, 'Replaced stale HEARTBEAT.md that omitted pulse_get_my_tasks');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'HEARTBEAT.md stale-upgrade failed — continuing');
+    }
+
     // Load per-agent config: ~/.shizuha/agents/{username}/agent.toml + CLAUDE.md
     const agentUsername = this.config.agentUsername;
     const agentCfg = agentUsername ? await loadAgentConfig(agentUsername) : null;
@@ -970,6 +1443,7 @@ export class AgentProcess {
     this.thinkingLevel = agentCfg?.thinkingLevel ?? this.config.thinkingLevel;
     this.reasoningEffort = agentCfg?.reasoningEffort ?? this.config.reasoningEffort;
     this.loopDetectorConfig = cfg.loopDetector;  // SCLI-20(c): TOML-tunable thresholds
+    this.loopDetector = new LoopDetector(this.loopDetectorConfig);
     this.sandboxConfig = cfg.sandbox?.mode !== 'unrestricted' ? cfg.sandbox : undefined;
 
     if (isHiveDirectXaiGrokModel(this.model)) {
@@ -1037,11 +1511,13 @@ export class AgentProcess {
         try { await provAny.getServedModel(this.model); } catch { /* ignore */ }
       }
     }
+    this.configuredMaxContextTokens = agentCfg?.maxContextTokens ?? cfg.agent.maxContextTokens;
     this.maxContextTokens = resolveEffectiveContextWindow(
       this.model,
       this.provider,
-      agentCfg?.maxContextTokens ?? cfg.agent.maxContextTokens,
+      this.configuredMaxContextTokens,
     );
+    this.refreshContextWindow(this.model, this.provider);
 
     this.toolRegistry = new ToolRegistry();
     registerBuiltinTools(this.toolRegistry);
@@ -1059,17 +1535,7 @@ export class AgentProcess {
     // Store state.db in the working directory (mounted volume in containers)
     // so sessions survive container restarts.
     this.store = new StateStore(path.join(this.cwd, '.shizuha-state.db'));
-    // Wire-prefix invariant (operator 2026-08-08): every history REWRITE goes
-    // through replaceMessages — the single choke-point — so wrapping it here
-    // guarantees the in-process frozen prefix can never outlive a rewrite.
-    // (The store method itself clears the persisted row.)
-    {
-      const _origReplaceMessages = this.store.replaceMessages.bind(this.store);
-      this.store.replaceMessages = (sessionId: string, msgs: Message[]) => {
-        if (sessionId === this.sessionId) this.providerWirePrefix = null;
-        return _origReplaceMessages(sessionId, msgs);
-      };
-    }
+    this.bindStoreWirePrefixInvalidation();
 
     // Inject store into session search tool
     const { setSearchStore } = await import('../tools/builtin/session-search.js');
@@ -1094,6 +1560,31 @@ export class AgentProcess {
       mcpConfigs = [...mcpConfigs, ...agentServers];
     }
 
+    // PLAT-9226: the multiplexer flag was a no-op on gateway-runtime seats —
+    // it is honored only inside getPlatformMcpConfigs, which on this path runs
+    // solely in the PLAT-3195 fallback below, and that fallback never fires on
+    // fleet pods (the platform-delivered agentCfg.mcp.servers always supplies
+    // the per-service shizuha-* entries). Collapse those per-service HTTP
+    // entries into the single stdio multiplexer entry BEFORE the SCLI-44
+    // scoper (which already scopes an embedded shizuha-mcp manifest) and the
+    // gateway-mcp block below (which already leaves stdio entries untouched).
+    // Flag OFF → the config passes through byte-identical.
+    {
+      const { resolveMcpMultiplexer, resolveProxyLauncher } = await import('../platform/mcp-services.js');
+      const multiplexed = collapsePlatformMcpToMultiplexer(mcpConfigs, {
+        useMultiplexer: resolveMcpMultiplexer(),
+        launcher: resolveProxyLauncher(),
+        bearerFile: process.env['MCP_UPSTREAM_BEARER_FILE']?.trim() || undefined,
+      });
+      mcpConfigs = multiplexed.configs;
+      if (multiplexed.collapsed.length > 0) {
+        logger.info(
+          { collapsed: multiplexed.collapsed },
+          '[PLAT-9226] collapsed platform MCP servers into the single mcp-multiplexer entry',
+        );
+      }
+    }
+
     // PLAT-3195: k8s-native fleet pods have no provisioned ~/.mcp.json (that
     // file is written by `provision-agent` on the docker/host path only), so a
     // gateway that only reads config files boots with ZERO platform MCP
@@ -1105,24 +1596,27 @@ export class AgentProcess {
     // on-401 broker token refresh (PLAT-223).
     if (!mcpConfigs.some((s) => s.name.startsWith('shizuha-')) && process.env['SHIZUHA_PLATFORM_URL']) {
       try {
-        const { getPlatformMcpConfigs } = await import('../platform/mcp-services.js');
+        const { getPlatformMcpConfigs, platformMcpEntriesToConfigs } = await import('../platform/mcp-services.js');
         const { fetchBrokerToken } = await import('../auth/broker-token.js');
         const bearerToken = (await fetchBrokerToken())?.accessToken
           || process.env['AGENT_ACCESS_TOKEN'] || '';
         if (bearerToken) {
           const derived = getPlatformMcpConfigs({ bearerToken, stdioProxy: 'off' });
-          const derivedConfigs = Object.entries(derived).flatMap(([name, entry]) =>
-            ('url' in entry ? [{
-              name,
-              transport: 'streamable-http' as const,
-              url: entry.url,
-              headers: { ...entry.headers },
-              platformManaged: true,
-            }] : []));
+          // PLAT-4013: admit stdio command entries too — the multiplexer
+          // entry (SHIZUHA_MCP_MULTIPLEXER=true) has no `url` and was silently
+          // dropped here, leaving derivation-reliant seats with zero MCP
+          // servers on the flag-ON path.
+          const derivedConfigs = platformMcpEntriesToConfigs(derived);
           if (derivedConfigs.length > 0) {
             mcpConfigs = [...mcpConfigs, ...derivedConfigs];
             logger.info({ servers: derivedConfigs.map((s) => s.name) },
               '[PLAT-3195] Derived platform MCP servers from env (no provisioned MCP config found)');
+          } else {
+            logger.warn({
+              platformUrl: process.env['SHIZUHA_PLATFORM_URL'],
+              mcpServices: process.env['SHIZUHA_MCP_SERVICES'],
+              effectiveMcp: process.env['AGENT_EFFECTIVE_MCP_SERVICES'],
+            }, '[PLAT-3195] Platform MCP env derivation produced zero servers');
           }
         } else {
           logger.warn('[PLAT-3195] No provisioned MCP config and no broker/env token — platform MCP unavailable');
@@ -1152,7 +1646,10 @@ export class AgentProcess {
       if (envSvcs) {
         const envSet = new Set(envSvcs.split(',').map((s) => s.trim()).filter(Boolean));
         for (const s of [...allowed]) {
-          if (!envSet.has(s)) allowed.delete(s);
+          // Hive grants are `pulse:org`; env may list the same scoped form.
+          // Exact has() would drop every grant and boot with zero MCP (Reo).
+          const stillGranted = envSet.has(s) || platformMcpServiceGranted(s.split(':')[0] ?? s, envSet);
+          if (!stillGranted) allowed.delete(s);
         }
       }
       const scoped = scopeGatewayPlatformMcpConfigs(mcpConfigs, allowed);
@@ -1407,15 +1904,15 @@ export class AgentProcess {
       // on both channels — cli/benchmark/append-only-tool-activation-bench.py):
       // a mid-session push into toolDefs rewrites the tools block at the prompt
       // HEAD and busts the vLLM prefix cache (full 30-70s re-prefill of the
-      // conversation at fleet context sizes). Instead, the ToolSearch RESULT
-      // already carries the full JSON schema in-message (append-only, cache-
-      // safe) and vLLM's DSV4 parser emits STRUCTURED tool_calls even for
-      // tools absent from the declared array — verified 8/8 with exact args.
-      // Execution works because ALL MCP tools stay registered in the registry.
-      // DeepSeek V4 Flash keeps this minimal head across restarts too: resolved
-      // schemas stay in append-only conversation history and are not persisted
-      // back into the next boot's tool head. Hosted APIs retain the compatible
-      // declared-schema append path because they reject undeclared functions.
+      // conversation at fleet context sizes; agent-rui 160a7c96 2026-09-02:
+      // 278s/259s 0% cache on the same tp4a home after ToolSearch). Instead,
+      // the ToolSearch RESULT already carries the full JSON schema in-message
+      // (append-only, cache-safe). DeepSeek V4 Flash emits STRUCTURED
+      // tool_calls for undeclared tools (8/8); GLM-5.3-Flash emits DSML
+      // `<tool_call>` which salvageGlmToolCall already parses. Execution works
+      // because ALL MCP tools stay registered in the registry. Hosted APIs
+      // retain the compatible declared-schema append path because they reject
+      // undeclared functions.
       // Kill-switch: SHIZUHA_APPEND_ONLY_TOOL_ACTIVATION=0 restores live push.
       const { modelSupportsAppendOnlyToolActivation } = await import('../tools/tool-search.js');
       const useAppendOnlyActivation = (): boolean =>
@@ -1452,12 +1949,18 @@ export class AgentProcess {
           dSchemas.set(d.name, { description: d.description, inputSchema: d.inputSchema });
         }
         setDeferredTools(dMap, dSchemas);
-        // Drop any already-activated deferred MCP tools that no longer exist (evicted).
-        const liveNames = new Set(liveDefs.map((d: any) => d.name));
-        const before = this.toolDefs.length;
-        this.toolDefs = this.toolDefs.filter((d: any) => !d.name.startsWith('mcp__') || liveNames.has(d.name));
-        if (this.toolDefs.length !== before) {
-          logger.info({ removed: before - this.toolDefs.length, deferred: liveMcp.length }, 'Rebuilt deferred catalog after MCP tool-set change');
+        // Drop any already-activated deferred MCP tools that no longer exist (evicted)
+        // — but NEVER on append-only models: shrinking tools[] rewrites the prompt
+        // head. agent-kei 2026-09-04: MCP timeout on resume looked like eviction
+        // and paid a 149k 0% cache prefill. Catalog rebuild already hides them
+        // from ToolSearch; the declared head stays frozen until compaction.
+        const liveNames = new Set<string>(liveDefs.map((d: { name: string }) => d.name));
+        const retained = retainDeclaredMcpToolsOnRefresh(
+          this.toolDefs, liveNames, useAppendOnlyActivation(),
+        );
+        this.toolDefs = retained.toolDefs;
+        if (retained.removed > 0) {
+          logger.info({ removed: retained.removed, deferred: liveMcp.length }, 'Rebuilt deferred catalog after MCP tool-set change');
         }
       };
 
@@ -1499,6 +2002,10 @@ export class AgentProcess {
       // path too — otherwise toolDefs stays a static snapshot and still advertises them.
       this.mcpManager.onToolsRefreshed = () => {
         reapplyToolsetFilter(); // re-strip toolset-filtered tools a refresh re-added (SCLI-42 L298)
+        if (process.env['SHIZUHA_APPEND_ONLY_TOOL_ACTIVATION'] !== '0'
+          && modelSupportsAppendOnlyToolActivation(this.model)) {
+          return;
+        }
         this.toolDefs = this.toolRegistry.definitions();
       };
       const skillCatalog = skillRegistry.size > 0
@@ -1537,7 +2044,7 @@ export class AgentProcess {
         const { HEARTBEAT_TRIGGER } = await import('../agent-base-instructions.js');
         for (const name of extractMentionedMcpToolNames(this.systemPrompt)) mentioned.add(name);
         for (const name of extractMentionedMcpToolNames(HEARTBEAT_TRIGGER)) mentioned.add(name);
-        for (const name of extractMentionedMcpToolNames(IDLE_HEARTBEAT_NUDGE)) mentioned.add(name);
+        for (const name of extractMentionedMcpToolNames(HEARTBEAT_TRIGGER)) mentioned.add(name);
         try {
           const persisted = JSON.parse(fs.readFileSync(this.activatedMcpToolsPath, 'utf-8')) as unknown;
           if (Array.isArray(persisted)) {
@@ -1556,6 +2063,24 @@ export class AgentProcess {
             'Pre-activated prompt-referenced MCP tools at setup (prefix-stable head)');
         }
       } catch { /* diagnostics-only compatibility optimization — never block setup */ }
+    } else if (!talkSeatSuppressesTools()) {
+      // DeepSeek keeps a minimal ToolSearch head, but pulse_get_my_work must
+      // stay declared or the model ends the turn silent (live nami/hiro/sara
+      // 2026-08-17: 9× queue-blind, Pulse still had ready work).
+      try {
+        const pulseHead = addExplicitlyMentionedMcpTools(
+          this.toolDefs,
+          this.toolRegistry.definitions(),
+          WORK_HEARTBEAT_MCP_TOOL_NAMES,
+        );
+        if (pulseHead.added.length > 0) {
+          this.toolDefs = pulseHead.toolDefs;
+          logger.info(
+            { tools: pulseHead.added, activeTools: this.toolDefs.length },
+            'Pre-activated Pulse heartbeat tools on append-only head',
+          );
+        }
+      } catch { /* never block setup */ }
     }
 
     // Opt-in only (SHIZUHA_TALK_SUPPRESS_TOOLS=1). CEO Office seats advertise
@@ -1598,6 +2123,21 @@ export class AgentProcess {
       store: this.store,
       failedDir: path.join(stateDir, 'delivery-queue', 'failed'),
       queueDir: path.join(stateDir, 'delivery-queue'),
+    });
+
+    // Initialize workspace GC (PLAT-6053): prunes aged per-task scratch in
+    // ~/.shizuha/work + ~/.shizuha/tmp. Dry-run by default (verify-before-
+    // destroy); flip to live deletion via SHIZUHA_WORKSPACE_GC_DRY_RUN=0 only
+    // after a dry-run decision log has been reviewed. Never touches browser/
+    // login state, audits, or sessions.
+    this.workspaceGc = new WorkspaceGc({
+      homeDir: process.env['HOME'],
+      pruneDays: (() => {
+        const raw = process.env['SHIZUHA_WORKSPACE_GC_DAYS'];
+        const n = raw ? Number.parseInt(raw, 10) : NaN;
+        return Number.isFinite(n) && n > 0 ? n : 7;
+      })(),
+      dryRun: process.env['SHIZUHA_WORKSPACE_GC_DRY_RUN'] !== '0',
     });
 
     // Initialize cron store for scheduled jobs
@@ -1676,6 +2216,11 @@ export class AgentProcess {
       this.reaper.start();
     }
 
+    // Start workspace GC (PLAT-6053) — prunes aged per-task scratch.
+    if (this.workspaceGc) {
+      this.workspaceGc.start();
+    }
+
     // Start rate limiter cleanup (prunes stale user buckets every 5 minutes)
     this.rateLimiter?.startCleanup();
 
@@ -1731,6 +2276,7 @@ export class AgentProcess {
       }),
     ).catch(() => { /* best-effort */ });
     this.startTelemetry();
+    this.startMemoryWatchdog();
     this.startIdleHeartbeat();
 
     // P99<=5s invariant (operator 2026-07-14): pre-warm the prefix cache before
@@ -1861,7 +2407,11 @@ export class AgentProcess {
       ) return true;
       const { messagesToChat, toolDefinitionsForProvider } = await import('../agent/turn.js');
       const chatMessages = messagesToChat(this.messages);
-      const providerToolDefs = toolDefinitionsForProvider(this.toolDefs, provider);
+      const providerToolDefs = toolDefinitionsForProvider(
+        this.toolDefs,
+        provider,
+        this.toolRegistry?.definitions?.() ?? this.toolDefs,
+      );
       const prewarmPrefixSnapshot = buildProviderPrefixSnapshot({
         model,
         contextWindow: this.maxContextTokens,
@@ -1996,7 +2546,34 @@ export class AgentProcess {
     return this.prewarmPrefixCache(this.model, this.provider, { reason: 'ready_work' });
   }
 
+  private refreshContextWindow(model: string, provider: LLMProvider): number {
+    if (!provider) return this.maxContextTokens;
+    const discovered = provider.discoveredContextWindowFor?.(model);
+    const sourceChanged = this.contextWindowSource
+      && (this.contextWindowSource.model !== model || this.contextWindowSource.provider !== provider);
+    const previous = this.maxContextTokens;
+    if (typeof discovered === 'number' && Number.isFinite(discovered) && discovered > 0) {
+      const configured = this.configuredMaxContextTokens;
+      this.maxContextTokens = typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+        ? Math.min(configured, discovered)
+        : discovered;
+    } else if (sourceChanged) {
+      this.maxContextTokens = resolveEffectiveContextWindow(
+        model,
+        provider.discoveredContextWindowFor ? resolveModelContextWindow(model) : provider,
+        this.configuredMaxContextTokens,
+      );
+    }
+    this.contextWindowSource = { model, provider };
+    if (previous !== this.maxContextTokens) {
+      logger.info({ model, provider: provider.name, previous, current: this.maxContextTokens, discovered,
+        configured: this.configuredMaxContextTokens }, 'Gateway refreshed effective context window');
+    }
+    return this.maxContextTokens;
+  }
+
   private modelMaxTokens(): number {
+    this.refreshContextWindow(this.model, this.provider);
     if (this.maxContextTokens > 0) return this.maxContextTokens;
     const m = (this.model || '').toLowerCase();
     if (m.includes('1m') || m.includes('-1m')) return 1_000_000;
@@ -2017,8 +2594,9 @@ export class AgentProcess {
     // models spend from the SAME budget (DeepSeek at effort=max can burn most
     // of it in reasoning before the tool-call JSON starts), truncating large
     // Write turns mid-JSON as incomplete 'max_tokens' turns (2026-08-09).
-    // After the first turn the agent has demonstrably found work — later turns
-    // get the normal budget.
+    // The caller keeps turnIndex=0 while the required alerts receipt is still
+    // pending. A failed generation/receipt does not complete bootstrap; only
+    // after that phase succeeds do later working turns get the normal budget.
     if (turnIndex > 0) return this.maxOutputTokens;
     const parsed = Number.parseInt(process.env['SHIZUHA_HEARTBEAT_MAX_OUTPUT_TOKENS'] ?? '', 10);
     const heartbeatCap = Number.isFinite(parsed) && parsed > 0 ? parsed : 4096;
@@ -2082,8 +2660,14 @@ export class AgentProcess {
       health: {
         ...health,
         recent_errors: recentErrors,
+        ...(this.lastCompactionFailure ? { compaction_failure: this.lastCompactionFailure } : {}),
       },
-      heartbeat: agentId ? heartbeatQueueDrainTelemetry(agentId) : null,
+      heartbeat: agentId ? (() => {
+        const drain = heartbeatQueueDrainTelemetry(agentId);
+        const skip = heartbeatBudgetSkipTelemetry(agentId);
+        if (!drain && !skip) return null;
+        return { ...(drain ?? {}), ...(skip ?? {}) };
+      })() : null,
     };
   }
 
@@ -2103,6 +2687,20 @@ export class AgentProcess {
     logger.info({ intervalMs: ms }, 'Gateway telemetry enabled');
   }
 
+  /**
+   * SCS-139 class: watch the container cgroup memory so a working-set climb
+   * leaves a log trail and — when sustained past the exit watermark — restarts
+   * the pod cleanly instead of the kernel OOM-killing us mid-write with no
+   * trail (two agent-kai OOMKills at the 8Gi limit, timeline unrecoverable).
+   */
+  private startMemoryWatchdog(): void {
+    void import('./memory-watchdog.js').then(({ startMemoryWatchdog }) => {
+      startMemoryWatchdog();
+    }).catch((err) => {
+      logger.warn({ err }, 'Memory watchdog failed to start (non-fatal)');
+    });
+  }
+
   /** Intrinsic scheduler heartbeat (SCLI-49). Native to the gateway so every
    *  shizuha-runtime agent periodically returns to Pulse's canonical queue.
    *  Cadence is independent of routine Connect task hints: if a turn is busy,
@@ -2111,18 +2709,23 @@ export class AgentProcess {
    *  Direct Pulse preflight keeps empty checkpoints model-free. */
   private startIdleHeartbeat(): void {
     if (process.env['SHIZUHA_IDLE_HEARTBEAT_DISABLED'] === '1') return;
-    const NUDGE = IDLE_HEARTBEAT_NUDGE;
+    const NUDGE = HEARTBEAT_TRIGGER;
     logger.info({ idleHeartbeatMs: this.idleHeartbeatMs, firstHeartbeatMs: this.firstHeartbeatMs, heartbeatDebounceMs: this.heartbeatDebounceMs }, 'Idle-heartbeat armed (SCLI-49 + SCLI-71 early first beat)');
     const tickIdleHeartbeat = async () => {
       try {
         const now = Date.now();
         const talkedSinceBoot = this.lastActivityAt > this.bootAt;
-        const prefixWarm = this.firstHeartbeatPending
-          && isLeanConversationalEnv()
-          && now >= this.nextHeartbeatDueAt
-          && !talkedSinceBoot
-          && !this.inbox.busy;
-        if (!prefixWarm && !idleHeartbeatAdmissionAllowed({
+        const firstBeatDue = idleHeartbeatFirstBeatDue({
+          firstHeartbeatPending: this.firstHeartbeatPending,
+          running: this.running,
+          now,
+          nextDueAt: this.nextHeartbeatDueAt,
+          talkedSinceBoot,
+          busy: this.inbox.busy,
+          pendingHeartbeat: this.inbox.hasClass('heartbeat'),
+        });
+        const prefixWarm = firstBeatDue && isLeanConversationalEnv();
+        if (!firstBeatDue && !idleHeartbeatAdmissionAllowed({
           running: this.running,
           busy: this.inbox.busy,
           pendingHeartbeat: this.inbox.hasClass('heartbeat'),
@@ -2149,8 +2752,17 @@ export class AgentProcess {
         this.lastHeartbeatAt = now;
         this.firstHeartbeatPending = false;
         this.nextHeartbeatDueAt = now + Math.max(this.idleHeartbeatMs, this.heartbeatDebounceMs);
-        const readyWork = prefixWarm ? null : await this.hasReadyPulseWorkForIdleHeartbeat();
-        if (readyWork === false && !prefixWarm) {
+        const preflight = prefixWarm
+          ? { ready: undefined as boolean | undefined }
+          : await this.hasReadyPulseWorkForIdleHeartbeat();
+        if (preflight.ready !== false && !prefixWarm) {
+          const agentId = this.config.agentId ?? this.config.agentName ?? 'unknown-agent';
+          const last = getHeartbeatQueueDrainOutcome(agentId);
+          if (last && shouldResetFruitlessHeartbeatSession(last)) {
+            this.resetFruitlessHeartbeatSession(last);
+          }
+        }
+        if (preflight.ready === false && !prefixWarm) {
           const agentId = this.config.agentId ?? this.config.agentName ?? 'unknown-agent';
           try {
             const empty = recordObservedEmptyPulseQueue(agentId);
@@ -2159,10 +2771,21 @@ export class AgentProcess {
           } catch (err) {
             logger.warn({ err, agentId }, 'Failed to record empty-queue idle heartbeat');
           }
+          // PLAT-6187: every idle-heartbeat model skip is counted and surfaced
+          // as [heartbeat-budget-skip] so "empty-queue idle" is measurable
+          // fleet-wide (PLS-741 signal gap). The reason comes from the preflight
+          // (queue_empty / no_token / preflight_http_error / preflight_exception).
+          const skipReason = preflight.reason === 'queue_empty' || preflight.reason === 'skip'
+            ? 'queue_empty'
+            : (preflight.reason as 'no_token' | 'preflight_http_error' | 'preflight_exception') ?? 'queue_empty';
+          const skip = recordHeartbeatBudgetSkip(agentId, skipReason);
+          console.log(formatHeartbeatBudgetSkipLogLine(skip));
           logger.info({
             idleMs: now - this.lastActivityAt,
             skippedModel: true,
             pulseReadyWork: false,
+            pulseReason: preflight.reason,
+            heartbeatBudgetSkipCount: skip.count,
           }, 'idle_tick skipped model: inbox empty and direct Pulse queue empty');
           return;
         }
@@ -2176,7 +2799,7 @@ export class AgentProcess {
           threadId: `heartbeat-${this.config.agentId}`,
           userId: 'system',
           userName: 'heartbeat',
-          content: NUDGE,
+          content: prefixWarm ? NUDGE : formatIdleHeartbeatNudge(preflight),
           timestamp: now,
           source: 'heartbeat',
           metadata: {
@@ -2184,7 +2807,7 @@ export class AgentProcess {
             // proves that this idle beat will do real work. The serialized
             // inbox consumer prewarms immediately before that turn; empty
             // queues still make zero model calls.
-            idleHeartbeatReadyWork: readyWork === true,
+            idleHeartbeatReadyWork: preflight.ready === true,
           },
         });
         logger.info({
@@ -2199,7 +2822,7 @@ export class AgentProcess {
       }
     };
     this.idleHeartbeatTimer = setInterval(() => { void tickIdleHeartbeat(); }, 60 * 1000);
-    if (isLeanConversationalEnv() && this.firstHeartbeatMs < 60_000) {
+    if (shouldArmFirstWarmHeartbeat(this.firstHeartbeatMs)) {
       this.firstWarmTimer = setTimeout(() => { void tickIdleHeartbeat(); }, this.firstHeartbeatMs);
     }
   }
@@ -2207,6 +2830,7 @@ export class AgentProcess {
   /** Stop the agent process gracefully. */
   async stop(): Promise<void> {
     this.running = false;
+    this.activeCompactionAbort?.abort();
     this.runtimeRollDrain.dispose();
     if (this.idleHeartbeatTimer) { clearInterval(this.idleHeartbeatTimer); this.idleHeartbeatTimer = null; }
     if (this.firstWarmTimer) { clearTimeout(this.firstWarmTimer); this.firstWarmTimer = null; }
@@ -2226,6 +2850,22 @@ export class AgentProcess {
         SESSION_ID: this.sessionId ?? '',
         MODEL: this.model,
         CWD: this.cwd,
+        // SCLI-618: stop-hook background awareness. Grok Build's Stop hook
+        // carries backgroundTasks[] + sessionCrons[] so hooks can react to
+        // still-running work on shutdown. Mirror that here with JSON arrays
+        // (empty when nothing is active) so hooks never have to guess.
+        BACKGROUND_TASKS: JSON.stringify(
+          this.taskRegistry.list()
+            .filter((t) => t.status === 'running' || t.status === 'pending')
+            .map((t) => ({ id: t.id, type: t.type, status: t.status, description: t.description })),
+        ),
+        ACTIVE_CRONS: JSON.stringify(
+          (this.cronScheduler?.listActiveJobs() ?? []).map((j) => ({
+            id: j.id,
+            name: j.name,
+            schedule: j.schedule.display,
+          })),
+        ),
       };
       await this.hookEngine.runHooks('SessionStop', hookEnv).catch(() => {}); // best-effort on shutdown
     }
@@ -2246,6 +2886,10 @@ export class AgentProcess {
     // Stop maintenance reaper and delivery retry loop before tearing down channels
     if (this.reaper) {
       this.reaper.stop();
+    }
+    // Stop workspace GC (PLAT-6053)
+    if (this.workspaceGc) {
+      this.workspaceGc.stop();
     }
     if (this.deliveryQueue) {
       this.deliveryQueue.stopRetryLoop();
@@ -2380,7 +3024,11 @@ export class AgentProcess {
         model,
         contextWindow: this.maxContextTokens,
         systemPrompt: this.systemPrompt,
-        tools: toolDefinitionsForProvider(this.toolDefs, provider),
+        tools: toolDefinitionsForProvider(
+          this.toolDefs,
+          provider,
+          this.toolRegistry?.definitions?.() ?? this.toolDefs,
+        ),
         chatMessages: messagesToChat(this.messages),
       });
       return !compareProviderPrefixSnapshots(proof, snapshot).cacheBreaking;
@@ -2405,12 +3053,49 @@ export class AgentProcess {
       };
     };
 
-    const maxOutputTokens = this.maxOutputTokensForMessage(msg, turnIndex);
+    const maxOutputTokens = this.maxOutputTokensForMessage(msg, forceHeartbeatQueueTool ? 0 : turnIndex);
     const doTurn = async (provider: any, model: string, thinking?: string, effort?: string) => {
+      const identity = {
+        sessionId: this.sessionId!, generation: crypto.randomUUID(), ownerId: this.toolAttemptOwner,
+        inboundMessageId: msg.id, executionId: msg.threadId, sessionEpoch: this.sessionGeneration,
+      };
+      const journaledToolIds = new Set<string>();
+      const auditIds = new Map<string, { id: string; name: string }>();
+      const assertOwner = () => {
+        if (this.sessionId !== identity.sessionId || this.sessionGeneration !== identity.sessionEpoch) {
+          throw Object.assign(new Error('Tool attempt session generation changed'), { code: 'TOOL_CHECKPOINT_FAILED', retryable: false });
+        }
+      };
+      const agentName = this.config.agentName ?? this.config.agentId ?? 'unknown';
+      const complete = (toolCallId: string, invocation: number, result: import('../tools/types.js').ToolResult, interrupted = false) => {
+        assertOwner();
+        this.store.completeToolAttempt(identity, toolCallId, invocation, result, interrupted);
+        const audit = auditIds.get(`${toolCallId}:${invocation}`);
+        if (audit && this.auditLogger) {
+          if (result.isError) this.auditLogger.logError(audit.id, agentName, audit.name, result.content, result.durationMs ?? 0);
+          else this.auditLogger.logAfter(audit.id, agentName, audit.name, result.content, result.durationMs ?? 0);
+        }
+      };
+      const executionJournal: NonNullable<ToolContext['executionJournal']> = {
+        generation: identity.generation,
+        begin: (toolCallId, name, input, invocation) => {
+          assertOwner();
+          this.store.beginToolAttempt(identity, toolCallId, name, input, invocation);
+          journaledToolIds.add(toolCallId);
+          if (this.auditLogger) auditIds.set(`${toolCallId}:${invocation}`, {
+            id: this.auditLogger.logBefore(agentName, name, input), name,
+          });
+        },
+        complete,
+        interrupt: (toolCallId, invocation, result) => complete(toolCallId, invocation, result, true),
+      };
+      this.refreshContextWindow(model, provider);
       const heartbeatQueueTool = !talkSeatSuppressesTools()
+        && this.permissionMode !== 'plan'
         && forceHeartbeatQueueTool
         && provider?.name === 'cortex'
-        ? this.toolDefs.find((tool) => tool.name.endsWith('__pulse_get_my_alerts'))
+        ? this.toolDefs.find((tool) => tool.name.endsWith('__pulse_get_my_work'))
+          || this.toolDefs.find((tool) => tool.name.endsWith('__pulse_get_my_alerts'))
         : undefined;
       let rehomeRequiredForAttempt = false;
       if (isLocalCortexModel(provider, model)) {
@@ -2421,7 +3106,7 @@ export class AgentProcess {
       }
       const result = await executeTurn(
         this.messages, provider, model, this.systemPrompt, this.toolDefs,
-        this.toolRegistry, this.permissions, this.emitter, toolContext,
+        this.toolRegistry, this.permissions, this.emitter, { ...toolContext, executionJournal },
         maxOutputTokens, this.temperature,
         undefined, // onPermissionAsk
         this.hookEngine ?? undefined,
@@ -2456,7 +3141,15 @@ export class AgentProcess {
               type: 'function',
               function: { name: heartbeatQueueTool.name },
             } : undefined,
-      );
+      ).catch((error: unknown) => {
+        assertOwner();
+        try {
+          this.messages.push(...this.store.recoverToolTurns(identity.sessionId, identity.ownerId, identity.sessionEpoch, identity.generation));
+        } catch (cause) {
+          throw Object.assign(new Error('Tool recovery checkpoint could not be committed'), { code: 'TOOL_CHECKPOINT_FAILED', retryable: false, cause });
+        }
+        throw error;
+      });
       // A `required` header belongs to this exact provider attempt. Surface it
       // only if that same attempt completed successfully; an errored stream
       // followed by a healthy fallback must not rehome the fallback's session.
@@ -2470,7 +3163,7 @@ export class AgentProcess {
         // incorrectly bless a request whose upstream stream then failed.
         this.cortexWarmPrefixProofs.set(model, this.lastProviderPrefixSnapshot);
       }
-      return result;
+      return { ...result, toolAttemptIdentity: identity, journaledToolIds: [...journaledToolIds] };
     };
 
     // Try active model first (use per-entry settings from the pinned/primary entry)
@@ -2678,6 +3371,7 @@ export class AgentProcess {
 
   /** Check if an error from executeTurn is eligible for model fallback. */
   private static isFallbackEligible(err: unknown): boolean {
+    if ((err as { code?: string })?.code === 'TOOL_CHECKPOINT_FAILED') return false;
     if (!(err instanceof Error)) return true;
     const msg = err.message.toLowerCase();
     // Abort/cancel — user-initiated, don't fallback
@@ -2904,6 +3598,33 @@ export class AgentProcess {
 
     const existing = this.store.loadSession(agentSessionId);
     if (existing) {
+      const previousModel = canonicalSessionModel(existing.model);
+      const currentModel = canonicalSessionModel(this.model);
+      if (previousModel && currentModel && previousModel !== currentModel) {
+        // Nova 2026-09-09: GLM-5.3-Flash eternal session (572 msgs / 241k
+        // tokens) resumed onto DeepSeek-V4-Flash-Vision-Metal and occupied
+        // the 1-slot Metal backend with 0 tokens. A listing change is a
+        // new conversation — do not replay the old wire prefix.
+        logger.warn({
+          sessionId: existing.id,
+          previousModel: existing.model,
+          model: this.model,
+          messageCount: existing.messages.length,
+        }, 'Eternal session model changed — rotating instead of resuming');
+        try {
+          this.store.deleteSession(existing.id);
+        } catch (err) {
+          logger.warn({ err: String(err), sessionId: existing.id }, 'Model-change session rotate: delete failed');
+        }
+        this.store.createSessionWithId(agentSessionId, this.model, this.cwd);
+        this.sessionId = agentSessionId;
+        this.messages = [];
+        this.sessionGeneration = 0;
+        this.providerWirePrefix = null;
+        this.lastProviderPrefixSnapshot = null;
+        logger.info({ sessionId: this.sessionId, model: this.model }, 'Created new eternal session after model change');
+        return;
+      }
       this.sessionId = existing.id;
       this.messages = [...existing.messages];
       const recovery = this.store.loadExpensiveTurnRecovery?.(existing.id) as ExpensiveTurnRecoveryState | null;
@@ -2971,15 +3692,21 @@ export class AgentProcess {
       this.sessionGeneration = 0;
       logger.info({ sessionId: this.sessionId }, 'Created new eternal session');
     }
+    this.messages.push(...this.store.recoverToolTurns(this.sessionId!, this.toolAttemptOwner, this.sessionGeneration));
   }
 
   /** PLAT-4189 resume pin. Compares the freshly composed prompt head against
    *  the byte-exact head the previous process last sent. Identical → no-op.
-   *  Same tool NAME set but drifted bytes (git context, memory, skill catalog,
-   *  tool descriptions) → adopt the persisted serialization verbatim and defer
-   *  the fresh composition to the next compaction, where the prefix cache
-   *  breaks anyway. Different tool name set → real capability change: adopt
-   *  fresh (one-time rebuild) and log exactly what changed.
+   *  Any other drift (git context, memory, skill catalog, tool descriptions,
+   *  OR a different tool NAME set) → adopt the persisted serialization
+   *  verbatim and defer the fresh composition to the next compaction.
+   *
+   *  A smaller tool set on resume is almost always MCP still connecting
+   *  (agent-kei 2026-09-04: Hive liveness bounce → pulse/wiki/admin 90s
+   *  timeout → this pin treated the shrink as a "capability change" and
+   *  rebuilt 149k tokens at 0% cache). A larger set is ToolSearch/JIT
+   *  activation that must wait for compaction. Neither is allowed to miss
+   *  the prefix cache. Operator invariant: only compaction may miss cache.
    *  Disable: SHIZUHA_RESUME_PROMPT_PIN=0. Fail-open. */
   private applyResumePromptPin(): void {
     const raw = (process.env['SHIZUHA_RESUME_PROMPT_PIN'] ?? '').trim().toLowerCase();
@@ -3003,38 +3730,33 @@ export class AgentProcess {
         const parsed = JSON.parse(persisted.toolDefs) as unknown;
         if (Array.isArray(parsed)) persistedDefs = parsed as ToolDefinition[];
       } catch { /* corrupt head — fall through to fresh adoption */ }
-      const freshNames = this.toolDefs.map((t) => t.name).sort();
-      const persistedNames = persistedDefs.map((t) => t.name).sort();
-      const sameNameSet = persistedDefs.length > 0
-        && freshNames.length === persistedNames.length
-        && freshNames.every((name, i) => name === persistedNames[i]);
-      if (sameNameSet && persisted.systemPrompt.length > 0) {
-        this.pendingPromptRefresh = { systemPrompt: this.systemPrompt, toolDefs: this.toolDefs };
-        const changedSections = diffSystemPromptSections(
-          hashSystemPromptSections(persisted.systemPrompt),
-          hashSystemPromptSections(this.systemPrompt),
-        );
-        this.systemPrompt = persisted.systemPrompt;
-        this.toolDefs = persistedDefs;
-        logger.warn({
-          agent: this.config.agentName ?? this.config.agentId,
-          samePrompt,
-          changedSections,
-          pinnedPromptChars: persisted.systemPrompt.length,
-          freshPromptChars: this.pendingPromptRefresh.systemPrompt.length,
-        }, 'PLAT-4189 resume pin: adopted previous process prompt head verbatim; fresh composition deferred to next compaction');
-      } else {
-        const added = freshNames.filter((n) => !persistedNames.includes(n));
-        const removed = persistedNames.filter((n) => !freshNames.includes(n));
+      if (persisted.systemPrompt.length === 0 && persistedDefs.length === 0) {
         this.store.saveProviderPrefixHead(this.sessionId, {
           createdAt: Date.now(), model: this.model,
           systemPrompt: this.systemPrompt, toolDefs: freshToolDefsJson,
         });
-        logger.warn({
-          agent: this.config.agentName ?? this.config.agentId,
-          addedTools: added, removedTools: removed,
-        }, 'PLAT-4189 resume pin: tool set changed across restart — adopting fresh head (one-time full prefix rebuild)');
+        return;
       }
+      const freshNames = this.toolDefs.map((t) => t.name).sort();
+      const persistedNames = persistedDefs.map((t) => t.name).sort();
+      const added = freshNames.filter((n) => !persistedNames.includes(n));
+      const removed = persistedNames.filter((n) => !freshNames.includes(n));
+      this.pendingPromptRefresh = { systemPrompt: this.systemPrompt, toolDefs: this.toolDefs };
+      const changedSections = diffSystemPromptSections(
+        hashSystemPromptSections(persisted.systemPrompt),
+        hashSystemPromptSections(this.systemPrompt),
+      );
+      this.systemPrompt = persisted.systemPrompt;
+      this.toolDefs = persistedDefs;
+      logger.warn({
+        agent: this.config.agentName ?? this.config.agentId,
+        samePrompt,
+        changedSections,
+        addedTools: added,
+        removedTools: removed,
+        pinnedPromptChars: persisted.systemPrompt.length,
+        freshPromptChars: this.pendingPromptRefresh.systemPrompt.length,
+      }, 'PLAT-4189 resume pin: adopted previous process prompt head verbatim; fresh composition deferred to next compaction');
     } catch (err) {
       logger.warn({ err: String(err) }, 'PLAT-4189 resume pin failed open — using fresh composition');
     }
@@ -3057,6 +3779,15 @@ export class AgentProcess {
     } catch { /* head persistence is best-effort */ }
     logger.info({ agent: this.config.agentName ?? this.config.agentId, reason },
       'PLAT-4189 resume pin: pending prompt refresh adopted');
+  }
+
+  /** In-memory cache identity follows only committed StateStore rewrites. */
+  private bindStoreWirePrefixInvalidation(): void {
+    const replace = this.store.replaceMessages.bind(this.store);
+    this.store.replaceMessages = (sessionId: string, messages: Message[]) => {
+      replace(sessionId, messages);
+      if (sessionId === this.sessionId) this.providerWirePrefix = null;
+    };
   }
 
   /** Persist the exact provider payload just sent as the frozen wire prefix
@@ -3378,7 +4109,7 @@ export class AgentProcess {
       threadId: `expensive-turn-recovery-${recovery.episodeId}`,
       userId: 'system',
       userName: 'recovery',
-      content: '[HEARTBEAT RECOVERY] The prior transcript generation is fenced. Call mcp__shizuha-pulse__pulse_get_my_alerts directly first, then mcp__shizuha-pulse__pulse_get_my_tasks. After both results, completely work or forward the highest-priority ready item across alerts and tasks; alerts win ties but never preempt higher-priority task WIP. Do not replay deferred feed first. If both inboxes are empty or blocked, report only that verified snapshot.',
+      content: '[HEARTBEAT RECOVERY] The prior transcript generation is fenced. Call mcp__shizuha-pulse__pulse_get_my_work (alerts + tasks in one snapshot) and choose what to advance. Do not replay deferred feed first. If both inboxes are empty or blocked, report only that verified snapshot.',
       timestamp: Date.now(),
       source: 'heartbeat',
       metadata: { expensiveTurnRecoveryEpisodeId: recovery.episodeId },
@@ -3826,39 +4557,114 @@ export class AgentProcess {
     }
   }
 
-  private async hasReadyPulseWorkForIdleHeartbeat(): Promise<boolean | undefined> {
-    const token = pulseToken();
+  private async hasReadyPulseWorkForIdleHeartbeat(): Promise<IdleHeartbeatPreflight> {
+    let token = await resolvePulseTokenFresh();
     const emails = idleHeartbeatAgentPulseEmails(this.config.agentUsername);
     const platform = pulseBaseUrl();
     if (!token || emails.length === 0) {
+      // PLAT-6187: fail-CLOSED on empty token. A queue-blind lease holder must
+      // never invoke the model on an idle heartbeat it cannot prove has work
+      // (Hiro 2026-08-17: expired RS256 -> 3x110k DeepSeek turns every ~2 min).
       logger.warn(
         { hasToken: Boolean(token), emails },
-        'Idle heartbeat Pulse preflight lacks token or email — failing open',
+        'Idle heartbeat Pulse preflight lacks token or email — failing closed',
       );
-      return undefined;
+      return { ready: false, reason: 'no_token' };
     }
 
+    const origin = platform.endsWith('/pulse') ? platform.replace(/\/pulse$/, '') : platform;
     try {
       for (const email of emails) {
-        const url = new URL('/pulse/api/items/heartbeat-preflight/', platform.endsWith('/pulse')
-          ? platform.replace(/\/pulse$/, '')
-          : platform);
+        const url = new URL('/pulse/api/items/heartbeat-preflight/', origin);
         url.searchParams.set('assignee_email', email);
-        const response = await fetch(url, {
+        let response = await fetch(url, {
           headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
           signal: AbortSignal.timeout(5_000),
         });
-        if (!response.ok) {
-          logger.warn({ status: response.status, email }, 'Idle heartbeat Pulse preflight HTTP failed open');
-          return undefined;
+        if (response.status === 401) {
+          const fresh = await resolvePulseTokenFresh();
+          if (pulsePreflightShouldRetryUnauthorized(response.status, token, fresh)) {
+            logger.warn({ email }, 'Idle heartbeat Pulse preflight 401 — refreshed broker JWT and retrying once');
+            token = fresh;
+            response = await fetch(url, {
+              headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+              signal: AbortSignal.timeout(5_000),
+            });
+          }
         }
-        const payload = await response.json() as { decision?: string };
-        if (payload.decision === 'run') return true;
-        if (payload.decision === 'skip') return false;
+        if (!response.ok) {
+          // PLAT-6187: fail-CLOSED on preflight HTTP failure — no model call
+          // without a confirmed ready-work decision.
+          logger.warn({ status: response.status, email }, 'Idle heartbeat Pulse preflight HTTP failed closed');
+          return { ready: false, reason: 'preflight_http_error' };
+        }
+        const payload = await response.json() as { decision?: string; reason?: string };
+        if (payload.decision === 'run') {
+          const snapshotLines = await this.fetchIdleHeartbeatQueueSnapshot(origin, token, email);
+          return { ready: true, reason: payload.reason || 'run', snapshotLines };
+        }
+        if (payload.decision === 'skip') return { ready: false, reason: payload.reason || 'skip' };
       }
-      return false;
+      return { ready: false, reason: 'queue_empty' };
     } catch (err) {
-      logger.warn({ err: (err as Error).message }, 'Idle heartbeat Pulse preflight failed open');
+      logger.warn({ err: (err as Error).message }, 'Idle heartbeat Pulse preflight failed closed');
+      return { ready: false, reason: 'preflight_exception' };
+    }
+  }
+
+  private resetFruitlessHeartbeatSession(last: {
+    outcome?: string;
+    readyTaskCount?: number;
+    consecutiveReadyNoProgressHeartbeats?: number;
+  }): void {
+    if (!this.sessionId) return;
+    const messageCount = this.messages.length;
+    const agentId = this.config.agentId ?? this.config.agentName ?? 'unknown-agent';
+    if (messageCount === 0) {
+      logger.warn({
+        sessionId: this.sessionId,
+        messageCount,
+        readyTaskCount: last.readyTaskCount,
+        consecutiveReadyNoProgressHeartbeats: last.consecutiveReadyNoProgressHeartbeats,
+      }, 'Fruitless needs_help heartbeat — session already empty, skipping rotate');
+      clearFruitlessConsecutiveAfterSessionRotate(agentId);
+      return;
+    }
+    logger.warn({
+      sessionId: this.sessionId,
+      messageCount,
+      readyTaskCount: last.readyTaskCount,
+      consecutiveReadyNoProgressHeartbeats: last.consecutiveReadyNoProgressHeartbeats,
+    }, 'Fruitless needs_help heartbeat — rotating eternal session so the next Pulse turn is not a 300k no-tool loop');
+    try {
+      this.store.replaceMessages(this.sessionId, []);
+    } catch (err) {
+      logger.warn({ err, sessionId: this.sessionId }, 'Failed to persist fruitless-heartbeat session rotate');
+    }
+    this.messages = [];
+    this.providerWirePrefix = null;
+    this.lastReportedPromptTokens = 0;
+    this.lastReportedRawEstimateTokens = 0;
+    this.sessionGeneration += 1;
+    clearFruitlessConsecutiveAfterSessionRotate(agentId);
+  }
+
+  private async fetchIdleHeartbeatQueueSnapshot(
+    origin: string,
+    token: string,
+    email: string,
+  ): Promise<string[] | undefined> {
+    try {
+      const url = new URL('/pulse/api/items/', origin);
+      url.searchParams.set('assignee_email', email);
+      url.searchParams.set('limit', '5');
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!response.ok) return undefined;
+      return formatPulseQueueSnapshotLines(await response.json());
+    } catch {
       return undefined;
     }
   }
@@ -3866,7 +4672,9 @@ export class AgentProcess {
   /** Process a single inbound message through the agent loop. */
   private async processMessage(msg: InboundMessage): Promise<void | false> {
     await this.pauseForExpensiveTurnGuardIfNeeded(msg);
-    this.touchActivity();
+    if (shouldTouchIdleActivityForSource(msg.source)) {
+      this.touchActivity();
+    }
 
     // Operator 2026-08-08: ALL cron jobs enter the normal agent path — tools,
     // session context, inbox serialization, session-affine routing. The old
@@ -3875,7 +4683,13 @@ export class AgentProcess {
     // (tool-less), and surfaced as unattributable admission ghost rows
     // (agent-sato 11:50Z). ScheduleWakeup loop jobs still carry their loop
     // config via metadata.selfInvocation/loop.
+    //
+    // Interval schedule_job watches still run on that path (tools, Cortex
+    // routing). They must not reset the Pulse idle clock, and their
+    // transcripts must not remain in the eternal session after the tick.
     const isSelfWakeup = msg.source === 'cron';
+    const isolateCronTranscript = cronJobShouldIsolateFromEternalSession(msg);
+    const cronTranscriptSnapshotCount = this.messages.length;
     // SCLI-93/SCLI-50: the intrinsic idle-heartbeat self-nudge is pushed with
     // source:'heartbeat' (see startIdleHeartbeat). Detect it so the auto-reply
     // engine is skipped for idle beats (a catch-all rule must not fire a canned
@@ -3886,6 +4700,8 @@ export class AgentProcess {
       : undefined;
     let recoveryAttemptRecorded = false;
     let runtimeRollDeferred = false;
+    let compactionDeferred = false;
+    let compactionDiscarded = false;
 
     const channel = this.channels.get(msg.channelId);
     if (!channel) {
@@ -3897,7 +4713,9 @@ export class AgentProcess {
     }
 
     this.inbox.busy = true;
-    this.lastActivityAt = Date.now();
+    if (shouldTouchIdleActivityForSource(msg.source)) {
+      this.lastActivityAt = Date.now();
+    }
 
     logger.info({
       agentId: this.config.agentId,
@@ -4135,6 +4953,36 @@ export class AgentProcess {
 
     } catch (err) {
       const errorMsg = (err as Error).message || 'Internal error';
+      if (err instanceof GatewayCompactionFailure) {
+        compactionDeferred = true;
+        compactionDiscarded = err.category === 'interrupted' || err.category === 'stale'
+          || err.generation !== this.sessionGeneration || err.sessionId !== this.sessionId;
+        if (compactionDiscarded) {
+          logger.debug({ code: err.code, generation: err.generation }, 'Discarded interrupted or fenced compaction result');
+          return false;
+        }
+        selfWakeupError = errorMsg;
+        // Provider errors retain their original message/code/status. Do not
+        // turn authentication, transport or storage errors into bad summaries.
+        this.recordRecentError(err.cause);
+        const cause = err.cause as { code?: unknown; status?: unknown; statusCode?: unknown } | undefined;
+        const status = cause?.status ?? cause?.statusCode;
+        this.lastCompactionFailure = {
+          category: err.category, code: err.code,
+          ...(cause?.code != null ? { cause_code: String(cause.code) } : {}),
+          ...(typeof status === 'number' ? { status } : {}),
+        };
+        logger.error({ err, channelId: msg.channelId, threadId: msg.threadId }, 'Compaction deferred the input without rewriting history');
+        this.emitTelemetry();
+        try {
+          await channel.sendEvent(msg.threadId, {
+            type: 'error', error: errorMsg,
+            ...this.lastCompactionFailure,
+            recoverable: true, terminal: false, timestamp: Date.now(),
+          } as any);
+        } catch { /* the input remains unacknowledged even if the channel is closed */ }
+        return false;
+      }
       const userError = userVisibleProviderFailure(errorMsg);
       selfWakeupError = errorMsg;
       this.recordRecentError(err);
@@ -4218,13 +5066,13 @@ export class AgentProcess {
         } catch { /* swallow send errors */ }
       }
     } finally {
-      if (!runtimeRollDeferred && recoveryEpisodeId && !recoveryAttemptRecorded) {
+      if (!runtimeRollDeferred && !compactionDeferred && recoveryEpisodeId && !recoveryAttemptRecorded) {
         await this.finishExpensiveTurnRecoveryBootstrap(recoveryEpisodeId, 'not_observed').catch((err) => {
           logger.error({ err, recoveryEpisodeId }, 'Failed to record SCLI-347 recovery attempt');
         });
       }
       // Fire MessageSent hook (agent finished responding)
-      if (!runtimeRollDeferred && this.hookEngine?.hasHooks('MessageSent')) {
+      if (!runtimeRollDeferred && !compactionDeferred && this.hookEngine?.hasHooks('MessageSent')) {
         await this.hookEngine.runHooks('MessageSent', {
           SESSION_ID: this.sessionId ?? '',
           CHANNEL_ID: msg.channelId,
@@ -4234,20 +5082,41 @@ export class AgentProcess {
         }).catch(() => {});
       }
 
-      if (!runtimeRollDeferred && isSelfWakeup && msg.cronJobId && this.cronStore) {
+      if (!runtimeRollDeferred && !compactionDiscarded && isSelfWakeup && msg.cronJobId && this.cronStore) {
         await this.cronStore.markJobRun(msg.cronJobId, selfWakeupError ? 'error' : 'ok', selfWakeupError);
+      }
+
+      if (isolateCronTranscript && !runtimeRollDeferred && !compactionDeferred) {
+        const trimmed = trimIsolatedCronTranscript(this.messages, cronTranscriptSnapshotCount);
+        if (trimmed.length !== this.messages.length) {
+          const removed = this.messages.length - trimmed.length;
+          this.messages = trimmed;
+          try {
+            this.store.replaceMessages(this.sessionId, this.messages);
+          } catch (err) {
+            logger.warn({ err, sessionId: this.sessionId }, 'Failed to trim isolated cron transcript');
+          }
+          this.providerWirePrefix = null;
+          logger.info({
+            sessionId: this.sessionId,
+            cronJobId: msg.cronJobId,
+            removed,
+            remaining: this.messages.length,
+          }, 'Isolated cron watch from eternal session');
+        }
       }
 
       this.inbox.busy = false;
       // No execution_complete/ack on a rollout checkpoint. The exact row is
       // still queued locally and remains replayable upstream after replacement.
-      if (!runtimeRollDeferred) channel.sendComplete(msg.threadId);
+      if (!runtimeRollDeferred && !compactionDeferred) channel.sendComplete(msg.threadId);
     }
   }
 
   /** Run agent turns until the model stops (no tool calls, max turns, etc.). */
   private async executeTurns(msg: InboundMessage, channel: Channel): Promise<boolean> {
     const { executeTurn } = await import('../agent/turn.js');
+    const { visibleTextFromContent, reasoningTextFromContent, isProgressOnlyAssistantText } = await import('../agent/content.js');
     const { needsCompaction, estimateOverheadTokens } = await import('../prompt/context.js');
 
     const { normalizeModelName } = await import('../provider/registry.js');
@@ -4295,9 +5164,13 @@ export class AgentProcess {
       }
     }
 
-    const toolContext = { cwd: this.cwd, sessionId: this.sessionId!, taskRegistry: this.taskRegistry, sandbox: this.sandboxConfig };
+    this.refreshContextWindow(activeModel, activeProvider);
+    const toolContext: ToolContext = { cwd: this.cwd, sessionId: this.sessionId!, taskRegistry: this.taskRegistry, sandbox: this.sandboxConfig };
     const startTime = Date.now();
     let turnIndex = 0;
+    // Never Cortex-force an inbox tool. The model calls Pulse itself or stops.
+    let heartbeatQueueToolPending = false;
+    let incompleteReason: HeartbeatQueueDrainRecord['incompleteReason'];
     let totalInputTokens = 0;
     // SCLI-182 anchor now lives on the instance (this.lastReportedPromptTokens)
     // so turn-0 gates of a NEW exchange keep the previous exchange's real
@@ -4347,8 +5220,14 @@ export class AgentProcess {
 
 
     // Loop detection — catches the agent calling the same tool repeatedly.
-    // Thresholds are TOML-tunable via [loopDetector] (SCLI-20c).
-    const loopDetector = new LoopDetector(this.loopDetectorConfig);
+    // Thresholds are TOML-tunable via [loopDetector] (SCLI-20c). Heartbeats
+    // keep the process-lifetime detector so ABAB fetch loops accumulate;
+    // a human/Connect message is a new attempt. executeTurns is a nested
+    // method — read source off `msg`, not processMessage's local.
+    if (msg.source !== 'heartbeat') {
+      this.loopDetector.reset();
+    }
+    const loopDetector = this.loopDetector;
 
     // Deferred MCP tools are all treated uniformly: if a turn explicitly names
     // an exact mcp__server__tool, make that tool schema active for this turn
@@ -4415,47 +5294,82 @@ export class AgentProcess {
       phase: 'pre-turn' | 'post-turn',
       overheadTokens: number,
     ): Promise<void> => {
-      const before = this.messages.length;
-      try { await this.flushPreCompactionMemory(); } catch { /* non-fatal */ }
-      const { compactMessagesRequired } = await import('../state/compaction.js');
-      const { messages: compacted } = await compactMessagesRequired(
-        this.messages,
-        activeProvider,
-        activeModel,
-        this.maxContextTokens,
-        // CTX-650 (agent-kei 2026-08-11): thread the SESSION identity. Without
-        // it the compaction request reaches Cortex under a prompt-hash
-        // affinity — a homeless 292K cold request that placement sends
-        // OFF-HOME (288.7s prefill on tp8 for content 99% warm on i7-a).
-        // With the session key it hits the session's own warm prefix in ~2s.
-        // Same bug class as the 2026-07-13 TUI-side fix; the gateway path
-        // was never threaded.
-        {
-          overheadTokens,
-          force: true,
-          ...(this.sessionId ? { sessionId: this.sessionId } : {}),
-        },
-      );
-      if (!this.validateCompactedMessages(compacted, this.messages)) {
-        throw new Error(`Semantic ${phase} compaction produced an invalid transcript`);
+      this.refreshContextWindow(activeModel, activeProvider);
+      const { compactMessagesRequired, CompactionQualityError, CompactionCapacityError } = await import('../state/compaction.js');
+      const generation = this.sessionGeneration;
+      const sessionId = this.sessionId;
+      const source = structuredClone(this.messages);
+      const sourceJson = JSON.stringify(source);
+      const abort = new AbortController();
+      this.activeCompactionAbort = abort;
+      let category: CompactionFailureCategory = 'internal';
+      let providerFailure: { error: unknown } | undefined;
+      try {
+        try { await this.flushPreCompactionMemory(); } catch { /* non-fatal */ }
+        abort.signal.throwIfAborted();
+        const { messages: compacted } = await compactMessagesRequired(
+          source, activeProvider, activeModel, this.maxContextTokens,
+          {
+            overheadTokens, force: true, abortSignal: abort.signal,
+            onProviderError: (error) => { providerFailure = { error }; },
+            // PLAT-9194 band: multi-pass compaction must re-validate the
+            // transaction fence BEFORE each additional model pass — a source
+            // mutated mid-transaction (appended input, generation bump) makes
+            // every further pass stale. Throwing here lands in the catch
+            // below, which classifies it 'stale' and the caller discards it
+            // silently (no error event, input stays unacknowledged).
+            beforeSemanticPass: () => {
+              if (generation !== this.sessionGeneration || sessionId !== this.sessionId
+                || sourceJson !== JSON.stringify(this.messages)) {
+                throw new Error('Compaction source changed while awaiting the summary');
+              }
+            },
+            // Maintenance keeps the real session's admission/cache identity.
+            ...(sessionId ? { sessionId } : {}),
+          },
+        );
+        abort.signal.throwIfAborted();
+        if (generation !== this.sessionGeneration || sessionId !== this.sessionId
+          || sourceJson !== JSON.stringify(this.messages)) {
+          category = 'stale';
+          throw new Error('Compaction source changed while awaiting the summary');
+        }
+        category = 'validation';
+        if (!this.validateCompactedMessages(compacted, source)) {
+          throw new Error(`Semantic ${phase} compaction produced an invalid transcript`);
+        }
+        category = 'persistence';
+        this.store.replaceMessages(this.sessionId, compacted);
+        this.messages.length = 0;
+        this.messages.push(...compacted);
+        this.adoptPendingPromptRefresh(`${phase.replace('-', '_')}_semantic_compaction`);
+        this.lastReportedPromptTokens = 0;
+        this.lastCompactionFailure = null;
+        logger.info(
+          { phase, before: source.length, after: compacted.length, sessionId },
+          'Gateway provider-backed semantic compaction complete',
+        );
+      } catch (err) {
+        if (abort.signal.aborted) category = 'interrupted';
+        // PLAT-9194: a source mutated mid-transaction (appended input) is
+        // stale even when the generation integer is unchanged — the fence
+        // callback throws on exactly this condition between passes.
+        else if (generation !== this.sessionGeneration || sessionId !== this.sessionId
+          || sourceJson !== JSON.stringify(this.messages)) category = 'stale';
+        else if (providerFailure && providerFailure.error === err) category = 'provider';
+        else if (err instanceof CompactionQualityError) category = 'quality';
+        else if (err instanceof CompactionCapacityError) category = 'capacity';
+        throw new GatewayCompactionFailure(
+          err, generation, sessionId, category,
+        );
+      } finally {
+        if (this.activeCompactionAbort === abort) this.activeCompactionAbort = null;
       }
-      this.messages.length = 0;
-      this.messages.push(...compacted);
-      this.adoptPendingPromptRefresh(`${phase.replace('-', '_')}_semantic_compaction`);
-      this.store.replaceMessages(this.sessionId, compacted);
-      // Provider truth describes the old prefix. The compacted successor has a
-      // new semantic prefix and must establish its own fresh measurement.
-      this.lastReportedPromptTokens = 0;
-      logger.info(
-        { phase, before, after: compacted.length, sessionId: this.sessionId },
-        'Gateway provider-backed semantic compaction complete',
-      );
-      // The rewrite keeps the same session affinity. Warm exactly this bounded
-      // successor before an interactive append, or tag the successor as cold if
-      // the affinity-preserving warmup is unavailable.
+      // Only a committed, validated rewrite needs its successor warmed.
       await prepareRewrittenHistory();
     };
     const compactPostTurnBoundaryIfNeeded = async (maxOutputTokens: number): Promise<boolean> => {
+      this.refreshContextWindow(activeModel, activeProvider);
       const overheadTokens = estimateOverheadTokens(this.systemPrompt, this.toolDefs, activeModel);
       if (!needsCompaction(
         this.messages,
@@ -4487,40 +5401,24 @@ export class AgentProcess {
       return true;
     };
     while (true) {
-      const turnMaxOutputTokens = this.maxOutputTokensForMessage(msg, turnIndex);
-      const systemOverheadTokens = estimateOverheadTokens(this.systemPrompt, this.toolDefs, activeModel);
-
-      // Fleet heartbeats must honor the pod's heartbeat budget. The 80k/100k
-      // pins were already on Saki's Deployment, but only the TUI loop read
-      // them — gateway ticks sent a 294k poisoned session and the model
-      // returned empty in ~7s without ever calling Pulse.
-      if (msg.source === 'heartbeat') {
-        const hbBudget = heartbeatBudgetConfig(this.maxContextTokens);
-        const hbEstimate = estimatePromptTokenBudget({
-          messages: this.messages,
-          systemPrompt: this.systemPrompt,
-          toolDefs: this.toolDefs,
-          model: activeModel,
-          sourceKind: 'heartbeat',
-          reportedPromptTokens: this.lastReportedPromptTokens,
-          reportedRawEstimateTokens: this.lastReportedRawEstimateTokens,
-        });
-        if (hbEstimate.promptTokenEstimate > hbBudget.hardBudgetTokens) {
-          logger.warn(
-            {
-              promptTokenEstimate: hbEstimate.promptTokenEstimate,
-              hardBudgetTokens: hbBudget.hardBudgetTokens,
-              messageCount: this.messages.length,
-            },
-            'Heartbeat skipped: session exceeds heartbeat hard budget (reset required)',
-          );
-          break;
-        }
+      if (turnIndex > 0 && this.checkpointRuntimeRollAfterTurn(msg, true)) {
+        return true;
       }
+      this.refreshContextWindow(activeModel, activeProvider);
+      const turnMaxOutputTokens = this.maxOutputTokensForMessage(msg, heartbeatQueueToolPending ? 0 : turnIndex);
+      const systemOverheadTokens = estimateOverheadTokens(this.systemPrompt, this.toolDefs, activeModel);
+      let budgetCheck = AgentProcess.inspectContextBudget(
+        this.messages, activeModel, this.maxContextTokens, this.systemPrompt, this.toolDefs,
+        turnMaxOutputTokens, this.lastReportedPromptTokens,
+      );
+
+      // Heartbeats always run, including at high ctx (operator 2026-08-17).
+      // Budget numbers may trigger the normal pre-turn compaction below; they
+      // must never skip or wipe the Pulse turn.
 
       // Pre-turn compaction check — prevents context overflow when the session
       // has accumulated too many messages (eternal sessions can grow indefinitely).
-      if (needsCompaction(
+      if (budgetCheck.exceeded || needsCompaction(
         this.messages,
         this.maxContextTokens,
         activeModel,
@@ -4534,20 +5432,15 @@ export class AgentProcess {
           'Pre-turn semantic compaction triggered',
         );
         await applySemanticCompaction('pre-turn', systemOverheadTokens);
+        budgetCheck = AgentProcess.inspectContextBudget(
+          this.messages, activeModel, this.maxContextTokens, this.systemPrompt, this.toolDefs,
+          turnMaxOutputTokens, this.lastReportedPromptTokens,
+        );
       }
 
       // Semantic compaction is the only legal history rewrite. This estimator
       // is now a fail-closed assertion; it must never authorize a local trim.
 
-      const budgetCheck = AgentProcess.inspectContextBudget(
-        this.messages,
-        activeModel,
-        this.maxContextTokens,
-        this.systemPrompt,
-        this.toolDefs,
-        turnMaxOutputTokens,
-        this.lastReportedPromptTokens, // PLAT-4189: anchor to real usage — never trim a session with real headroom
-      );
       if (budgetCheck.exceeded) {
         throw new Error(
           `Semantic compaction invariant failed before gateway provider call (${budgetCheck.promptTokens}/${budgetCheck.targetTokens} tokens); history was preserved`,
@@ -4592,6 +5485,7 @@ export class AgentProcess {
       });
 
       let result: any;
+      let rejectedReason: HeartbeatQueueDrainRecord['incompleteReason'];
       let expensiveTurnDecision: ExpensiveTurnGuardDecision = { action: 'ok' };
       let cortexRehomeRequired = false;
       try {
@@ -4599,35 +5493,46 @@ export class AgentProcess {
         result = await this.executeTurnWithFallback(
           executeTurn, activeModel, activeProvider, useFallbackChain,
           toolContext, msg, channel,
-          msg.source === 'heartbeat' && turnIndex === 0,
+          heartbeatQueueToolPending,
           postCompactionRequestKind,
           () => { cortexRehomeRequired = true; },
           turnIndex,
         );
         postCompactionRequestKind = undefined;
+        // Semantic admission is separate from transport completion, including
+        // a capped response. Keep legitimate partial answers, but do not turn
+        // known narration/degeneration into history merely because it hit the
+        // output limit. Existing incomplete-stream handling remains terminal.
+        const workingNoToolTurn = !talkSeatSuppressesTools()
+          && this.permissionMode !== 'plan' && result.toolCalls.length === 0;
+        const visibleText = visibleTextFromContent(result.assistantMessage.content)
+          .replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+        // Nova 2026-09-11: empty 0-tool generation with ready work was accepted
+        // as a completed turn (incompleteReason unset), so the fruitless
+        // rotator wiped the session every 3 beats. Silence is still the
+        // correct reply when the snapshot has no ready work.
+        const heartbeatEmptyWithReadyWork = msg.source === 'heartbeat'
+          && heartbeatSnapshotHasReadyWork(heartbeatToolCalls, heartbeatToolResults);
+        rejectedReason = result.requiredToolFailure ? 'required_tool_not_called'
+          : workingNoToolTurn && (result.outputDegeneracyReason || result.stopReason === 'degenerate_generation') ? 'degenerate_generation'
+          : workingNoToolTurn && (result.stopReason === 'glm_observation' || isProgressOnlyAssistantText(visibleText)) ? 'progress_only'
+          : workingNoToolTurn && !visibleText
+            && (reasoningTextFromContent(result.assistantMessage.content).trim()
+              || heartbeatEmptyWithReadyWork)
+            && (msg.source === 'heartbeat' || !incompleteTurnError(result.incompleteStreamReason ?? result.stopReason)) ? 'reasoning_only'
+          : undefined;
         // Update active model/provider if fallback changed them
         if (useFallbackChain && this.pinnedFallbackIndex !== pinnedFallbackIndexBeforeTurn && this.pinnedFallbackIndex < this.modelFallbacks.length) {
           const pinned = this.modelFallbacks[this.pinnedFallbackIndex]!;
           const pinnedModel = normalizeModelName(pinned.model);
-          if (pinnedModel !== activeModel) {
-            // A pinned entry whose provider is unavailable (e.g. a stale env
-            // chain naming an unauthenticated claude model) must not throw and
-            // kill the WHOLE message turn — un-pin and keep the working active
-            // model instead (yuki's heartbeat/task-assign turns died this way
-            // when a stale k8s-env chain pinned claude-sonnet).
-            try {
-              activeProvider = this.providerReg.resolve(pinnedModel);
-              activeModel = pinnedModel;
-            } catch (pinErr) {
-              logger.warn({ pinnedModel, activeModel, err: (pinErr as Error).message },
-                'Pinned fallback model unavailable — keeping current model and resetting pin');
-              this.pinnedFallbackIndex = 0;
-              this.pinnedFallbackAt = 0;
-            }
+          if (pinnedModel !== activeModel || this.provider !== activeProvider) {
+            activeProvider = this.provider;
+            activeModel = pinnedModel;
           }
         } else if (useFallbackChain) {
           this.alignPinnedFallbackIndexWithActiveModel(activeModel, normalizeModelName);
         }
+        this.refreshContextWindow(activeModel, activeProvider);
 
         // GAP F: End turn span
         if (turnSpanId) {
@@ -4659,8 +5564,10 @@ export class AgentProcess {
             inputTokens: result.inputTokens,
             outputTokens: result.outputTokens,
             toolNames: result.toolCalls.slice(0, 8).map((c: { name?: string }) => c?.name ?? '?'),
-            assistantExcerpt: assistantText.slice(0, 500),
-          });
+            assistantExcerpt: (assistantText || reasoningTextFromContent(result.assistantMessage?.content).trim()).slice(0, 500),
+            ...(rejectedReason ? { incompleteReason: rejectedReason } : {}),
+            ...(result.requiredToolFailure ? { requiredToolFailure: result.requiredToolFailure } : {}),
+          }, rejectedReason ? 'error' : 'ok');
         }
         expensiveTurnDecision = this.expensiveTurnGuard.record({
           now: Date.now(),
@@ -4740,11 +5647,12 @@ export class AgentProcess {
         for (let ti = 0; ti < result.toolCalls.length; ti++) {
           const tc = result.toolCalls[ti];
           const tr = result.toolResults[ti];
+          if (result.journaledToolIds?.includes(tc.id)) continue;
           const auditId = this.auditLogger.logBefore(agentName, tc.name, tc.input);
           if (tr?.isError) {
-            this.auditLogger.logError(auditId, agentName, tc.name, tr.content ?? 'unknown error', 0);
+            this.auditLogger.logError(auditId, agentName, tc.name, tr.content ?? 'unknown error', tr.durationMs ?? 0);
           } else {
-            this.auditLogger.logAfter(auditId, agentName, tc.name, tr?.content ?? '', 0);
+            this.auditLogger.logAfter(auditId, agentName, tc.name, tr?.content ?? '', tr?.durationMs ?? 0);
           }
         }
       }
@@ -4753,6 +5661,10 @@ export class AgentProcess {
       // persisted.  Any late async emitter delivery is rejected by the
       // generation check above; the clean successor owns all subsequent work.
       if (expensiveTurnDecision.action === 'pause') {
+        if (result.toolAttemptIdentity) {
+          const identity = result.toolAttemptIdentity;
+          this.messages.push(...this.store.recoverToolTurns(identity.sessionId, identity.ownerId, identity.sessionEpoch, identity.generation));
+        }
         sawLoopBreak = true;
         await this.applyExpensiveTurnPauseBranch(expensiveTurnDecision, activeModel, msg);
         turnIndex++;
@@ -4778,11 +5690,23 @@ export class AgentProcess {
         } catch { /* durable anchor is best-effort */ }
       }
 
-      // Persist assistant message
-      result.assistantMessage.id = assistantMessageId;
-      result.assistantMessage.executionId = msg.threadId;
-      this.messages.push(result.assistantMessage);
-      this.store.appendMessage(this.sessionId, result.assistantMessage);
+      // Classify before admission to model history. Audit/stream telemetry
+      // already retains the raw response; replaying failed narration and then
+      // quoting it in a correction only teaches the next attempt to repeat it.
+      const turnMessages: Message[] = [];
+      if (!rejectedReason) {
+        result.assistantMessage.id = assistantMessageId;
+        result.assistantMessage.executionId = msg.threadId;
+        turnMessages.push(result.assistantMessage);
+      }
+      if (result.toolCalls.some((call: { name: string }, index: number) =>
+        (call.name.endsWith('__pulse_get_my_work')
+          || call.name.endsWith('__pulse_get_my_alerts')
+          || call.name.endsWith('__pulse_get_my_tasks'))
+        && result.toolResults[index]
+        && !result.toolResults[index].isError)) {
+        heartbeatQueueToolPending = false;
+      }
 
       if (result.toolResults.length > 0) {
         // Oversized-image ingest cap: a full-quality screenshot (200KB+ base64)
@@ -4819,8 +5743,15 @@ export class AgentProcess {
         // Persist tool results exactly. If they push the projection across the
         // context invariant, the post-turn semantic prefix compactor handles
         // it; no local preview rewrite may replace their content.
-        this.messages.push(trMsg);
-        this.store.appendMessage(this.sessionId, trMsg);
+        turnMessages.push(trMsg);
+      }
+      if (result.toolAttemptIdentity) {
+        this.messages.push(...this.store.finalizeToolTurn(result.toolAttemptIdentity, turnMessages));
+      } else {
+        for (const message of turnMessages) {
+          this.store.appendMessage(this.sessionId, message);
+          this.messages.push(message);
+        }
       }
 
       totalInputTokens += result.inputTokens;
@@ -4834,13 +5765,20 @@ export class AgentProcess {
       // Do this after the provider + tool execution succeeds so a genuinely
       // wedged in-flight turn still ages and remains diagnosable.
       this.touchActivity();
+      for (let i = 0; i < result.toolCalls.length; i++) {
+        const call = result.toolCalls[i];
+        const toolResult = result.toolResults[i];
+        heartbeatToolCalls.push({ name: call?.name, input: call?.input });
+        heartbeatToolResults.push({ content: toolResult?.content, isError: toolResult?.isError });
+      }
+      // PLAT-8991: a heartbeat turn with no write-class calls is a clean
+      // boundary — reset the process-lifetime loop detector so contract-correct
+      // drained beats (identical pulse_get_my_work probes at the 90s fleet
+      // cadence) cannot false-positive the probe-streak across beats. Dirty
+      // beats (errors/writes) keep the streak; within-turn ABAB loops still
+      // accumulate and break inside the turn that runs them.
       if (msg.source === 'heartbeat') {
-        for (let i = 0; i < result.toolCalls.length; i++) {
-          const call = result.toolCalls[i];
-          const toolResult = result.toolResults[i];
-          heartbeatToolCalls.push({ name: call?.name, input: call?.input });
-          heartbeatToolResults.push({ content: toolResult?.content, isError: toolResult?.isError });
-        }
+        this.loopDetector.resetIfNoWrites(heartbeatToolCalls);
       }
       this.store.updateTokens(this.sessionId, result.inputTokens, result.outputTokens);
 
@@ -4928,8 +5866,9 @@ export class AgentProcess {
         break;
       }
       if (result.toolCalls.length === 0) {
-        const incompleteError = incompleteTurnError(result.stopReason);
+        const incompleteError = incompleteTurnError(result.incompleteStreamReason ?? result.stopReason);
         if (incompleteError) {
+          incompleteReason = rejectedReason;
           sawLoopBreak = true;
           await channel.sendEvent(msg.threadId, {
             type: 'error',
@@ -4938,23 +5877,31 @@ export class AgentProcess {
           });
           break;
         }
-        break; // Text-only — done
+        // No tools → the turn is over (Codex / Claude Code / Grok Build).
+        // Do not inject Pulse, lecture "call get_my_work", or retry
+        // reasoning_only / wrap-up. Record the classifier for telemetry only.
+        if (rejectedReason) incompleteReason = rejectedReason;
+        break;
       }
 
       // Loop detection — check if the agent is stuck calling the same tool(s)
       type LoopStatus = 'ok' | 'warning' | 'probe-warning' | 'break';
       const RANK: Record<LoopStatus, number> = { ok: 0, warning: 1, 'probe-warning': 1, break: 2 };
       let worstLoopStatus: LoopStatus = 'ok';
+      let brokeOnTool: string | undefined;
       for (const tc of result.toolCalls) {
         const status = loopDetector.record(tc.name, tc.input);
         if (RANK[status] > RANK[worstLoopStatus]) worstLoopStatus = status;
-        if (status === 'break') break;
+        if (status === 'break') {
+          brokeOnTool = tc.name;
+          break;
+        }
       }
       if (worstLoopStatus === 'break') {
         sawLoopBreak = true;  // SCLI-60
         const breakMsg: Message = {
           role: 'user',
-          content: 'You are stuck in a loop. Stopping execution. Please try a completely different approach.',
+          content: heartbeatLoopBreakMessage(brokeOnTool),
           timestamp: Date.now(),
         };
         this.messages.push(breakMsg);
@@ -4975,7 +5922,10 @@ export class AgentProcess {
       } else if (worstLoopStatus === 'warning') {
         const warnMsg: Message = {
           role: 'user',
-          content: 'You appear to be calling the same tool repeatedly with the same arguments. This may indicate you are stuck in a loop. Try a different approach.',
+          content:
+            'You appear to be looping on the same tool (identical arguments or alternating between two). '
+            + 'Do not re-fetch Pulse tasks you already have in this turn. '
+            + 'Advance the work with a different tool (transition, comment, edit, or a new task key).',
           timestamp: Date.now(),
         };
         this.messages.push(warnMsg);
@@ -4984,6 +5934,21 @@ export class AgentProcess {
 
     }
 
+    } catch (err) {
+      if (err instanceof GatewayCompactionFailure && err.category === 'quality' && msg.source === 'heartbeat'
+        && err.generation === this.sessionGeneration) {
+        const outcome = recordHeartbeatQueueDrainTurn(
+          this.config.agentId ?? this.config.agentName ?? 'unknown-agent',
+          {
+            toolCalls: heartbeatToolCalls, toolResults: heartbeatToolResults,
+            incompleteReason: 'semantic_compaction_failed',
+          },
+          new Date().toISOString(),
+          { pulseQueueObligated: !isLeanConversationalEnv() },
+        );
+        console.log(formatHeartbeatQueueDrainOutcomeLogLine(outcome));
+      }
+      throw err;
     } finally {
       // SCLI-32: teardown — runs on both normal exit and error throw. Fire-and-forget:
       // fleet agents have no forced process.exit so pending Pulse requests complete
@@ -5013,11 +5978,13 @@ export class AgentProcess {
           {
             toolCalls: heartbeatToolCalls,
             toolResults: heartbeatToolResults,
+            ...(incompleteReason ? { incompleteReason } : {}),
           },
           new Date().toISOString(),
           { pulseQueueObligated: !isLeanConversationalEnv() },
         );
         console.log(formatHeartbeatQueueDrainOutcomeLogLine(heartbeatDrainOutcome));
+        this.emitTelemetry();
         // Heartbeat exchanges remain append-only like every other turn. The
         // shared provider-backed compactor is the only mechanism allowed to
         // rewrite working context; no-op/queue-only classification is telemetry,
@@ -5025,20 +5992,22 @@ export class AgentProcess {
       } catch (err) {
         logger.warn({ err, agentId: this.config.agentId ?? this.config.agentName }, 'Failed to record heartbeat queue-drain outcome');
       }
-    }
-
-    // Drain-the-queue safety net — see shouldFastRearmIdleHeartbeat.
-    if (msg.source === 'heartbeat' && shouldFastRearmIdleHeartbeat({
-      sawLoopBreak,
-      readyTaskCount: heartbeatDrainOutcome?.readyTaskCount,
-      progressEventCount: heartbeatDrainOutcome?.progressEventCount,
-      forwardedEventCount: heartbeatDrainOutcome?.forwardedEventCount,
-      consecutiveReadyNoProgressHeartbeats:
-        heartbeatDrainOutcome?.consecutiveReadyNoProgressHeartbeats,
-    })) {
-      this.lastActivityAt = Date.now() - this.idleHeartbeatMs;
-      this.lastHeartbeatAt = Date.now() - this.heartbeatDebounceMs;
-      this.nextHeartbeatDueAt = Date.now();
+    } else {
+      // Busy seats often never go idle, so Hive would keep a stale needs_help
+      // from the last fruitless heartbeat while Pulse comments/transitions
+      // continue (san/mio/nagi 2026-09-09). Producer-owned clear.
+      try {
+        const progress = recordObservedWorkProgress(
+          this.config.agentId ?? this.config.agentName ?? 'unknown-agent',
+          { toolCalls: heartbeatToolCalls, toolResults: heartbeatToolResults },
+        );
+        if (progress) {
+          console.log(formatHeartbeatQueueDrainOutcomeLogLine(progress));
+          this.emitTelemetry();
+        }
+      } catch (err) {
+        logger.warn({ err, agentId: this.config.agentId ?? this.config.agentName }, 'Failed to record non-heartbeat work progress');
+      }
     }
 
     // Track usage

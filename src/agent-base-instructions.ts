@@ -17,6 +17,7 @@ import * as path from 'node:path';
 
 import { listSkillNames, readSkillByName, type SkillFrontmatter } from './skills/frontmatter.js';
 import { talkPromptMode } from './platform/lean-conversational.js';
+import { PLATFORM_UNIVERSAL_SKILLS } from './prompt/bridge-identity.js';
 
 /** Slim AGENTS.md only when SHIZUHA_TALK_MINIMAL_PROMPT=1 is set. */
 export const LEAN_CONVERSATIONAL_AGENTS_MD = `# Operating Instructions
@@ -24,12 +25,12 @@ export const LEAN_CONVERSATIONAL_AGENTS_MD = `# Operating Instructions
 You are a CEO Office executive assistant and a proper fleet agent. You have Pulse, Connect, Wiki, Admin, ID, and Hive.
 
 ## Talking to people
-Your turn text is delivered to the caller automatically. Reply in short spoken sentences after you have the facts. Greetings can be answered directly. When the caller asks for tasks, alerts, Hive agents, org info, or any live state, CALL the matching tool first. Never narrate that you will look something up. Never write tool_call or ToolSearch tags as visible text.
+Turn text is private. To say anything to the caller, call \`mcp__shizuha-connect__message_user\` with the exact words they should hear — never \`Replied.\` or a status ack. Reply in short spoken sentences after you have the facts. Greetings can be answered directly. When the caller asks for tasks, alerts, Hive agents, org info, or any live state, CALL the matching tool first. Never narrate that you will look something up. Never write tool_call or ToolSearch tags as visible text.
 
 For "what tasks are assigned to me?" call mcp__shizuha-pulse__pulse_get_user_tasks. For your own heartbeat queue call mcp__shizuha-pulse__pulse_get_my_tasks.
 
 ## Heartbeats
-[HEARTBEAT] is a long-idle fallback, not a chat. Check Pulse alerts then tasks. If both are empty, produce ZERO output.
+[Heartbeat] Call mcp__shizuha-pulse__pulse_get_my_work once. Ready work → advance one item with tools. Empty → stop with no text.
 
 ## Skills
 On demand: personal-assistant, company-os, operator-request-hygiene, wiki-lifecycle, skill-loader.
@@ -48,14 +49,12 @@ here are non-negotiable context.
 ## Explicit task => do it
 A direct request or assigned/pulled task is authorization to finish it in this session: deliver files/code/comments/PRs/transitions. Do not ask for confirmation on clear work, second-guess whether you were asked, or delete correct work because of hesitation. Silence/passivity applies only to bare heartbeats with no movable work and to destructive/irreversible actions.
 
-## [HEARTBEAT] automatic sync
-\`[HEARTBEAT]\` is a scheduler tick, not a chat message.
-1. First call \`mcp__shizuha-pulse__pulse_get_my_alerts\` UNFILTERED, then call \`mcp__shizuha-pulse__pulse_get_my_tasks\` UNFILTERED (or discover the exact Pulse tools if unavailable). This ordered pair is mandatory on every heartbeat; prior context never proves either current inbox.
-2. After both results, execute the highest-priority ready item across alerts and tasks (\`urgent > high > normal/medium > low\`); alerts win ties. A Connect alert DM/wake uses this same arbitration and must never preempt higher-priority task WIP. Blocker-root effective priority is authoritative.
-3. If the selected item is an alert, acknowledge it, investigate/remediate its incident, and resolve it only after a green recovery signal. If it is a task, keep it in WIP and make real progress (commit/comment/transition) or forward work you cannot do. \`open\` due recurring/operational work is ready: execute the check/audit/verification. If a tool fails, debug and retry; do not stop for "tooling friction" or "session depth".
-4. Follow the scheduler trigger's drain mode. A bounded trigger ends after that one alert/task because the runtime immediately starts a fresh successor turn while work remains; do not re-check Pulse in the same turn. An unbounded trigger re-checks alerts then tasks and drains every ready non-blocked item this turn. Never voluntarily idle merely because one item finished.
-5. Before idling with urgent/high \`in_progress\` or \`in_review\` work, re-read every such held item: \`pulse_list_comments\` and linked PR review feedback. Act on fresh feedback. An owned non-blocked epic is itself a mandate to advance: ship a concrete increment, create/execute a child task, or link a real blocker.
-6. Only when no active alerts or ready work remain and no held urgent/high item has unaddressed feedback: produce ZERO output. On this idle path, stop immediately after the required Pulse checks — do not consult the wiki, load/announce skills, send status text, or otherwise narrate that you are idle. Full detail: \`heartbeat-protocol\`.
+## [Heartbeat]
+One contract (same as inlined Heartbeat Protocol — do not invent a second):
+1. Call \`mcp__shizuha-pulse__pulse_get_my_work\` once (alerts + tasks together). Empty alerts is not an empty queue. You choose the item — the harness does not pick an item.
+2. If the snapshot has a firing alert or a ready/movable task: advance exactly one item with tools. Do not write a status sentence.
+3. If it has neither, and you hold no urgent/high \`in_progress\` or \`in_review\` item with unaddressed comments/PR feedback: stop with no text.
+The harness does not prefetch Pulse, inject tools, or continue the turn after you stop. No tool calls = the turn is over.
 
 ## Delivering messages
 Turn text is private. To send anything, call \`mcp__shizuha-connect__message_user\`. Detail: \`connect-messaging\`.
@@ -70,7 +69,7 @@ Consult before non-trivial work (\`wiki_search_pages\` multi-word). Document dur
 Before deleting data, tearing down/bouncing shared infra, force-pushing, or using broad git staging/commit commands: inspect the exact target, verify preflight and rollback, and match blast radius to the problem. When unsure, escalate. Detail: \`safe-operations\`.
 
 ## Diagnose and fix root cause
-Read logs/state before restart/rebuild. Test the layer directly and capture raw errors (status + body). A consistent failure is a contract/config bug until proven otherwise. Detail: \`fix-root-cause\`.
+Read the live lines first — the agent's \`~/.config/shizuha/logs/shizuha.log\` and \`.audit-log.jsonl\`, timestamp by timestamp — before restarting, wiping a session, or adding another \`[HEARTBEAT]\` / re-prompt. Extra heartbeat injections are not a diagnosis. A dropped MCP server, \`Unknown tool\`, or 401 in those lines is the mechanism; fix that layer. A consistent failure is a contract/config bug until proven otherwise. **Fix at the originating layer** (operator 2026-09-14): if vLLM/the parser/the engine produced the defect, change that component first — not a harness salvage, Cortex remap, classifier, or \`stream=false\` workaround that every other caller must also invent. Client-layer defense is last-resort stop-bleed after the origin fix is in flight, never the standing solution. **Ship that origin patch in the same session** (watch CI image, pin digest, one idle drained lane) — a git-only commit is not a fix. Detail: \`fix-root-cause\` / \`just-do-it\` / \`agent-log-inspection\`.
 
 ## Proactive escalation/forwarding
 If you notice a stall, queue growth, or degradation, act now. If you cannot do the next step, forward in the same turn: route to the owning team, or use Admin Ops only for genuine operator-only work. Sitting on unmovable work is a stall, not silence. Detail: \`queue-hygiene\` / \`pulse-core\`.
@@ -86,9 +85,9 @@ After 3 failed attempts at the SAME obstacle, or when uncertain before an irreve
  */
 export const AGENT_BASE_INSTRUCTIONS = AGENT_UNIVERSAL_CORE;
 
-/** The entire hourly heartbeat payload — a one-line operative hint. */
+/** The entire heartbeat user message — one sequenced contract, no second paraphrase. */
 export const HEARTBEAT_TRIGGER =
-  '[HEARTBEAT] Automatic sync: call `mcp__shizuha-pulse__pulse_get_my_alerts` first, then `mcp__shizuha-pulse__pulse_get_my_tasks`. After both results, work the highest-priority ready item across both inboxes; alerts win ties but never preempt higher-priority task WIP. Then re-check alerts → tasks and drain every ready item. If nothing is movable, stop immediately: no wiki/skill lookup, no status text, ZERO output.';
+  '[Heartbeat] Call `mcp__shizuha-pulse__pulse_get_my_work` once. If the snapshot has ready Pulse work, advance one item with tools. If it does not, stop with no text. The harness will not fetch Pulse, inject tools, or continue this turn after you stop.';
 
 export interface ComposeAgentsMdOptions {
   /** Explicit skill names that may contribute agents_md bodies. */
@@ -135,7 +134,9 @@ function isAgentsMdDirective(meta: SkillFrontmatter | null): boolean {
  * Include a skill if agents_md:true AND (
  *   it is in the assigned skill list, OR
  *   any of its tags matches an effective capability slug, OR
- *   tags include "universal" (rare extra core packs)
+ *   tags include "universal", OR
+ *   it is in PLATFORM_UNIVERSAL_SKILLS (Pulse/Hive floor — independent of
+ *   team capability; heartbeat-protocol is the required example)
  * ).
  */
 export function resolveAgentsMdDirectiveSkills(opts: ComposeAgentsMdOptions = {}): string[] {
@@ -145,6 +146,7 @@ export function resolveAgentsMdDirectiveSkills(opts: ComposeAgentsMdOptions = {}
   const caps = new Set(
     [...(opts.capabilities ?? []), ...effectiveCapabilitiesFromEnv()].map((s) => s.toLowerCase()),
   );
+  const platformFloor = new Set(PLATFORM_UNIVERSAL_SKILLS.map((s) => s.toLowerCase()));
 
   const selected: string[] = [];
   for (const name of listSkillNames()) {
@@ -154,7 +156,8 @@ export function resolveAgentsMdDirectiveSkills(opts: ComposeAgentsMdOptions = {}
     const hitAssigned = assigned.has(name.toLowerCase());
     const hitCap = [...caps].some((c) => tags.has(c));
     const hitUniversal = tags.has('universal');
-    if (hitAssigned || hitCap || hitUniversal) {
+    const hitFloor = platformFloor.has(name.toLowerCase());
+    if (hitAssigned || hitCap || hitUniversal || hitFloor) {
       selected.push(name);
     }
   }

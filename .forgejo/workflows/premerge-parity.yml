@@ -10,6 +10,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Agent runtime workflow parity
         run: python3 -m unittest -v tests.ci.test_agent_runtime_workflow_parity
+      - name: "No github/secrets context in run bodies (PLAT-4734)"
+        run: |
+          set -euo pipefail
+          # The detector parses workflows rather than pattern-matching lines, so
+          # a real YAML parser is a hard requirement — a guard that silently
+          # does nothing is the defect class this test exists to catch.
+          # PyYAML is used when the image ships it. The premerge runner image
+          # ships no PyYAML and has no PyPI egress, so the former
+          # `pip install pyyaml` fallback failed on every run (PLAT-9226 parity
+          # lane); the test now falls back to the vendored fail-closed parser
+          # in tests/ci/_mini_yaml.py, which raises on anything it cannot
+          # parse — the guard still fails closed, never silently skips.
+          python3 -m unittest -v tests.ci.test_plat4734_no_context_injection
       - name: Agent runtime Python lock parity
         run: python3 -m unittest -v tests.ci.test_agent_runtime_python_lock
       - name: Agent runtime OCI overlay contract

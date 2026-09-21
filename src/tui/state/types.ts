@@ -1,7 +1,7 @@
 import type { PermissionMode } from '../../permissions/types.js';
 
 /** TUI screen modes */
-export type ScreenMode = 'prompt' | 'approval' | 'sessions' | 'models' | 'help' | 'pager';
+export type ScreenMode = 'prompt' | 'approval' | 'sessions' | 'models' | 'help' | 'pager' | 'tasks' | 'mcp';
 
 /** Model info for model picker */
 export interface ModelInfo {

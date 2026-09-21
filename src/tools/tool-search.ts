@@ -461,20 +461,55 @@ function formatToolWithSchema(t: DeferredToolInfo): string {
 }
 
 /**
- * Models served over plain OpenAI-compatible endpoints (our self-hosted
- * open-weight stack) have no server-side `tool_reference` expansion, so they
- * need the full schema inlined in the ToolSearch result. Hosted frontier
- * providers (Anthropic/OpenAI/Google) handle the terse summary fine and we keep
- * their transcript lean.
+ * Models served over plain OpenAI-compatible endpoints that do NOT go through
+ * Cortex have no server-side `tool_reference` expansion, so they need the full
+ * schema inlined in the ToolSearch result. Cortex implements the Claude/Codex
+ * strip/expand contract, so Cortex ids stay on the terse + tool_reference path.
+ * Hosted frontier providers handle the terse summary themselves.
  */
 export function modelNeedsInlineToolSchemas(model: string): boolean {
   const m = (model ?? '').toLowerCase();
+  if (isCortexModelId(m)) return false;
   return (
-    isCortexModelId(m) ||
     m.startsWith('vllm/') ||
     m.startsWith('ollama/') ||
     m.startsWith('llamacpp/')
   );
+}
+
+/** Providers whose server strips defer_loading and expands tool_reference. */
+export function modelUsesServerToolReferences(model: string): boolean {
+  const m = (model ?? '').toLowerCase();
+  if (isCortexModelId(m)) return true;
+  if (m.startsWith('claude') || m.startsWith('anthropic')) return true;
+  if (m.startsWith('gpt-') || m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4')) return true;
+  return false;
+}
+
+export function formatToolReferenceBlocks(names: string[]): string {
+  const unique = [...new Set(names.filter(Boolean))];
+  if (unique.length === 0) return '';
+  return unique
+    .map((name) => JSON.stringify({ type: 'tool_reference', tool_name: name }))
+    .join('\n');
+}
+
+/**
+ * Attach the full MCP catalog with defer_loading so Cortex (or Anthropic)
+ * can expand tool_reference without putting those schemas in the engine
+ * tools[] prefix. Direct tools (already in `declared`) stay unmarked.
+ */
+export function attachDeferredCatalogForEngine(
+  declared: ToolDefinition[],
+  catalog: ToolDefinition[],
+): ToolDefinition[] {
+  const declaredNames = new Set(declared.map((definition) => definition.name));
+  const deferred = catalog
+    .filter((definition) => definition.name.startsWith('mcp__') && !declaredNames.has(definition.name))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((definition) => ({ ...definition, deferLoading: true }));
+  if (deferred.length === 0) return declared;
+  return [...declared, ...deferred];
 }
 
 /**
@@ -493,11 +528,23 @@ export function modelSupportsAppendOnlyToolActivation(model: string): boolean {
   const normalized = (model ?? '')
     .toLowerCase()
     .replace(/^(?:cortex|vllm|ollama|llamacpp)\//, '');
-  // Keep this allow-list evidence-based. DeepSeek V4 Flash has an 8/8 live
-  // parser bench for history-only schemas; other self-hosted models still get
-  // the full schema in history but retain declared-schema compatibility until
-  // they pass the same gate.
-  return /^deepseek[-_/ .]?v4[-_/ .]?flash(?:$|[-_/ .])/.test(normalized);
+  // Evidence-based allow-list. A mid-session tools[] push rewrites the vLLM
+  // chat-template HEAD and full-prefills the whole resident prefix even when
+  // the session still holds a TTL lease on the same backend.
+  //
+  // DeepSeek V4 Flash: 8/8 structured history-only calls
+  // (cli/benchmark/append-only-tool-activation-bench.py).
+  // GLM-5.x / GLM-4.7 via Cortex: agent-rui session 160a7c96 2026-09-02
+  // ToolSearch select:wiki_get_page then wiki_list_spaces on tp4a 76ee89b7
+  // paid 278s / 259s 0% cache 3s after 99.9% hits (prompt +1818 / +420).
+  // Live leftover-TP4 probe 2026-09-02: GLM-5.3-Flash emits DSML
+  // `<tool_call>mcp__…wiki_create_page` with the right args when the schema
+  // is only in the ToolSearch tool_result; SCLI salvageGlmToolCall already
+  // turns that into a registry call. Hosted grok/OpenAI/Claude stay off
+  // this list — they reject undeclared functions.
+  if (/^deepseek[-_/ .]?v4[-_/ .]?flash(?:$|[-_/ .])/.test(normalized)) return true;
+  if (/^glm-/.test(normalized)) return true;
+  return false;
 }
 
 /**
@@ -567,9 +614,9 @@ export function createToolSearchTool(
       query: z.string().describe(
         'Search keywords or "select:tool_name" for direct selection. Use + prefix to require a term.',
       ),
-      max_results: z.number().int().min(1).max(10).default(maxResultsCap).describe(
+      max_results: z.number().int().min(1).max(10).describe(
         `Maximum number of results to return (default/cap: ${maxResultsCap})`,
-      ),
+      ).optional(),
     }),
     readOnly: true,
     riskLevel: 'low',
@@ -609,17 +656,20 @@ export function createToolSearchTool(
         };
       }
 
-      // Compact summary (hosted frontier models): names + args only. The full
-      // schemas reach the model via the provider's tools array on the next turn.
+      // Compact summary + Claude-shaped tool_reference blocks. Cortex expands
+      // those server-side into function schemas in the message tail; hosted
+      // APIs do the same. The tools[] prefix stays byte-stable.
       const summary = results
         .map((t) => `- **${t.name}** (${t.serverName}) args: ${summarizeSchemaArgs(t.inputSchema)}\n  ${compactDescription(t.description)}`)
         .join('\n');
+      const references = formatToolReferenceBlocks(results.map((t) => t.name));
 
       return {
         toolUseId: '',
         content:
           `Found ${results.length} tool(s). Call one of these discovered tools directly on your next action; do not call ToolSearch again unless none fit.\n` +
-          `Required args are marked with *.\n\n${summary}`,
+          `Required args are marked with *.\n\n${summary}` +
+          (references ? `\n\n${references}` : ''),
       };
     },
   };

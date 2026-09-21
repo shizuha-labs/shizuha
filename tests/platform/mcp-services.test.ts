@@ -3,6 +3,7 @@ import {
   getPlatformMcpConfigs,
   resolveOrganizationIdForMcp,
   resolveMcpAllowList,
+  allowListGrantsService,
   prunePlatformMcpKeys,
   stripPlatformManagedMcpEntries,
 } from '../../src/platform/mcp-services.js';
@@ -97,6 +98,19 @@ describe('SHIZUHA_MCP_SERVICES allow-list (SCLI-64)', () => {
     process.env['SHIZUHA_MCP_SERVICES'] = 'pulse, wiki';
     const configs = getPlatformMcpConfigs({ bearerToken: token({}), mcpHost: 'localhost' });
     expect(Object.keys(configs).sort()).toEqual(['shizuha-pulse', 'shizuha-wiki']);
+  });
+
+  it('Hive service:org grants still derive the unscoped platform servers (Reo / QNT-40)', () => {
+    expect(allowListGrantsService(['pulse:shizuha-digital', 'wiki:shizuha-digital'], 'pulse')).toBe(true);
+    expect(allowListGrantsService(['pulse:shizuha-digital'], 'wiki')).toBe(false);
+    expect(allowListGrantsService(['pulse:shizuha-digital'], 'id')).toBe(false);
+    process.env['SHIZUHA_MCP_SERVICES'] = 'admin:shizuha-digital,connect:shizuha-digital,id:shizuha-digital,pulse:shizuha-digital,wiki:shizuha-digital';
+    const configs = getPlatformMcpConfigs({
+      bearerToken: token({}), mcpHost: 'localhost', stdioProxy: 'off',
+    });
+    expect(Object.keys(configs).sort()).toEqual([
+      'shizuha-admin', 'shizuha-connect', 'shizuha-id', 'shizuha-pulse', 'shizuha-wiki',
+    ]);
   });
 
   it('resolveMcpAllowList: intersects when both explicit and env are set (env narrows role ceiling)', () => {

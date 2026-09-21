@@ -131,3 +131,40 @@ describe('StateStore.listSessions', () => {
     expect(store.loadTokenizerCalibration(s.id, 'test-model')).toBeNull();
   });
 });
+
+describe('StateStore.sessionExists (SCLI-418 state-free probe)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shizuha-sessexists-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('returns false when the DB does not exist, without creating anything', () => {
+    const dbPath = path.join(tmpDir, 'state.db');
+    expect(fs.existsSync(dbPath)).toBe(false);
+    expect(StateStore.sessionExists('ghost-session', dbPath)).toBe(false);
+    // Read-only probe must not create the DB or its parent dir
+    expect(fs.existsSync(dbPath)).toBe(false);
+  });
+
+  it('returns true for a persisted session and false for a ghost, read-only', () => {
+    const dbPath = path.join(tmpDir, 'state.db');
+    const store = new StateStore(dbPath);
+    const s = store.createSession('model-a', '/tmp');
+    store.close();
+
+    expect(StateStore.sessionExists(s.id, dbPath)).toBe(true);
+    expect(StateStore.sessionExists('not-a-session', dbPath)).toBe(false);
+
+    // Probe must not mutate the DB (mtime/bytes unchanged vs a read-only open)
+    const before = fs.statSync(dbPath);
+    StateStore.sessionExists('probe', dbPath);
+    const after = fs.statSync(dbPath);
+    expect(after.size).toBe(before.size);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+  });
+});

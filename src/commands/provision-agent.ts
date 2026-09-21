@@ -47,7 +47,10 @@ export type ProvisionAgentRole = (typeof PROVISION_AGENT_ROLES)[number];
 // Canonical account identifier grammar: alphanumeric first char, then
 // alphanumerics / '.' / '-' / '_' only. Rejects empty, whitespace (incl. TAB/LF),
 // control bytes (incl. ANSI ESC), and any path/parent-traversal syntax (SCLI-436).
-export const PROVISION_USERNAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+// SCLI-691: lowercase-canonical only. shizuha-id usernames are lowercase; an
+// uppercase input used to cross this preflight, invoke registration, and mutate
+// HOME before the server-side rejection — the rejection must precede all of it.
+export const PROVISION_USERNAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const NAME_RE = /^[^\u0000-\u001f\u007f]*$/;
@@ -58,9 +61,20 @@ const NAME_RE = /^[^\u0000-\u001f\u007f]*$/;
  * are printed as JSON escapes (single line), and the value is length-capped.
  */
 export function describeProvisionValue(value: string, max = 80): string {
-  const json = JSON.stringify(value);
+  // JSON.stringify can return undefined for lone invalid runtime values even
+  // though this public CLI path is typed as string. Coerce first so the
+  // diagnostic remains fail-loud and terminal-safe at the runtime boundary.
+  const json = JSON.stringify(String(value));
   if (json.length <= max + 2) return json;
-  return `${json.slice(0, max)}…`;
+
+  // Do not truncate in the middle of a JSON escape. A slice ending in a lone
+  // backslash would make the diagnostic ambiguous and can hide what byte was
+  // rejected. Back up across the trailing slash run until it is even.
+  let end = max;
+  let slashRun = 0;
+  for (let i = end - 1; i >= 0 && json[i] === '\\'; i--) slashRun++;
+  if (slashRun % 2 === 1) end--;
+  return `${json.slice(0, end)}…`;
 }
 
 export interface ProvisionPreflight {
@@ -89,9 +103,18 @@ export function validateProvisionInputs(
         `(got ${describeProvisionValue(agentUsername)})`,
     );
   }
+  if (/[A-Z]/.test(agentUsername)) {
+    // SCLI-691: specific diagnostic with the canonical suggestion, so the
+    // operator fixes the input instead of discovering it post-registration.
+    throw new Error(
+      `provision-agent: username must be lowercase-canonical — shizuha-id usernames ` +
+        `are lowercase; did you mean '${agentUsername.toLowerCase()}'? ` +
+        `(got ${describeProvisionValue(agentUsername)})`,
+    );
+  }
   if (!PROVISION_USERNAME_RE.test(agentUsername)) {
     throw new Error(
-      `provision-agent: username must be a canonical identifier (letters/digits/._- only, ` +
+      `provision-agent: username must be a canonical identifier (lowercase letters/digits/._- only, ` +
         `no path syntax or '..') (got ${describeProvisionValue(agentUsername)})`,
     );
   }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { Inbox, gatewayInboxClass } from '../../src/gateway/inbox.js';
+import { Inbox, gatewayInboxClass, isProbeOrLivenessContent } from '../../src/gateway/inbox.js';
 import type { InboundMessage } from '../../src/gateway/types.js';
 
 function message(content: string, options: Partial<InboundMessage> = {}): InboundMessage {
@@ -16,6 +16,15 @@ function message(content: string, options: Partial<InboundMessage> = {}): Inboun
     ...options,
   };
 }
+
+describe('probe/liveness inbound', () => {
+  it('recognizes QA test and generic stuck-loop content', () => {
+    expect(isProbeOrLivenessContent('Test message — please confirm you can see this.')).toBe(true);
+    expect(isProbeOrLivenessContent('pong')).toBe(true);
+    expect(isProbeOrLivenessContent("I'm stuck in a loop. Let me break out of it.")).toBe(true);
+    expect(isProbeOrLivenessContent('[hritik] keep going on VEN-229')).toBe(false);
+  });
+});
 
 describe('gateway scheduler inbox priority', () => {
   it('runs direct/control, then heartbeat, and drops parked assignment notices', async () => {
@@ -118,6 +127,78 @@ describe('gateway scheduler inbox priority', () => {
     expect(row.content).toContain('ORIG-230');
     expect(row.content).toContain('PLS-854');
     expect(inbox.depth).toBe(0);
+  });
+
+  it('holds Connect alert DMs during a work session and drops them on heartbeat', async () => {
+    const inbox = new Inbox();
+    inbox.push(message('please start PLAT-6188', { userName: 'kai' }));
+    expect(gatewayInboxClass(await inbox.next())).toBe('direct-control');
+    inbox.busy = true;
+    inbox.push(message('[Alert] #24390 CortexModelNoHealthyBackend\nLabels: alertname=CortexModelNoHealthyBackend'));
+    inbox.push(message('[Alert Resolved] CortexModelNoHealthyBackend\nLabels: alertname=CortexModelNoHealthyBackend'));
+    expect(inbox.depth).toBe(1);
+    inbox.push(message('[HEARTBEAT]', { source: 'heartbeat', userName: 'heartbeat' }));
+    inbox.busy = false;
+    expect(gatewayInboxClass(await inbox.next())).toBe('heartbeat');
+    expect(inbox.depth).toBe(0);
+  });
+
+  it('coalesces idle alert DMs by alertname and does not start a turn', async () => {
+    const inbox = new Inbox();
+    inbox.busy = true;
+    inbox.push(message('[Alert] #1 CortexModelNoHealthyBackend\nLabels: alertname=CortexModelNoHealthyBackend'));
+    inbox.push(message('[Alert] #2 CortexModelNoHealthyBackend\nLabels: alertname=CortexModelNoHealthyBackend'));
+    expect(inbox.depth).toBe(1);
+    inbox.busy = false;
+    inbox.push(message('[HEARTBEAT]', { source: 'heartbeat', userName: 'heartbeat' }));
+    expect(gatewayInboxClass(await inbox.next())).toBe('heartbeat');
+    expect(inbox.depth).toBe(0);
+  });
+
+  it('does not wake an idle seat for a lone Connect alert DM', async () => {
+    const inbox = new Inbox();
+    inbox.push(message('[Alert Resolved] CortexInteractiveTTFTP99AboveFiveSeconds'));
+    let admitted = false;
+    const pending = inbox.next().then((row) => {
+      admitted = true;
+      return row;
+    });
+    await Promise.resolve();
+    expect(admitted).toBe(false);
+    expect(inbox.depth).toBe(1);
+    inbox.push(message('[HEARTBEAT]', { source: 'heartbeat', userName: 'heartbeat' }));
+    expect(gatewayInboxClass(await pending)).toBe('heartbeat');
+    expect(inbox.depth).toBe(0);
+  });
+
+  it('classifies interval cron watches below heartbeat and above routine-task', async () => {
+    expect(gatewayInboxClass(message('watch cortex#160', {
+      source: 'cron',
+      id: 'cron-1',
+      userName: 'Cron',
+    }))).toBe('cron');
+
+    const inbox = new Inbox();
+    inbox.busy = true;
+    inbox.push(message('watch cortex#160', { source: 'cron', id: 'cron-1', userName: 'Cron' }));
+    inbox.push(message('[system] [Task Assigned] PLAT-7319'));
+    inbox.push(message('[HEARTBEAT]', { source: 'heartbeat', userName: 'heartbeat' }));
+    inbox.busy = false;
+
+    expect(gatewayInboxClass(await inbox.next())).toBe('heartbeat');
+    expect(gatewayInboxClass(await inbox.next())).toBe('cron');
+    expect(inbox.depth).toBe(0);
+  });
+
+  it('keeps a real user DM ahead of a queued cron watch', async () => {
+    const inbox = new Inbox();
+    inbox.busy = true;
+    inbox.push(message('watch shizuha-beta#297', { source: 'cron', id: 'cron-2', userName: 'Cron' }));
+    inbox.push(message('[kei] stall escalation on cortex#179', { userName: 'kei' }));
+    inbox.busy = false;
+
+    expect(gatewayInboxClass(await inbox.next())).toBe('direct-control');
+    expect(gatewayInboxClass(await inbox.next())).toBe('cron');
   });
 
   it('still injects a single idle Task Assigned as itself', async () => {

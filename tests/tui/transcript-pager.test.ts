@@ -72,8 +72,27 @@ describe('SCLI-382 TranscriptPager', () => {
     const src = readFileSync(resolve(repoRoot, 'src/tui/components/TranscriptPager.tsx'), 'utf8');
     expect(src).toMatch(/pageUp/);
     expect(src).toMatch(/pageDown/);
-    expect(src).toMatch(/useState\(maxOffset\)/);
+    expect(src).toMatch(/useState\(\(\) => maxOffset\)/);
     expect(src).toMatch(/Transcript/);
+    expect(src).toMatch(/parseMouseWheel/);
+    expect(src).toMatch(/resetTuiCanvas/);
+  });
+
+  it('App wheel uses Ink scrollBy, not DECSTBM, and pager exit clears leftover pixels', () => {
+    const app = readFileSync(resolve(repoRoot, 'src/tui/App.tsx'), 'utf8');
+    expect(app).toMatch(/scrollBy\(wheel === 'up' \? -3 : 3\)/);
+    expect(app).not.toMatch(/buildScrollRegionSequence/);
+    expect(app).toMatch(/resetTuiCanvas/);
+    expect(app).toMatch(/screen === 'mcp'/);
+    expect(app).toMatch(/remainingViewportRows\(terminalRows/);
+    expect(app).toMatch(/rows=\{viewportRows\}/);
+    expect(app).toMatch(/belowChromeRef/);
+  });
+
+  it('TranscriptPager trims trailing blank lines so the last page is not an empty canvas', () => {
+    const src = readFileSync(resolve(repoRoot, 'src/tui/components/TranscriptPager.tsx'), 'utf8');
+    expect(src).toMatch(/lines\[lines\.length - 1\]!\.trim\(\) === ''/);
+    expect(src).toMatch(/Math\.min\(maxOffset, Math\.max\(0, prev \+ delta\)\)/);
   });
 
   it('getPagerTranscript loads full history on demand without a lifetime cache', () => {

@@ -54,6 +54,41 @@ interface WsClient {
   activeThreadId: string | null;
 }
 
+// OpenClaw gateway protocol version. Operator/backend clients MUST include the
+// current protocol in their connect range (MIN_CLIENT_PROTOCOL_VERSION=4 per
+// packages/gateway-protocol/src/version.ts). The bridge is a trusted
+// same-process backend client (client.id="gateway-client", mode="backend") and
+// therefore must negotiate the current protocol, not the N-1 node window.
+export const GATEWAY_PROTOCOL_VERSION = 4;
+
+/**
+ * True when a gateway connect error is a client/gateway protocol range
+ * mismatch (e.g. "protocol mismatch ... min=1 max=3 expected=4"). We branch on
+ * this to emit one concise actionable diagnostic instead of a raw stack.
+ */
+export function isProtocolMismatchError(message: string | undefined | null): boolean {
+  if (!message) return false;
+  return /protocol\s+mismatch/i.test(message) || /expected=\d+/i.test(message);
+}
+
+/**
+ * Build a one-line actionable diagnostic naming the client and gateway
+ * protocol ranges from the gateway's raw mismatch message. Falls back to the
+ * raw message when the expected range cannot be parsed.
+ */
+export function buildProtocolMismatchDiagnostic(message: string): string {
+  const clientRange = message.match(/min=(\d+)\s+max=(\d+)/i);
+  const expected = message.match(/expected=(\d+)/i);
+  const client = clientRange
+    ? `client ${clientRange[1]}–${clientRange[2]}`
+    : 'client range unknown';
+  const gateway = expected ? `gateway requires ${expected[1]}` : 'gateway range unknown';
+  return `OpenClaw protocol mismatch: ${client} vs ${gateway}. ` +
+    `The SCLI embedded gateway client and the packaged OpenClaw runtime are out of sync — ` +
+    `align the packaged OpenClaw version with the client (GATEWAY_PROTOCOL_VERSION=${GATEWAY_PROTOCOL_VERSION}) ` +
+    `or pin a gateway whose protocol range overlaps the client.`;
+}
+
 function isBridgePromptDebugEnabled(): boolean {
   return process.env['SHIZUHA_DEBUG_BRIDGE_PROMPTS'] === '1';
 }
@@ -299,7 +334,15 @@ export class OpenClawBridge {
 
     await this.ensureAuth();
     await this.startGateway();
-    await this.connectToGateway();
+    try {
+      await this.connectToGateway();
+    } catch (err) {
+      // SCLI-420: a gateway handshake failure (e.g. protocol mismatch) must
+      // teardown the child gateway and surface a concise diagnostic — never a
+      // raw stack or a misleading "listening" line.
+      this.teardownGateway();
+      throw err;
+    }
     await this.startServer();
     // Proactive delivery: OpenClaw channel plugin POSTs to /v1/proactive (no file watcher needed)
 
@@ -313,6 +356,17 @@ export class OpenClawBridge {
       sessionId: this.sessionId,
       msg: 'OpenClaw bridge initialized',
     }));
+  }
+
+  /** Kill the child gateway process and clear gateway state (clean teardown). */
+  private teardownGateway(): void {
+    if (this.gatewayProcess && this.gatewayProcess.pid) {
+      try { process.kill(-this.gatewayProcess.pid, 'SIGTERM'); } catch { /* already gone */ }
+      try { this.gatewayProcess.kill('SIGTERM'); } catch { /* already gone */ }
+    }
+    this.gatewayProcess = null;
+    this.gatewayConnected = false;
+    this.gatewayWs = null;
   }
 
   // ── Gateway lifecycle ──
@@ -460,7 +514,11 @@ export default plugin;
     if (!ready) {
       throw new Error('OpenClaw gateway failed to start within 30s');
     }
-    console.log('[openclaw-bridge] Gateway is ready');
+    // NOTE: this is child-gateway TCP readiness only — NOT bridge readiness.
+    // The bridge is only healthy after the WS handshake completes and the
+    // bridge listener is up (SCLI-420: do not treat child readiness as
+    // authoritative).
+    console.log('[openclaw-bridge] OpenClaw gateway process is up (TCP) — awaiting WS handshake');
   }
 
   private async waitForGateway(timeoutMs: number): Promise<boolean> {
@@ -495,7 +553,10 @@ export default plugin;
       let handshakeComplete = false;
 
       ws.on('open', () => {
-        console.log('[openclaw-bridge] WS connected to gateway');
+        // Deliberately NOT logged as success here: a raw TCP/WS connect does
+        // not mean the gateway handshake (and thus the bridge) is healthy. The
+        // authoritative readiness log is emitted only after the handshake
+        // completes (see the hello-ok branch below).
       });
 
       ws.on('message', (rawData: Buffer | string) => {
@@ -536,8 +597,11 @@ export default plugin;
             id: connectId,
             method: 'connect',
             params: {
-              minProtocol: 1,
-              maxProtocol: 3,
+              // Operator/backend clients must negotiate the current protocol
+              // (MIN_CLIENT_PROTOCOL_VERSION=4). SCLI-420: the previous
+              // maxProtocol=3 was rejected by the packaged v4 gateway.
+              minProtocol: GATEWAY_PROTOCOL_VERSION,
+              maxProtocol: GATEWAY_PROTOCOL_VERSION,
               client: {
                 id: 'gateway-client',
                 version: '1.0.0',
@@ -564,20 +628,31 @@ export default plugin;
         if (type === 'res' && msg.ok && !handshakeComplete) {
           handshakeComplete = true;
           this.gatewayConnected = true;
-          console.log('[openclaw-bridge] Gateway handshake complete');
+          console.log('[openclaw-bridge] Gateway handshake complete — bridge protocol OK');
           resolve();
           return;
         }
 
         // ── Error response ──
         if (type === 'res' && !msg.ok) {
+          const errMsg = (msg.error?.message as string | undefined) ?? 'Unknown gateway error';
+          // SCLI-420: a protocol mismatch must surface as ONE concise actionable
+          // diagnostic naming client + gateway ranges — never a raw stack or a
+          // misleading "connected" log.
+          if (isProtocolMismatchError(errMsg)) {
+            const diag = buildProtocolMismatchDiagnostic(errMsg);
+            console.error(`[openclaw-bridge] ${diag}`);
+            this.gatewayConnected = false;
+            reject(new Error(diag));
+            return;
+          }
           const reqId = msg.id as string;
           const pending = this.pendingRequests.get(reqId);
           if (pending) {
             this.pendingRequests.delete(reqId);
-            pending.reject(new Error(msg.error?.message ?? 'Unknown gateway error'));
+            pending.reject(new Error(errMsg));
           } else if (!handshakeComplete) {
-            reject(new Error(msg.error?.message ?? 'Gateway handshake failed'));
+            reject(new Error(errMsg));
           }
           return;
         }
@@ -1270,5 +1345,18 @@ export async function startOpenClawBridge(opts: OpenClawBridgeOptions): Promise<
   });
   process.on('SIGINT', () => { process.exit(0); });
 
-  await bridge.start();
+  try {
+    await bridge.start();
+  } catch (err) {
+    // SCLI-420: never dump a raw Node stack / absolute bundle path on startup
+    // failure. Emit one concise actionable diagnostic and exit non-zero so the
+    // daemon can restart/roll without a misleading success line.
+    const message = (err as Error)?.message ?? String(err);
+    if (isProtocolMismatchError(message)) {
+      console.error(`[openclaw-bridge] ${buildProtocolMismatchDiagnostic(message)}`);
+    } else {
+      console.error(`[openclaw-bridge] Failed to start: ${message}`);
+    }
+    process.exit(1);
+  }
 }

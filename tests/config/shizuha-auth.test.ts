@@ -5,8 +5,11 @@ import * as path from 'node:path';
 import {
   writeShizuhaAuth,
   readShizuhaAuth,
+  readShizuhaAuthSafe,
+  probeShizuhaAuthStore,
   clearShizuhaAuth,
   getShizuhaAuthStatus,
+  resolveRuntimeIdentity,
   shizuhaAuthPath,
   getValidShizuhaAccessToken,
   getValidShizuhaOAuthAccessToken,
@@ -85,6 +88,46 @@ describe('shizuhaAuth', () => {
     expect(clearShizuhaAuth()).toBe(true);
     expect(getShizuhaAuthStatus()).toEqual({ loggedIn: false });
     await expect(getValidShizuhaAccessToken()).resolves.toBeNull();
+  });
+
+  it('SCLI-393: reports the fleet-runtime identity when no interactive login exists', () => {
+    const savedUser = process.env['AGENT_USERNAME'];
+    const savedId = process.env['AGENT_ID'];
+    try {
+      delete process.env['AGENT_USERNAME'];
+      delete process.env['AGENT_ID'];
+      process.env['SHIZUHA_AGENT_USERNAME'] = 'zen';
+      process.env['SHIZUHA_AGENT_ID'] = '15';
+      expect(getShizuhaAuthStatus()).toEqual({
+        loggedIn: true,
+        username: 'zen',
+        source: 'fleet-runtime',
+      });
+    } finally {
+      delete process.env['SHIZUHA_AGENT_USERNAME'];
+      delete process.env['SHIZUHA_AGENT_ID'];
+      if (savedUser !== undefined) process.env['AGENT_USERNAME'] = savedUser;
+      if (savedId !== undefined) process.env['AGENT_ID'] = savedId;
+    }
+  });
+
+  it('SCLI-393: resolveRuntimeIdentity returns null without injected identity', () => {
+    const savedUser = process.env['AGENT_USERNAME'];
+    const savedId = process.env['AGENT_ID'];
+    const savedSUser = process.env['SHIZUHA_AGENT_USERNAME'];
+    const savedSId = process.env['SHIZUHA_AGENT_ID'];
+    try {
+      delete process.env['AGENT_USERNAME'];
+      delete process.env['AGENT_ID'];
+      delete process.env['SHIZUHA_AGENT_USERNAME'];
+      delete process.env['SHIZUHA_AGENT_ID'];
+      expect(resolveRuntimeIdentity()).toBeNull();
+    } finally {
+      if (savedUser !== undefined) process.env['AGENT_USERNAME'] = savedUser;
+      if (savedId !== undefined) process.env['AGENT_ID'] = savedId;
+      if (savedSUser !== undefined) process.env['SHIZUHA_AGENT_USERNAME'] = savedSUser;
+      if (savedSId !== undefined) process.env['SHIZUHA_AGENT_ID'] = savedSId;
+    }
   });
 
   it('logs in via nginx /id/api path from host fallback', async () => {
@@ -276,5 +319,73 @@ describe('shizuhaAuth', () => {
       getValidShizuhaOAuthAccessToken(),
     ])).resolves.toEqual([newAccess, newAccess]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  describe('probeShizuhaAuthStore / readShizuhaAuthSafe (SCLI-439)', () => {
+    it('returns missing for an absent store', () => {
+      expect(probeShizuhaAuthStore()).toEqual({ kind: 'missing' });
+      expect(readShizuhaAuthSafe()).toEqual({ kind: 'missing' });
+    });
+
+    it('returns ok for a valid store', () => {
+      writeShizuhaAuth({
+        username: 'kai',
+        accessToken: 'access-token',
+        refreshToken: 'refresh-token',
+        lastLoginAt: new Date().toISOString(),
+      });
+      expect(probeShizuhaAuthStore()).toEqual({ kind: 'ok' });
+      const safe = readShizuhaAuthSafe();
+      expect(safe.kind).toBe('ok');
+      if (safe.kind === 'ok') expect(safe.state.username).toBe('kai');
+    });
+
+    it('rejects a FIFO store without hanging', () => {
+      fs.mkdirSync(path.join(tmpHome, '.shizuha'), { recursive: true });
+      const fifo = shizuhaAuthPath();
+      // mkfifo via child process (Node has no mkfifo API).
+      const { execFileSync } = require('node:child_process') as typeof import('node:child_process');
+      execFileSync('mkfifo', [fifo]);
+      const probe = probeShizuhaAuthStore();
+      expect(probe.kind).toBe('invalid');
+      if (probe.kind === 'invalid') expect(probe.reason).toMatch(/not a regular file/);
+    });
+
+    it('rejects a symlink store without following it', () => {
+      fs.mkdirSync(path.join(tmpHome, '.shizuha'), { recursive: true });
+      const target = path.join(tmpHome, 'outside.json');
+      fs.writeFileSync(target, '{}');
+      fs.symlinkSync(target, shizuhaAuthPath());
+      const probe = probeShizuhaAuthStore();
+      expect(probe.kind).toBe('invalid');
+      if (probe.kind === 'invalid') expect(probe.reason).toMatch(/symlink/);
+    });
+
+    it('rejects a directory store', () => {
+      fs.mkdirSync(shizuhaAuthPath(), { recursive: true });
+      const probe = probeShizuhaAuthStore();
+      expect(probe.kind).toBe('invalid');
+      if (probe.kind === 'invalid') expect(probe.reason).toMatch(/directory/);
+    });
+
+    it('rejects corrupt JSON as invalid (not logged out)', () => {
+      fs.mkdirSync(path.join(tmpHome, '.shizuha'), { recursive: true });
+      fs.writeFileSync(shizuhaAuthPath(), '{ not valid json', { mode: 0o600 });
+      const safe = readShizuhaAuthSafe();
+      expect(safe.kind).toBe('invalid');
+      if (safe.kind === 'invalid') expect(safe.reason).toMatch(/corrupt|incomplete/);
+    });
+
+    it('rejects a wrong-typed root (array) as invalid', () => {
+      fs.mkdirSync(path.join(tmpHome, '.shizuha'), { recursive: true });
+      fs.writeFileSync(shizuhaAuthPath(), '[]', { mode: 0o600 });
+      expect(readShizuhaAuthSafe().kind).toBe('invalid');
+    });
+
+    it('readShizuhaAuth returns null for invalid stores (no regression)', () => {
+      fs.mkdirSync(path.join(tmpHome, '.shizuha'), { recursive: true });
+      fs.writeFileSync(shizuhaAuthPath(), '{ not valid json', { mode: 0o600 });
+      expect(readShizuhaAuth()).toBeNull();
+    });
   });
 });

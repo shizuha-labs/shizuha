@@ -226,8 +226,72 @@ export function discoverClaudeTokens(): AnthropicTokenEntry[] {
   return tokens;
 }
 
+/**
+ * SCLI-438: validate the credential-store write boundary with NON-following
+ * metadata BEFORE any mutation. Requires an owner-controlled real directory
+ * parent and either an absent store or a supported owner-controlled regular
+ * file. Rejects symlink, directory, FIFO, socket, device, unreadable object,
+ * and hostile-parent shapes boundedly — so the writer never destructively
+ * replaces a non-regular object, hangs on a FIFO, or raw-crashes.
+ *
+ * Throws a bounded Error (no raw stack) on any unsafe shape.
+ */
+export function validateCredentialStoreWrite(): void {
+  const dir = credentialsDir();
+  const filePath = credentialsPath();
+
+  // Parent directory: if present it must be a real (non-symlink) directory.
+  let dirStat: fs.Stats | undefined;
+  try {
+    dirStat = fs.lstatSync(dir);
+  } catch {
+    // Absent parent is fine — we create it below with mode 0700.
+    dirStat = undefined;
+  }
+  if (dirStat) {
+    if (!dirStat.isDirectory()) {
+      throw new Error(
+        `shizuha: cannot write credential store: ${dir} is not a directory (it is ${describeMode(dirStat)}). Fix or remove it first.`,
+      );
+    }
+    if (dirStat.isSymbolicLink()) {
+      throw new Error(
+        `shizuha: cannot write credential store: ${dir} is a symlink. Refusing to follow it; fix or remove it first.`,
+      );
+    }
+  }
+
+  // Store file: if present it must be a supported regular file (not a symlink).
+  let fileStat: fs.Stats | undefined;
+  try {
+    fileStat = fs.lstatSync(filePath);
+  } catch {
+    fileStat = undefined;
+  }
+  if (fileStat) {
+    if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+      throw new Error(
+        `shizuha: cannot write credential store: ${filePath} is ${describeMode(fileStat)}. Refusing to replace it; fix or remove it first.`,
+      );
+    }
+  }
+}
+
+function describeMode(stat: fs.Stats): string {
+  if (stat.isSymbolicLink()) return 'a symbolic link';
+  if (stat.isDirectory()) return 'a directory';
+  if (stat.isFIFO()) return 'a FIFO';
+  if (stat.isSocket()) return 'a socket';
+  if (stat.isCharacterDevice()) return 'a character device';
+  if (stat.isBlockDevice()) return 'a block device';
+  return 'not a regular file';
+}
+
 /** Atomic write with restricted permissions. */
 export function writeCredentials(store: CredentialStore): void {
+  // SCLI-438: fail closed on hostile/non-regular store or parent BEFORE mutation.
+  validateCredentialStoreWrite();
+
   const dir = credentialsDir();
   // Ensure directory exists with mode 700
   if (!fs.existsSync(dir)) {
@@ -678,6 +742,82 @@ export function setOpenAIEndpoint(opts: {
   writeCredentials(store);
 }
 
+
+export type OpenAIProviderSettingsView = {
+  configured: boolean;
+  keyPrefix: string | null;
+  baseUrl: string | null;
+  defaultModel: string | null;
+};
+
+/** Masked dashboard/settings view. A URL-only local server counts as configured. */
+export function openaiProviderSettingsView(
+  creds?: CredentialStore['openai'],
+): OpenAIProviderSettingsView {
+  const apiKey = creds?.apiKey?.trim();
+  const baseUrl = creds?.baseUrl?.trim() || null;
+  const defaultModel = creds?.defaultModel?.trim() || null;
+  return {
+    configured: Boolean(apiKey || baseUrl),
+    keyPrefix: apiKey ? `${apiKey.slice(0, 10)}...` : null,
+    baseUrl,
+    defaultModel,
+  };
+}
+
+export type ApplyOpenAIProviderBody = {
+  apiKey?: unknown;
+  baseUrl?: unknown;
+  defaultModel?: unknown;
+};
+
+/** Apply a dashboard PUT. URL-only is valid; Shizuha ID is not required. */
+export function applyOpenAIProviderFromDashboard(
+  body: ApplyOpenAIProviderBody,
+): { ok: true } | { ok: false; error: string } {
+  const hasKeyField = typeof body.apiKey === 'string';
+  const hasUrlField = typeof body.baseUrl === 'string';
+  const hasModelField = typeof body.defaultModel === 'string';
+  if (!hasKeyField && !hasUrlField && !hasModelField) {
+    return { ok: false, error: 'Provide a base URL and/or an API key' };
+  }
+
+  const apiKey = hasKeyField ? String(body.apiKey) : undefined;
+  const rawUrl = hasUrlField ? String(body.baseUrl) : undefined;
+  const defaultModel = hasModelField ? String(body.defaultModel) : undefined;
+
+  if (apiKey !== undefined && apiKey.trim() && apiKey.trim().length < 4) {
+    return { ok: false, error: 'API key is too short' };
+  }
+
+  let baseUrl: string | undefined;
+  if (rawUrl !== undefined) {
+    const trimmed = rawUrl.trim();
+    if (trimmed) {
+      if (!/^https?:\/\//i.test(trimmed)) {
+        return { ok: false, error: 'Base URL must start with http:// or https://' };
+      }
+      baseUrl = normalizeOpenAICompatibleBaseUrl(trimmed);
+    } else {
+      baseUrl = '';
+    }
+  }
+
+  const prev = readCredentials().openai ?? {};
+  const nextKey = apiKey !== undefined ? apiKey.trim() : (prev.apiKey ?? '');
+  const nextUrl = baseUrl !== undefined ? baseUrl : (prev.baseUrl ?? '');
+  if (!nextKey && !nextUrl) {
+    return { ok: false, error: 'Provide a base URL and/or an API key' };
+  }
+
+  setOpenAIEndpoint({
+    ...(apiKey !== undefined ? { apiKey } : {}),
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+    ...(defaultModel !== undefined ? { defaultModel } : {}),
+  });
+  return { ok: true };
+}
+
 export function setGoogleKey(key: string): void {
   const store = readCredentials();
   store.google = { apiKey: key };
@@ -707,6 +847,35 @@ export function removeProvider(provider: 'anthropic' | 'openai' | 'google'): boo
   delete store[provider];
   writeCredentials(store);
   return true;
+}
+
+/**
+ * SCLI-414: clear ALL locally stored provider credentials (cortex, openai,
+ * anthropic, google, codex, copilot) so `logout` is honest — no provider
+ * authority survives a sign-out. Idempotent: returns true if any provider was
+ * removed, false if the store was already empty/absent.
+ */
+export function clearAllProviderCredentials(): boolean {
+  const store = readCredentials();
+  const providers: Array<keyof CredentialStore> = [
+    'anthropic',
+    'openai',
+    'google',
+    'codex',
+    'copilot',
+    'cortex',
+  ];
+  let removed = false;
+  for (const provider of providers) {
+    if (store[provider]) {
+      delete store[provider];
+      removed = true;
+    }
+  }
+  if (removed) {
+    writeCredentials(store);
+  }
+  return removed;
 }
 
 // ── Codex Account Management ──

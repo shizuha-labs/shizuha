@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { pinPreparedStatements } from '../shared/sqlite-statement-cache.js';
 
 /**
  * SQLite-backed permission memory — persists tool approvals across sessions.
@@ -14,6 +15,7 @@ export class PermissionMemory {
     const file = dbPath ?? path.join(dir, 'permissions.db');
 
     this.db = new Database(file);
+    pinPreparedStatements(this.db);
     this.db.pragma('journal_mode = WAL');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS approvals (

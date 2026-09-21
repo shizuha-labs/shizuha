@@ -106,8 +106,8 @@ export interface ModelProfile {
   /**
    * How to replay stored `reasoning_content` on later turns.
    * `always` (default) = current GLM/Qwen behavior.
-   * `tool-call-turns` = official DeepSeek rule: only on assistant turns
-   * that also carry tool_calls (SCLI-584 / Let-me contamination).
+   * `tool-call-turns` = DeepSeek fallback for requests without tools.
+   * DeepSeek V4 requests carrying tools replay reasoning from every turn.
    */
   reasoningPassback?: 'always' | 'tool-call-turns';
 
@@ -145,14 +145,45 @@ export interface ModelProfile {
 
   /** Whether the served model accepts image content blocks (vision/multimodal).
    *  Default (undefined/false) = TEXT-ONLY: the vLLM provider substitutes image
-   *  tool-results with a textual placeholder instead of sending image_url blocks,
-   *  which a text-only model (e.g. GLM-4.7) rejects with HTTP 400 (SCLI-63).
-   *  Set true only for a genuinely multimodal served model (e.g. a Qwen-VL via
-   *  the CTX-8 vision track) to re-enable image passing + auto-downscale. */
+   *  tool-results / user image blocks with a textual placeholder instead of
+   *  sending image_url, which a text-only model (e.g. GLM-4.7) rejects with
+   *  HTTP 400 (SCLI-63). Set true only for a genuinely multimodal served
+   *  model (GLM-5.3-Flash, Qwen3.5/3.6 VL) so screenshots, `read` of image
+   *  files, and pasted TUI images keep flowing as image_url. */
   supportsVision?: boolean;
 }
 
 const MINIMAL_NON_INTERACTIVE_PROMPT = `You operate in non-interactive mode. Do not ask the user questions — proceed with available context. Use tools to complete the task. When done, return the final result as text (not a tool call).`;
+
+/** Shared glm47 lean core: tools + JSON + ToolSearch. No fleet heartbeat. */
+const GLM_LEAN_TOOL_CORE = `You complete real work by USING TOOLS — you do not just talk about it.
+
+When you call a tool, pass ALL required arguments as valid JSON. Many tools are available via ToolSearch: search by keyword (e.g. "wiki create page", "pulse transition") or use \`select:<exact_tool_name>\` to load a tool before calling it.`;
+
+/** Interactive TUI/CLI — human is on this chat. Do not poll Pulse as a harness tick. */
+export const GLM_LEAN_INTERACTIVE_PROMPT = `${GLM_LEAN_TOOL_CORE}
+
+You are in an interactive terminal with a human. Reply in this chat. Do not call mcp__shizuha-pulse__pulse_get_my_work, mcp__shizuha-pulse__pulse_get_my_tasks, or mcp__shizuha-pulse__pulse_get_my_alerts unless they asked. There is no [HEARTBEAT] in this session. Do not call message_user to talk to them.`;
+
+/** Hive/gateway seats — heartbeat-protocol floor (SCLI-76). */
+export const GLM_LEAN_FLEET_PROMPT = `${GLM_LEAN_TOOL_CORE}
+
+On [HEARTBEAT]: call mcp__shizuha-pulse__pulse_get_my_work (alerts + tasks in one snapshot). You choose what to advance to a real outcome (a comment, a status transition, a PR). Empty alerts does not mean an empty queue. Before going idle while holding non-blocked urgent/high in_progress or in_review work, re-read EACH such held item's latest comments + linked-PR review feedback (not just the top-ranked one) — the listing shows status only, so a held task whose next action arrived as a comment looks "done" but is ready work (SCLI-76). Only if no alert/task is ready AND no held item has unaddressed feedback: produce no output and end the turn.
+
+To send anything to a human or another agent, call mcp__shizuha-connect__message_user (your turn text is private and reaches no one otherwise). Ship code ONLY through Pull Requests — never push to a main/default branch; author from a fork. If you cannot do something yourself (operator-only access, blocked, another team's work), forward it the same turn (reassign or raise to admin-ops); do not sit on work you cannot move.`;
+
+/** Fleet GLM seats pass \`role\`; TUI/interactive CLI do not. */
+export function resolveMinimalSystemPrompt(
+  profile: ModelProfile,
+  opts?: { role?: string },
+): string | undefined {
+  const mini = profile.minimalSystemPrompt;
+  if (!mini) return undefined;
+  if (mini.includes('On [HEARTBEAT]:') && !opts?.role) {
+    return GLM_LEAN_INTERACTIVE_PROMPT;
+  }
+  return mini;
+}
 
 /**
  * Known model profiles. Matched by substring against model name (first match wins).
@@ -236,6 +267,27 @@ const PROFILES: Array<[string, ModelProfile]> = [
     // (the placeholder is only needed for genuinely text-only models like GLM-4.7,
     // which 400 on images; a vision arch accepts — or harmlessly ignores — them).
     supportsVision: true,
+  }],
+
+  // Qwen3.8-27B-Q2 — i9-ws llama.cpp UD-Q2_K_XL, 1×262144 slot + draft-mtp.
+  // Must precede the generic Qwen3.8 profile (first-match-wins). Distinct
+  // from retired Q4 (122880) and s1 BF16.
+  ['Qwen3.8-27B-Q2', {
+    displayName: 'Qwen3.8-27B-Q2',
+    useFullSystemPrompt: true,
+    noSystemPrompt: false,
+    includeToolListInPrompt: false,
+    supportsThinking: true,
+    disableThinkingExplicitly: true,
+    toolCallFormat: 'auto',
+    supportsParallelToolCalls: true,
+    nativeContextWindow: 262144,
+    recommendedMaxOutputTokens: 16384,
+    defaultTemperature: 0.6,
+    defaultTopP: 0.95,
+    defaultReasoningEffort: 'xhigh',
+    benefitsFromPrefixCaching: true,
+    supportsVision: false,
   }],
 
   // Qwen3.8-27B-Q4 — i9-ws llama.cpp UD-Q4_K_XL, 1×122880 slot. Must precede
@@ -373,9 +425,6 @@ const PROFILES: Array<[string, ModelProfile]> = [
     // high; SCLI used to send max on every turn. At 280k+ that extra think
     // budget showed up as "Let me …" planning carousels (shizuha5 2026-08-13).
     defaultReasoningEffort: 'high',
-    // Official DeepSeek thinking-mode passback (SCLI-584): replay CoT only
-    // on tool-call turns. Feeding every prior "Let me…" trace back into
-    // self-hosted templates is the slow session-long carousel.
     reasoningPassback: 'tool-call-turns',
     benefitsFromPrefixCaching: true,
   }],
@@ -460,6 +509,49 @@ const PROFILES: Array<[string, ModelProfile]> = [
 
   // ── GLM Models ──
   // Order matters: first-match-wins by substring.
+  // GLM-5.3-Flash must precede GLM-5 (otherwise "GLM-5.3-Flash" matches "GLM-5"
+  // and inherits the 202k/16k GLM-5 profile). Live TP4: official FP8 weights,
+  // --tool-call-parser glm47, --reasoning-parser glm45, 500k ctx. Same glm47
+  // SCLI-54/57 class as GLM-5.2: lean prompt + thinking ON. Thinking tokens
+  // share max_tokens; 16k truncates nightmare/impossible writes (bench 1183).
+  ['GLM-5.3', {
+    displayName: 'GLM-5.3-Flash',
+    useFullSystemPrompt: false,
+    minimalSystemPrompt: GLM_LEAN_FLEET_PROMPT,
+    noSystemPrompt: false,
+    includeToolListInPrompt: false,
+    supportsThinking: true,
+    defaultThinkingOn: true,
+    disableThinkingExplicitly: false,
+    toolCallFormat: 'auto',
+    supportsParallelToolCalls: true,
+    nativeContextWindow: 500000,
+    recommendedMaxOutputTokens: 32768,
+    // Z.AI / vLLM recipe sampling is temperature 1.0, top_p 0.95 (generation_config.json
+    // and docs.vllm.ai/zai-org/GLM-5.3-Flash). The TUI scaffold default is 0.
+    // Live shizuha2 e81682dd 2026-09-19: every agentic dump sent temperature:0
+    // with no top_p → greedy decode → "g g" / "s1 s1" / g/g/g/g stutter, then
+    // vLLM repetition_detected. Same class as SCLI-451 DSV4 greedy loops.
+    // Pin the model-card values so config.agent.temperature=0 cannot win.
+    defaultTemperature: 1.0,
+    defaultTopP: 0.95,
+    // vLLM recipe default is max; long TUI/agent sessions at 200k+ then
+    // restated constraints until max_tokens (shizuha1 2026-09-13). high is
+    // the official balanced effort; Flash cannot disable thinking.
+    defaultReasoningEffort: 'high',
+    // Z.AI interleaved thinking: CoT must be replayed on every subsequent
+    // request, including reasoning-only stops. Default `shouldPassBackReasoning`
+    // is already always; pin it so a DeepSeek-style tool-call-turns policy
+    // cannot be inherited by substring match.
+    reasoningPassback: 'always',
+    benefitsFromPrefixCaching: true,
+    // First natively multimodal GLM-5 (text+image+video). Live EXL3 TP4
+    // already serves `--limit-mm-per-prompt '{"image":4,"video":1}'`. Without
+    // this flag SCLI-63 substitutes every screenshot / pasted image with
+    // "Image not sent … text-only" and the vision encoder never sees pixels.
+    supportsVision: true,
+  }],
+
   // GLM-5.2 must precede GLM-5.1 / GLM-5 (otherwise "GLM-5.2-…" matches "GLM-5").
   // QT + production GLM-5.2 use vLLM --tool-call-parser glm47 — same SCLI-54/57
   // failure class as GLM-4.7: full bulk prompt + thinking-off → corrupt/empty
@@ -467,13 +559,7 @@ const PROFILES: Array<[string, ModelProfile]> = [
   ['GLM-5.2', {
     displayName: 'GLM-5.2',
     useFullSystemPrompt: false,
-    minimalSystemPrompt: `You are an autonomous agent. You complete real work by USING TOOLS — you do not just talk about it.
-
-When you call a tool, pass ALL required arguments as valid JSON. Many tools are available via ToolSearch: search by keyword (e.g. "wiki create page", "pulse transition") or use \`select:<exact_tool_name>\` to load a tool before calling it.
-
-On [HEARTBEAT]: call mcp__shizuha-pulse__pulse_get_my_alerts first, then mcp__shizuha-pulse__pulse_get_my_tasks. After both results, work the highest-priority ready item across alerts and tasks to a real outcome (a comment, a status transition, a PR); alerts win ties but never preempt higher-priority task WIP. Then re-check alerts before tasks and take the next ready item — drain your ready inboxes and never idle while an alert or task is assigned to you. Before going idle while holding non-blocked urgent/high in_progress or in_review work, re-read EACH such held item's latest comments + linked-PR review feedback (not just the top-ranked one) — get_my_tasks shows status only, so a held task whose next action arrived as a comment looks "done" but is ready work (SCLI-76). Only if no alert/task is ready AND no held item has unaddressed feedback: produce no output and end the turn.
-
-To send anything to a human or another agent, call mcp__shizuha-connect__message_user (your turn text is private and reaches no one otherwise). Ship code ONLY through Pull Requests — never push to a main/default branch; author from a fork. If you cannot do something yourself (operator-only access, blocked, another team's work), forward it the same turn (reassign or raise to admin-ops); do not sit on work you cannot move.`,
+    minimalSystemPrompt: GLM_LEAN_FLEET_PROMPT,
     noSystemPrompt: false,
     includeToolListInPrompt: false,
     supportsThinking: true,
@@ -537,13 +623,7 @@ To send anything to a human or another agent, call mcp__shizuha-connect__message
     // LEAN prompt: skip the full BASE+POLICY+ROLE+tool-list bulk; the essentials below
     // + the agent's contextPrompt (identity) + on-demand skills are enough.
     useFullSystemPrompt: false,
-    minimalSystemPrompt: `You are an autonomous agent. You complete real work by USING TOOLS — you do not just talk about it.
-
-When you call a tool, pass ALL required arguments as valid JSON. Many tools are available via ToolSearch: search by keyword (e.g. "wiki create page", "pulse transition") or use \`select:<exact_tool_name>\` to load a tool before calling it.
-
-On [HEARTBEAT]: call mcp__shizuha-pulse__pulse_get_my_alerts first, then mcp__shizuha-pulse__pulse_get_my_tasks. After both results, work the highest-priority ready item across alerts and tasks to a real outcome (a comment, a status transition, a PR); alerts win ties but never preempt higher-priority task WIP. Then re-check alerts before tasks and take the next ready item — drain your ready inboxes and never idle while an alert or task is assigned to you. Before going idle while holding non-blocked urgent/high in_progress or in_review work, re-read EACH such held item's latest comments + linked-PR review feedback (not just the top-ranked one) — get_my_tasks shows status only, so a held task whose next action arrived as a comment looks "done" but is ready work (SCLI-76). Only if no alert/task is ready AND no held item has unaddressed feedback: produce no output and end the turn.
-
-To send anything to a human or another agent, call mcp__shizuha-connect__message_user (your turn text is private and reaches no one otherwise). Ship code ONLY through Pull Requests — never push to a main/default branch; author from a fork. If you cannot do something yourself (operator-only access, blocked, another team's work), forward it the same turn (reassign or raise to admin-ops); do not sit on work you cannot move.`,
+    minimalSystemPrompt: GLM_LEAN_FLEET_PROMPT,
     noSystemPrompt: false,
     includeToolListInPrompt: false,
     supportsThinking: true,
@@ -699,6 +779,25 @@ To send anything to a human or another agent, call mcp__shizuha-connect__message
     nativeContextWindow: 200000,
     recommendedMaxOutputTokens: 32000,
     benefitsFromPrefixCaching: true,
+  }],
+
+  // ── Grok Voice Think Fast (realtime S2S + function tools) ──
+  // Must precede grok-4.x / grok- so the voice IDs don't inherit the 500K
+  // chat-completions profile. Context is a realtime session, not SuperGrok 500K.
+  ['grok-voice', {
+    displayName: 'Grok Voice Think Fast',
+    useFullSystemPrompt: true,
+    useLeanBasePrompt: true,
+    noSystemPrompt: false,
+    includeToolListInPrompt: false,
+    supportsThinking: true,
+    disableThinkingExplicitly: false,
+    toolCallFormat: 'openai',
+    supportsParallelToolCalls: true,
+    nativeContextWindow: 128000,
+    recommendedMaxOutputTokens: 8192,
+    benefitsFromPrefixCaching: false,
+    defaultReasoningEffort: 'high',
   }],
 
   // ── Grok 4.5 / 4.6 (xAI SuperGrok, 500K) — must precede generic grok- ──

@@ -21,6 +21,12 @@ import { VirtualKeyboard } from '../input-devices/keyboard.js';
 import { getStealthArgs, getStealthScript, getRequiredFontPackages, type StealthConfig } from '../input-devices/stealth.js';
 import { loadBrowserConfig, buildProxyUrl, type BrowserToolConfig } from '../input-devices/config.js';
 import { SocksForwarder } from '../input-devices/socks-forwarder.js';
+import {
+  isCdpUsable,
+  waitForCdpUsable,
+  reclaimCdpPort,
+  CDP_READY_TIMEOUT_MS,
+} from './cdp.js';
 
 const PAGE_LOAD_WAIT_MS = 3000;
 const IDLE_TIMEOUT_MS = 10 * 60_000; // 10 minutes
@@ -119,39 +125,9 @@ export class HumanBrowserSession {
       }
     }
 
-    // 5. Launch Chrome (non-headless, on the virtual display)
-    // Check if Chrome with CDP is already running (e.g. started by agent via Bash)
-    let cdpPort = 9222;
-    try {
-      const http = await import('node:http');
-      const existing = await new Promise<boolean>((resolve) => {
-        const req = http.get(`http://127.0.0.1:9222/json/version`, (res) => {
-          res.destroy();
-          resolve(res.statusCode === 200);
-        });
-        req.on('error', () => resolve(false));
-        req.setTimeout(2000, () => { req.destroy(); resolve(false); });
-      });
-      if (existing) {
-        console.log('[human-browser] Reusing existing Chrome CDP on port 9222');
-        // Skip launching Chrome — it's already running
-        const fingerprintSeed = Math.floor(Math.random() * 2147483647);
-        const stealthConfig: StealthConfig = {
-          userDataDir: this.userDataDir,
-          screenWidth: this.config.stealth?.viewportWidth ?? 1920,
-          screenHeight: this.config.stealth?.viewportHeight ?? 1080,
-          fingerprintSeed,
-        };
-        await this.injectStealthViaCDP(cdpPort, stealthConfig, fingerprintSeed);
-        this.mouse = new VirtualMouse({ cdpPort, screenWidth: this.config.stealth?.viewportWidth ?? 1920, screenHeight: this.config.stealth?.viewportHeight ?? 1080 });
-        this.keyboard = new VirtualKeyboard({ cdpPort });
-        await this.mouse.start();
-        await this.keyboard.start();
-        this._started = true;
-        return;
-      }
-    } catch { /* no existing Chrome — start fresh below */ }
-    cdpPort = 9222; // Always use fixed port — cdpEvaluate() and mouse/keyboard connect to 9222
+    // 5. Launch Chrome (non-headless, on the virtual display).
+    // Fixed port 9222 is the contract — mouse/keyboard/cdpEvaluate all hardcode it.
+    const cdpPort = 9222;
     const fingerprintSeed = Math.floor(Math.random() * 2147483647);
 
     const stealthConfig: StealthConfig = {
@@ -166,6 +142,12 @@ export class HumanBrowserSession {
       webglRenderer: this.config.stealth?.webglRenderer,
       fingerprintSeed,
     };
+    const reuseStealthConfig: StealthConfig = {
+      userDataDir: this.userDataDir,
+      screenWidth: this.config.stealth?.viewportWidth ?? 1920,
+      screenHeight: this.config.stealth?.viewportHeight ?? 1080,
+      fingerprintSeed,
+    };
     const chromeArgs = [
       ...getStealthArgs(stealthConfig),
       // CDP on localhost only — used once for stealth injection, then not needed
@@ -173,35 +155,87 @@ export class HumanBrowserSession {
       '--remote-debugging-address=127.0.0.1',
       'about:blank',
     ];
-
     const chromePath = this.findChrome();
 
-    this.chrome = spawn(chromePath, chromeArgs, {
-      env: {
-        ...process.env,
-        DISPLAY: displayId,
-        // Strip all proxy env vars — Chrome must connect to CDP and X directly.
-        // Daemon injects HTTPS_PROXY for container IPv6 workaround, but Chrome
-        // doesn't need it (DinD/sysbox has proper networking).
-        HTTPS_PROXY: '',
-        HTTP_PROXY: '',
-        https_proxy: '',
-        http_proxy: '',
-        NO_PROXY: '*',
-        no_proxy: '*',
-        ...(this.config.stealth?.timezone ? { TZ: this.config.stealth.timezone } : {}),
-        ...(this.config.stealth?.locale ? { LANG: `${this.config.stealth.locale}.UTF-8` } : {}),
-      },
-      stdio: ['ignore', 'ignore', 'ignore'],
-    });
+    // Reuse an existing Chrome only if it is genuinely usable (a real page
+    // target behind a WebSocket debug URL). A responder that answers
+    // /json/version but exposes no usable page target is wedged — reusing it
+    // (the old behaviour) silently produced "connect ECONNREFUSED 127.0.0.1:9222"
+    // for the very next CDP call (BRW-37).
+    if (await isCdpUsable(cdpPort)) {
+      console.log('[human-browser] Reusing existing Chrome CDP on port 9222');
+      await this.injectStealthViaCDP(cdpPort, reuseStealthConfig, fingerprintSeed);
+      this.mouse = new VirtualMouse({ cdpPort, screenWidth: this.config.stealth?.viewportWidth ?? 1920, screenHeight: this.config.stealth?.viewportHeight ?? 1080 });
+      this.keyboard = new VirtualKeyboard({ cdpPort });
+      await this.mouse.start();
+      await this.keyboard.start();
+      this._started = true;
+      return;
+    }
+    // If something half-open is squatting on the fixed port from a previous
+    // session, reclaim it so our fresh launch can bind it.
+    await reclaimCdpPort(this.userDataDir, cdpPort);
 
-    this.chrome.on('exit', (code) => {
-      console.log(`[human-browser] Chrome exited with code ${code}`);
-      this.chrome = null;
-    });
+    const spawnChrome = (): void => {
+      this.chrome = spawn(chromePath, chromeArgs, {
+        env: {
+          ...process.env,
+          DISPLAY: displayId,
+          // Strip all proxy env vars — Chrome must connect to CDP and X directly.
+          // Daemon injects HTTPS_PROXY for container IPv6 workaround, but Chrome
+          // doesn't need it (DinD/sysbox has proper networking).
+          HTTPS_PROXY: '',
+          HTTP_PROXY: '',
+          https_proxy: '',
+          http_proxy: '',
+          NO_PROXY: '*',
+          no_proxy: '*',
+          ...(this.config.stealth?.timezone ? { TZ: this.config.stealth.timezone } : {}),
+          ...(this.config.stealth?.locale ? { LANG: `${this.config.stealth.locale}.UTF-8` } : {}),
+        },
+        stdio: ['ignore', 'ignore', 'ignore'],
+      });
 
-    // Wait for Chrome + CDP to be ready
-    await new Promise((r) => setTimeout(r, 3000));
+      this.chrome.on('exit', (code) => {
+        console.log(`[human-browser] Chrome exited with code ${code}`);
+        this.chrome = null;
+      });
+    };
+
+    // 5b. Launch Chrome, then WAIT until CDP is genuinely usable (page target
+    //     present) instead of the old fixed 3000ms sleep. Cold starts can take
+    //     5-15s (Xvfb init, first-profile creation, font setup).
+    spawnChrome();
+    let ready = await waitForCdpUsable(cdpPort, CDP_READY_TIMEOUT_MS);
+
+    if (!ready) {
+      // Chrome may have died on the first (cold) launch. Reclaim and relaunch
+      // once before giving up — this clears the transient state that produced
+      // the BRW-37 ECONNREFUSED avalanche.
+      console.warn('[human-browser] CDP not ready on first launch — reclaiming port and relaunching');
+      if (this.chrome) {
+        this.chrome.kill('SIGKILL');
+        this.chrome = null;
+      }
+      await reclaimCdpPort(this.userDataDir, cdpPort);
+      spawnChrome();
+      ready = await waitForCdpUsable(cdpPort, CDP_READY_TIMEOUT_MS);
+    }
+
+    if (!ready) {
+      // Loud, actionable failure instead of a bare ECONNREFUSED surfacing
+      // elsewhere (AC: "listener absent must fail loudly with ownership evidence").
+      throw new Error(
+        `[human-browser] Chrome did not expose a usable CDP endpoint on ` +
+        `127.0.0.1:${cdpPort} after two launch attempts (BRW-37). ` +
+        `Nothing usable is listening on the human-mode CDP port, so ` +
+        `browser(action="navigate", mode="human") cannot proceed. ` +
+        `Chrome binary: ${chromePath}; profile: ${this.userDataDir}; ` +
+        `owner: ${process.env?.AGENT_USERNAME ?? 'unknown'}; ` +
+        `check the agent container for [human-browser] log lines and ensure ` +
+        `Xvfb + the playwright chromium at ${process.env.PLAYWRIGHT_BROWSERS_PATH ?? '/opt/playwright-browsers'} are present.`,
+      );
+    }
 
     // 6. Inject stealth patches via CDP (runs before any page navigation)
     await this.injectStealthViaCDP(cdpPort, stealthConfig, fingerprintSeed);

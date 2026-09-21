@@ -363,8 +363,8 @@ describe('runAgent — incomplete model turns', () => {
     expect(mockProvider.callCount).toBe(2);
     const secondCallMsgs = mockProvider.capturedMessages[1]!;
     expect(secondCallMsgs.some(
-      (m) => typeof m.content === 'string' && m.content.includes('Continue. Use your tools'),
-    )).toBe(true);
+      (m) => typeof m.content === 'string' && /Continue\. Use your tools|Continue with the next task/i.test(m.content),
+    )).toBe(false);
   });
 
   it('continues autonomous max_tokens even when reasoning leaked into visible text', async () => {
@@ -421,8 +421,7 @@ describe('runAgent — PLAT-216 no-progress guard', () => {
     // Turn 2: [C, D] — new calls, added to seenSigs
     // Turn 3: [A, B] — all seen → noProgressTurns=1
     // Turn 4: [C, D] — all seen → noProgressTurns=2
-    // Turn 5: [A, B] — all seen → noProgressTurns=3 ≥ threshold → inject stuckNotice, stuckCleanupPending=true
-    // Turn 6: cleanup (text-only) → stuckCleanupPending check fires → StuckEvent
+    // Turn 5: [A, B] — all seen → noProgressTurns=3 ≥ threshold → StuckEvent (no inject)
     mockProvider.queueResponse(
       ResponseBuilder.withToolCalls('', [
         { id: 'tc1', name: 'read', input: { file_path: '/a.ts' } },
@@ -453,8 +452,6 @@ describe('runAgent — PLAT-216 no-progress guard', () => {
         { id: 'tc10', name: 'read', input: { file_path: '/b.ts' } },
       ]),
     );
-    // Cleanup turn: agent responds to stuck notice with text
-    mockProvider.queueResponse(ResponseBuilder.textOnly('I cannot proceed — the files are missing.'));
 
     const events = await collectEvents({ maxTurns: 20 });
 
@@ -574,7 +571,13 @@ describe('runAgent — compaction trigger', () => {
       totalOutputTokens: 0,
       turnCount: 0,
     });
+    // PLAT-9194 band: the 0.40 floor can demand multiple hierarchical passes
+    // on a 100-message resumed history — queue a summary buffer; the turn
+    // response stays last.
     mockProvider.queueResponse(ResponseBuilder.textOnly('Compaction summary of the conversation. '.repeat(30)));
+    for (let pass = 0; pass < 8; pass++) {
+      mockProvider.queueResponse(ResponseBuilder.textOnly('Compaction summary of the conversation. '.repeat(30)));
+    }
     mockProvider.queueResponse(ResponseBuilder.textOnly('Resumed safely.'));
 
     const events = await collectEvents({ sessionId, maxContextTokens: 200_000 });
@@ -582,9 +585,14 @@ describe('runAgent — compaction trigger', () => {
     expect(findEvent<{ type: 'complete' }>(events, 'complete')).toBeDefined();
     // LLM-based compaction (operator 2026-08-08): the resumed over-threshold
     // history is summarized first, then the interactive turn runs.
-    expect(mockProvider.callCount).toBe(2);
-    expect(mockProvider.capturedOptions[1]?.requestKind).toBe('post_compaction');
-    expect(mockProvider.capturedMessages[1]?.[0]?.content).toContain('[Conversation Summary]');
+    // PLAT-9194 band: the 0.40 floor can demand MULTIPLE hierarchical
+    // compaction passes — assert on the shape (≥1 compaction pass, the LAST
+    // call is the post-compaction interactive turn on summarized history)
+    // rather than a pinned pass count.
+    expect(mockProvider.callCount).toBeGreaterThanOrEqual(2);
+    const turnIndex = mockProvider.callCount - 1;
+    expect(mockProvider.capturedOptions[turnIndex]?.requestKind).toBe('post_compaction');
+    expect(mockProvider.capturedMessages[turnIndex]?.[0]?.content).toContain('[Conversation Summary]');
     expect(storeHarness.replaceMessages).toHaveBeenCalledTimes(1);
   });
 
@@ -682,8 +690,8 @@ describe('runAgent — SCLI-9 silent generation guard (a)', () => {
   });
 });
 
-describe('runAgent — SCLI-9 reasoning-channel surfacing guard (b)', () => {
-  it('surfaces rawContent reasoning for thinking-capable models when no text content and breaks', async () => {
+describe('runAgent — SCLI-9 reasoning-channel privacy guard (b)', () => {
+  it('does not copy rawContent reasoning onto the visible content channel', async () => {
     // Reasoning-only: no text chunk, one reasoning block with rawContent
     mockProvider.queueResponse([
       { type: 'reasoning' as const, id: 'r1', rawContent: 'My reasoning chain here.' },
@@ -694,12 +702,10 @@ describe('runAgent — SCLI-9 reasoning-channel surfacing guard (b)', () => {
 
     const events = await collectEvents({ model: 'DeepSeek-R1' });
     const contentEvents = findEvents(events, 'content') as Array<{ type: 'content'; text: string }>;
-    expect(contentEvents.some((e) => e.text.includes('reasoning chain'))).toBe(true);
-    const complete = findEvent<{ type: 'complete'; totalTurns: number }>(events, 'complete');
-    expect(complete?.totalTurns).toBe(1);
+    expect(contentEvents.some((e) => e.text.includes('reasoning chain'))).toBe(false);
   });
 
-  it('surfaces summary text reasoning for thinking-capable models when rawContent absent and breaks', async () => {
+  it('does not copy summary-text reasoning onto the visible content channel', async () => {
     mockProvider.queueResponse([
       { type: 'reasoning' as const, id: 'r2', summary: [{ text: 'Step 1.' }, { text: 'Step 2.' }] },
       { type: 'usage' as const, inputTokens: 100, outputTokens: 40 },
@@ -709,12 +715,10 @@ describe('runAgent — SCLI-9 reasoning-channel surfacing guard (b)', () => {
 
     const events = await collectEvents({ model: 'DeepSeek-R1' });
     const contentEvents = findEvents(events, 'content') as Array<{ type: 'content'; text: string }>;
-    expect(contentEvents.some((e) => e.text.includes('Step 1') && e.text.includes('Step 2'))).toBe(true);
-    const complete = findEvent<{ type: 'complete'; totalTurns: number }>(events, 'complete');
-    expect(complete?.totalTurns).toBe(1);
+    expect(contentEvents.some((e) => e.text.includes('Step 1') || e.text.includes('Step 2'))).toBe(false);
   });
 
-  it('surfaces reasoning-only output for thinking-capable DeepSeek-V4-Flash', async () => {
+  it('does not leak thinking-only DeepSeek-V4-Flash reasoning as the answer', async () => {
     mockProvider.queueResponse([
       { type: 'reasoning' as const, id: 'r3', rawContent: 'stale hidden prompt should not leak' },
       { type: 'usage' as const, inputTokens: 100, outputTokens: 50 },
@@ -724,8 +728,7 @@ describe('runAgent — SCLI-9 reasoning-channel surfacing guard (b)', () => {
 
     const events = await collectEvents({ model: 'DeepSeek-V4-Flash' });
     const contentEvents = findEvents(events, 'content') as Array<{ type: 'content'; text: string }>;
-    expect(contentEvents.some((e) => e.text.includes('stale hidden prompt'))).toBe(true);
-    expect(mockProvider.callCount).toBe(1);
+    expect(contentEvents.some((e) => e.text.includes('stale hidden prompt'))).toBe(false);
   });
 });
 
@@ -738,14 +741,16 @@ describe('runAgent — SCLI-9 thinking-only re-prompt guard (c)', () => {
 
     const events = await collectEvents();
     const complete = findEvent<{ type: 'complete'; totalTurns: number }>(events, 'complete');
-    // Two turns: thinking-only re-prompt, then real answer
+    // Two turns: thinking-only continue from the persisted assistant prefix,
+    // then real answer. No user lecture (operator 2026-09-10).
     expect(complete?.totalTurns).toBe(2);
-    // Second call should include the continue nudge
     const secondCallMsgs = mockProvider.capturedMessages[1]!;
     const hasContinueNudge = secondCallMsgs.some((m) =>
-      typeof m.content === 'string' && m.content.includes('Continue'),
+      typeof m.content === 'string' && /Continue\.|left off|progress update/i.test(m.content),
     );
-    expect(hasContinueNudge).toBe(true);
+    expect(hasContinueNudge).toBe(false);
+    const last = secondCallMsgs[secondCallMsgs.length - 1];
+    expect(last?.role).toBe('assistant');
   });
 
   it('talk one-shot seats do not re-prompt thinking-only or run a second model call', async () => {

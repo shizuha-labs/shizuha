@@ -22,7 +22,7 @@ import {
 } from './heartbeat-hygiene.js';
 import { resolveDynamicCompactionWindow, resolveEffectiveContextWindow, type CompactionWindowMode } from '../provider/context-window.js';
 import { MCPManager } from '../tools/mcp/manager.js';
-import { isLeanConversationalEnv, leanConversationalSkillNames, talkSeatSuppressesTools, talkSeatTurnTimeoutMs } from '../platform/lean-conversational.js';
+import { isLeanConversationalEnv, leanConversationalSkillNames, talkSeatSuppressesTools, talkSeatTurnTimeoutMs, PULSE_MCP_TOOL } from '../platform/lean-conversational.js';
 import { registerMCPTools, createMCPResourceReadTool } from '../tools/mcp/bridge.js';
 import {
   ToolSearchState,
@@ -45,7 +45,6 @@ import {
 } from './content.js';
 import { DEGENERACY_RECOVERY_PROMPT } from './output-degeneracy-guard.js';
 import {
-  AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
   incompleteTurnError,
   MAX_THINKING_ONLY_RECOVERY,
   shouldContinueAutonomousMaxTokens,
@@ -478,6 +477,7 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
   // - max_tokens with visible text / transport salvage → incomplete terminal, no replay
   // - max_tokens with thinking/reasoning only (autonomous) → same re-prompt as thinking-only
   // - Thinking-only (no output text) → re-prompt up to 3 times, counted separately
+  // - Thinking-model reasoning-only → persist the reasoning block for cache; never copy it onto visible content
   // - Non-thinking reasoning-only → one visible-answer recovery; never surface hidden text
   // - Silent generation (0 output tokens) → targeted recovery up to 2 times
   // - Progress-only narration ("Let me search...") → force an actual tool call/final answer
@@ -593,7 +593,16 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
         effectiveReportedTokens = 0;
         promptBudget = estimatePromptTokenBudget({ messages, systemPrompt, toolDefs, model, sourceKind: promptBudget.sourceKind });
         if (promptBudget.sourceKind === 'heartbeat' && promptBudget.promptTokenEstimate > hbBudget.softBudgetTokens) {
-          throw new Error('Semantic context compaction did not restore heartbeat headroom');
+          // Operator 2026-08-17: never skip a heartbeat because ctx is large.
+          // Compaction is best-effort; send the Pulse turn anyway.
+          logger.warn(
+            {
+              turnIndex,
+              promptTokenEstimate: promptBudget.promptTokenEstimate,
+              softBudgetTokens: hbBudget.softBudgetTokens,
+            },
+            'Heartbeat proceeding after compaction left a large prompt',
+          );
         }
       }
 
@@ -736,6 +745,13 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
             /model_leased|leased to another agent/i.test(msg);
           if (isModelLeased) {
             logger.warn({ turnIndex }, 'Model leased to another agent — ending turn, will retry after long pause / next heartbeat');
+            throw turnErr;
+          }
+
+          const isResidencyFull = (turnErr as { residencyFull?: boolean }).residencyFull === true ||
+            /residency_full|residency_ttl_protected/i.test(msg);
+          if (isResidencyFull) {
+            logger.warn({ turnIndex }, 'Residency TTL-full — ending turn; retry after the advertised home expiry');
             throw turnErr;
           }
 
@@ -987,6 +1003,8 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
         const continuing = !talkOneShot && (
           result.toolCalls.length > 0
           || (result.outputTokens === 0 && silentGenerationCount < MAX_SILENT_GENERATION_RECOVERY)
+          || (_reasoning && !_txt.trim() && modelProfile.supportsThinking
+            && thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY)
           || (_reasoning && !_txt.trim() && !modelProfile.supportsThinking
             && nonThinkingReasoningRecoveryCount < MAX_NON_THINKING_REASONING_RECOVERY)
           || (_isThinkingOnly && thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY)
@@ -1067,15 +1085,8 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
           thinkingOnlyRecoveryCount++;
           logger.warn(
             { turnIndex, attempt: thinkingOnlyRecoveryCount, outputTokens: result.outputTokens, stopReason: result.stopReason },
-            'SCLI: max_tokens hit on a thinking-only autonomous turn — continuing so the model can tool-call',
+            'SCLI: max_tokens hit on a thinking-only autonomous turn — continuing from persisted prefix (no Continue lecture)',
           );
-          const continueMsg: Message = {
-            role: 'user',
-            content: AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
-            timestamp: Date.now(),
-          };
-          messages.push(continueMsg);
-          store.appendMessage(session.id, continueMsg);
           continue;
         }
         const incompleteError = incompleteTurnError(result.stopReason);
@@ -1127,60 +1138,97 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
           continue;
         }
 
-        // SCLI-9(b): Reasoning-channel surfacing — model put its answer entirely
-        // into a reasoning/thinking block with no text content. Try rawContent
-        // first (vLLM/OpenAI-compatible), then fall back to summary[].text
-        // (Anthropic extended thinking).
+        // SCLI-9(b): Reasoning is private. A thinking-capable model may end
+        // the turn with a reasoning block and no visible text (GLM/DeepSeek).
+        // Persist that block for prefix-cache/replay, but do not copy it onto
+        // the user-visible content channel — TUI users should see thinking
+        // only while it is in progress (operator 2026-09-10). Nudge-looping
+        // these models just re-reasons until we error out.
         const reasoningStr = reasoningTextFromContent(content);
         const textContent = visibleTextFromContent(content);
         const strippedContent = strippedVisibleTextFromContent(content);
         const hasActionableText = strippedContent.length > 0;
 
-        if (!hasActionableText && reasoningStr.length > 0) {
-          if (modelProfile.supportsThinking) {
-            logger.info(
-              { turnIndex, reasoningLen: reasoningStr.length },
-              'SCLI-9: surfacing reasoning-only answer (no text content) — stopping loop',
+        if (result.stopReason === 'glm_observation' && permissionMode !== 'plan') {
+          if (hasActionableText && progressOnlyRecoveryCount < MAX_PROGRESS_ONLY_RECOVERY) {
+            progressOnlyRecoveryCount++;
+            logger.warn(
+              { turnIndex, attempt: progressOnlyRecoveryCount, stopReason: result.stopReason },
+              'SCLI: GLM <|observation|> stop without parsed tool_calls — continuing from prefix (no user lecture)',
             );
-            yield { type: 'content', text: reasoningStr, timestamp: Date.now() };
-            break;
-          }
-          logger.warn(
-            { turnIndex, reasoningLen: reasoningStr.length, model },
-            'SCLI-9: non-thinking model returned reasoning-only output; treating as invalid provider response',
-          );
-          if (nonThinkingReasoningRecoveryCount < MAX_NON_THINKING_REASONING_RECOVERY) {
-            nonThinkingReasoningRecoveryCount++;
-            const retryMsg: Message = {
-              role: 'user',
-              content: 'Your previous response was not visible to the user. Reply again with the final answer in normal visible text only.',
-              timestamp: Date.now(),
-            };
-            messages.push(retryMsg);
-            store.appendMessage(session.id, retryMsg);
             continue;
+          }
+          if (!hasActionableText) {
+            logger.warn(
+              { turnIndex, stopReason: result.stopReason, outputTokens: result.outputTokens },
+              'SCLI: GLM <|observation|> drop with empty text after salvage — not an empty-response retry loop',
+            );
+          }
+        } else if (!hasActionableText && reasoningStr.length > 0) {
+          if (modelProfile.supportsThinking) {
+            // Hidden CoT is not a finished answer. Live shizuha1 2026-09-10:
+            // GLM planned hive_list_fleet_agents in reasoning (151 toks,
+            // stop=stop) and the loop broke, so the tool calls never left
+            // the model. Do not dump CoT; do not inject a "you left off"
+            // user lecture (operator 2026-09-10). SCLI-9(c) continues from
+            // the already-persisted assistant reasoning prefix.
+            logger.info(
+              { turnIndex, reasoningLen: reasoningStr.length, stopReason: result.stopReason },
+              'SCLI-9: reasoning-only stop; continuing generation (not a finished answer)',
+            );
+            if (result.stopReason === 'max_tokens' || result.stopReason === 'stall_salvage') {
+              break;
+            }
+            if (result.stopReason === 'repetition') {
+              logger.warn(
+                { turnIndex, reasoningLen: reasoningStr.length },
+                'SCLI-9: GLM repetition_detected think-loop — not continuing from garbled CoT',
+              );
+              break;
+            }
+          } else {
+            logger.warn(
+              { turnIndex, reasoningLen: reasoningStr.length, model },
+              'SCLI-9: non-thinking model returned reasoning-only output; treating as invalid provider response',
+            );
+            if (nonThinkingReasoningRecoveryCount < MAX_NON_THINKING_REASONING_RECOVERY) {
+              nonThinkingReasoningRecoveryCount++;
+              const retryMsg: Message = {
+                role: 'user',
+                content: 'Your previous response was not visible to the user. Reply again with the final answer in normal visible text only.',
+                timestamp: Date.now(),
+              };
+              messages.push(retryMsg);
+              store.appendMessage(session.id, retryMsg);
+              continue;
+            }
           }
         }
 
-        // SCLI-9(c): Thinking-only re-prompt — model generated <think>...</think>
-        // but no actionable output. Re-prompt separately from truncation recovery.
-        if (!talkOneShot && !hasActionableText && textContent.length > 0 && thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY) {
+        // SCLI-9(c): Hidden reasoning or <think> with no tool/text is an
+        // incomplete generation, not a finished answer. The assistant
+        // message (including reasoning_content) is already on `messages`.
+        // Issue the next completion from that prefix so the model can emit
+        // the tool calls it already planned. Do NOT add a user lecture —
+        // that is the policy layer, cuts prefix-cache, and is what the
+        // operator rejected (2026-09-10 shizuha1).
+        if (!talkOneShot && !hasActionableText
+          && result.stopReason !== 'glm_observation'
+          && result.stopReason !== 'repetition'
+          && (textContent.length > 0
+            || (reasoningStr.length > 0
+              && result.stopReason !== 'max_tokens'
+              && result.stopReason !== 'stall_salvage'))
+          && thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY) {
           thinkingOnlyRecoveryCount++;
           logger.info(
-            { turnIndex, attempt: thinkingOnlyRecoveryCount, outputTokens: result.outputTokens },
-            'SCLI-9: thinking-only response — re-prompting for action',
+            { turnIndex, attempt: thinkingOnlyRecoveryCount, outputTokens: result.outputTokens, stopReason: result.stopReason },
+            'SCLI-9: thinking-only response — continuing from persisted reasoning (no user lecture)',
           );
-          const continueMsg: Message = {
-            role: 'user',
-            content: 'Continue. Use your tools to implement the solution.',
-            timestamp: Date.now(),
-          };
-          messages.push(continueMsg);
-          store.appendMessage(session.id, continueMsg);
           continue;
         }
 
-        if (!hasActionableText) {
+        if (!hasActionableText && result.stopReason !== 'glm_observation') {
           logger.warn(
             { turnIndex, stopReason: result.stopReason, inputTokens: result.inputTokens, outputTokens: result.outputTokens,
               silentGenerationCount, thinkingOnlyRecoveryCount },
@@ -1207,15 +1255,11 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
             progressOnlyRecoveryCount++;
             logger.warn(
               { turnIndex, attempt: progressOnlyRecoveryCount, text: strippedContent.slice(0, 240) },
-              'SCLI: progress-only assistant narration without tool call — re-prompting',
+              'SCLI: progress-only assistant narration without tool call — continuing from prefix (no user lecture)',
             );
-            const continueMsg: Message = {
-              role: 'user',
-              content: `Your previous response was only a progress update, not a completed answer: "${strippedContent.slice(0, 240)}"\n\nDo not stop after narrating the next step. If work remains, call the appropriate tool now. If the task is actually complete, give the final answer directly.`,
-              timestamp: Date.now(),
-            };
-            messages.push(continueMsg);
-            store.appendMessage(session.id, continueMsg);
+            // The assistant progress line is already on `messages`. A "you
+            // narrated progress" user lecture is the policy layer the
+            // operator rejected (2026-09-10 shizuha1). Continue generation.
             continue;
           }
           logger.warn(
@@ -1270,20 +1314,23 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
         break;
       }
 
-      // PLAT-216: Cross-turn no-progress guard.
+      // PLAT-216: Cross-turn no-progress guard. STOP — do not inject a
+      // "tell the operator / message_user" cleanup turn. That prompt made
+      // GLM spam hritik with pong / "I'm stuck in a loop" (Shion 2026-09-15).
       if (MAX_NO_PROGRESS_TURNS > 0) {
         const noProgressResult = noProgressGuard.record(result.toolCalls);
         if (noProgressResult === 'stuck') {
           const n = noProgressGuard.turnsWithoutProgress;
-          logger.warn({ turnsWithoutProgress: n }, 'PLAT-216: no-progress guard triggered — injecting cleanup notification');
-          const stuckNotice: Message = {
-            role: 'user',
-            content: `[System] No-progress guard: you have repeated the same tool calls for ${n} consecutive turns without advancing. You appear to be stuck. Please post a comment or message explaining why you cannot proceed (e.g. via pulse_add_comment or message_user), then stop. This is your final turn.`,
+          logger.warn({ turnsWithoutProgress: n, threshold: MAX_NO_PROGRESS_TURNS },
+            'PLAT-216: no-progress guard — stopping without inject');
+          yield {
+            type: 'stuck',
+            reason: `Agent looped without advancing for ${n} consecutive turns (threshold: ${MAX_NO_PROGRESS_TURNS}). Stopped.`,
+            turnsWithoutProgress: n,
+            threshold: MAX_NO_PROGRESS_TURNS,
             timestamp: Date.now(),
           };
-          messages.push(stuckNotice);
-          store.appendMessage(session.id, stuckNotice);
-          stuckCleanupPending = true;
+          break;
         }
       }
 

@@ -42,7 +42,17 @@ export interface ChatReasoningBlock {
   summary?: Array<{ text: string }>;
 }
 
-export type ChatContentBlock = ChatTextBlock | ChatToolUseBlock | ChatToolResultBlock | ChatReasoningBlock;
+/** User-pasted / TUI-attached image (Anthropic-style source block). */
+export interface ChatImageBlock {
+  type: 'image';
+  source: {
+    type: 'base64';
+    data: string;
+    media_type: string;
+  };
+}
+
+export type ChatContentBlock = ChatTextBlock | ChatToolUseBlock | ChatToolResultBlock | ChatReasoningBlock | ChatImageBlock;
 
 // ── Chat Options ──
 
@@ -97,6 +107,9 @@ export interface ChatOptions {
   /** Response-header signal from Cortex that the current session home is in
    * warm-only soft drain. Internal lifecycle callback; other providers ignore. */
   onCortexRehomeRequired?: () => void;
+  /** Heartbeat prefetch already put pulse_get_my_work in this turn. Salvage
+   *  must not dispatch a recovered listing tool (class 1 → class 2). */
+  heartbeatInboxSatisfied?: boolean;
 }
 
 // ── Stream Chunks ──
@@ -174,4 +187,5 @@ export interface LLMProvider {
    * (self-hosted, auto-discovered via maxContextWindow) leave it undefined.
    */
   contextWindowFor?(model: string): number;
+  discoveredContextWindowFor?(model: string): number | undefined;
 }

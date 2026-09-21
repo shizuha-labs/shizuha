@@ -86,9 +86,11 @@ describe('VLlmProvider Cortex soft-drain rehome contract', () => {
     ));
 
     expect(completionBody?.['session_id']).toBe('agent-session-nami');
+    expect(completionBody?.['cache_control']).toEqual({ type: 'ephemeral', ttl: '5m' });
     expect(completionBody?.['metadata']).toEqual({
       request_kind: 'warmup',
       cortex_rehome: 'soft-drain',
+      cache_control: { type: 'ephemeral', ttl: '5m' },
     });
     expect(chunks.some((chunk) => chunk.type === 'done')).toBe(true);
   });

@@ -327,5 +327,9 @@ export function isTransientProviderFailure(input: {
     || /econnreset|socket hang|premature close|fetch failed|other side closed|terminated/i.test(blob)
     || /error occurred while processing|help\.openai\.com|upstream interrupted|stream (closed|interrupted|dropped)/i.test(blob)
     || /rate.?limit|at capacity|no first chunk|non-streaming response timeout/i.test(blob)
+    // Empty/opaque SSE error frames ("vLLM stream error: unknown error") are
+    // reconnect/proxy cuts, not a bad --model. Chess leftover 2026-08-16 died
+    // in 737ms because this string matched nothing and skip-retry ended the cell.
+    || /stream error:/i.test(blob)
   );
 }

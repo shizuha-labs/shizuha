@@ -413,6 +413,116 @@ describe('Connect ingress turn suppression (CON-223)', () => {
   });
 
   it.each([
+    ['ack_only', 'Acknowledged.'],
+    ['reaction_only', '👍'],
+    ['thread_close', 'Closing this thread.'],
+    ['no_reply_requested', 'No reply needed.'],
+  ] as const)('suppresses same-org group %s exactly once before the bridge callback', async (reason, content) => {
+    const onMessage = vi.fn();
+    const client = new ConnectClient({ onMessage }) as any;
+    const metric = metricsRegistry.getSingleMetric('shizuha_connect_ingress_events_total');
+    const before = await metric?.get();
+    const beforeCount = before?.values.find((value) => value.labels['channel'] === 'group'
+      && value.labels['decision'] === 'suppressed'
+      && value.labels['reason'] === reason)?.value ?? 0;
+
+    client.handleMessage({
+      type: 'new_message',
+      conversation_id: `conv-group-${reason}`,
+      message: {
+        id: `group-${reason}`,
+        content,
+        sender_id: 88,
+        sender_username: 'mio',
+        conversation_type: 'group',
+        sender_same_org: true,
+      },
+    });
+
+    const after = await metric?.get();
+    const afterCount = after?.values.find((value) => value.labels['channel'] === 'group'
+      && value.labels['decision'] === 'suppressed'
+      && value.labels['reason'] === reason)?.value ?? 0;
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(afterCount - beforeCount).toBe(1);
+  });
+
+  it.each([
+    ['Please inspect the logs.', 'required'],
+    ['Acknowledged. New blocker: the health endpoint is 503.', 'optional'],
+    ['[malformed terminal marker', 'optional'],
+  ])('fails open same-org group control %s exactly once', async (content, obligation) => {
+    const onMessage = vi.fn();
+    const client = new ConnectClient({ onMessage }) as any;
+    const metric = metricsRegistry.getSingleMetric('shizuha_connect_ingress_events_total');
+    const before = await metric?.get();
+    const beforeCount = before?.values.find((value) => value.labels['channel'] === 'group'
+      && value.labels['decision'] === 'delivered'
+      && value.labels['reason'] === 'actionable')?.value ?? 0;
+    client.handleMessage({
+      type: 'new_message',
+      conversation_id: `conv-group-control-${obligation}`,
+      message: {
+        id: `group-control-${content}`,
+        content,
+        sender_id: 88,
+        sender_username: 'mio',
+        conversation_type: 'group',
+        sender_same_org: true,
+      },
+    });
+    const after = await metric?.get();
+    const afterCount = after?.values.find((value) => value.labels['channel'] === 'group'
+      && value.labels['decision'] === 'delivered'
+      && value.labels['reason'] === 'actionable')?.value ?? 0;
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onMessage.mock.calls[0]?.[6]).toBe(obligation);
+    expect(afterCount - beforeCount).toBe(1);
+  });
+
+  it('keeps self echoes separate from the group content classifier', async () => {
+    const originalUserId = process.env['AGENT_USER_ID'];
+    process.env['AGENT_USER_ID'] = '88';
+    try {
+      const onMessage = vi.fn();
+      const client = new ConnectClient({ onMessage }) as any;
+      const metric = metricsRegistry.getSingleMetric('shizuha_connect_ingress_events_total');
+      const before = await metric?.get();
+      const beforeSelfEcho = before?.values.find((value) => value.labels['decision'] === 'suppressed'
+        && value.labels['reason'] === 'self_echo')?.value ?? 0;
+      const beforeAck = before?.values.find((value) => value.labels['channel'] === 'group'
+        && value.labels['decision'] === 'suppressed'
+        && value.labels['reason'] === 'ack_only')?.value ?? 0;
+
+      client.handleMessage({
+        type: 'new_message',
+        conversation_id: 'conv-group-self-echo',
+        message: {
+          id: 'group-self-echo',
+          content: 'Acknowledged.',
+          sender_id: 88,
+          sender_username: 'jun',
+          conversation_type: 'group',
+          sender_same_org: true,
+        },
+      });
+
+      const after = await metric?.get();
+      const afterSelfEcho = after?.values.find((value) => value.labels['decision'] === 'suppressed'
+        && value.labels['reason'] === 'self_echo')?.value ?? 0;
+      const afterAck = after?.values.find((value) => value.labels['channel'] === 'group'
+        && value.labels['decision'] === 'suppressed'
+        && value.labels['reason'] === 'ack_only')?.value ?? 0;
+      expect(onMessage).not.toHaveBeenCalled();
+      expect(afterSelfEcho - beforeSelfEcho).toBe(1);
+      expect(afterAck - beforeAck).toBe(0);
+    } finally {
+      if (originalUserId === undefined) delete process.env['AGENT_USER_ID'];
+      else process.env['AGENT_USER_ID'] = originalUserId;
+    }
+  });
+
+  it.each([
     ['external', false],
     ['unknown', undefined],
   ])('fails open %s-org direct acknowledgments once as optional', (_label, senderSameOrg) => {
@@ -458,7 +568,8 @@ describe('Connect ingress turn suppression (CON-223)', () => {
   it.each([
     ['direct', 'Deployment is green.', 'optional'],
     ['direct', 'Please inspect the logs.', 'required'],
-    // Group is content-based too (inject-once): plain ack is optional, not forced required.
+    // Cross-org group provenance fails open; same-org group suppression is
+    // covered above at the real handleMessage boundary.
     ['group', 'Acknowledged.', 'optional'],
     ['group', 'Please inspect the logs.', 'required'],
     ['invalid', 'Acknowledged.', 'optional'],

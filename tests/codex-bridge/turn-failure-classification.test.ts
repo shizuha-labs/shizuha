@@ -74,6 +74,15 @@ describe('Codex structured terminal failure handling', () => {
       turn: { status: 'failed' },
       error: { message: 'HTTPConnection failed: upstream timed out' },
     })).toMatchObject({ category: 'transient_provider' });
+
+    expect(classifyCodexTurnCompletion({
+      turn: {
+        status: 'failed',
+        error: {
+          message: "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+        },
+      },
+    })).toMatchObject({ category: 'deterministic' });
   });
 
   it('redacts credentials from provider diagnostics before logging or telemetry', () => {

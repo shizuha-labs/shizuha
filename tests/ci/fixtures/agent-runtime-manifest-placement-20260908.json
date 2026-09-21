@@ -1,0 +1,235 @@
+{
+  "observed_at": "2026-09-08T23:25:59.681764+00:00",
+  "failed_run": 39436,
+  "failed_source": "1f6c5ac90e602f8b3e2c37e82e2e2f4c2d5467cc",
+  "failed_pod_uid": "6118be10-fcbf-428d-ab99-48e9c924aa2f",
+  "failed_placement": {
+    "nodeSelector": {
+      "kubernetes.io/arch": "amd64"
+    }
+  },
+  "nodes": [
+    {
+      "metadata": {
+        "name": "gx10-1",
+        "uid": "552e0024-20d0-415b-891d-3a2c699d8a98",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-1"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-10",
+        "uid": "9a00cd5e-be2d-4a01-adb2-8d0d5743b149",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-10"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-11",
+        "uid": "8bbea9b8-22ae-43a8-aefe-e2afe17fae70",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-11"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-12",
+        "uid": "1a96d9df-f250-40cc-8cc6-05a759f8efaf",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-12"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-13",
+        "uid": "fe283cb3-e950-4846-a055-52f688c4a85b",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-13"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-14",
+        "uid": "7d29230e-3e5a-4131-9abb-bc8a34933d60",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-14"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-15",
+        "uid": "cfe095f8-238f-4b54-8cda-9a6c5f4c64f8",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-15",
+          "node-role.kubernetes.io/control-plane": "true"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-16",
+        "uid": "8b3d7f85-6741-4a02-ae09-77c3478c3d37",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-16"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-2",
+        "uid": "8fb7b474-88f5-455f-8cff-ed25b7e94419",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-2"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-3",
+        "uid": "ae63d36e-35ed-49d4-90bf-4459b5447869",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-3"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-4",
+        "uid": "0fb56f08-fc56-4c32-81a7-3a7a2e1cf546",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-4"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-5",
+        "uid": "874a6a3a-228d-4a44-94c4-11c036dad6b2",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-5",
+          "node-role.kubernetes.io/control-plane": "true"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-6",
+        "uid": "7887d9ea-3977-4a3a-84f3-70a12dcae96b",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-6",
+          "node-role.kubernetes.io/control-plane": "true"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-7",
+        "uid": "7f033375-73a2-4d12-82ac-2f3d6513138d",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-7"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-8",
+        "uid": "c19613af-7cfe-4fc7-93c8-2db151f0f27a",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-8"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "gx10-9",
+        "uid": "447303ee-7b33-41f0-ba61-52a8981b72d6",
+        "labels": {
+          "kubernetes.io/arch": "arm64",
+          "kubernetes.io/hostname": "gx10-9"
+        }
+      },
+      "spec": {}
+    },
+    {
+      "metadata": {
+        "name": "i9-ws",
+        "uid": "15ede53c-d569-40cf-bc87-b5d19cbcd618",
+        "labels": {
+          "kubernetes.io/arch": "amd64",
+          "kubernetes.io/hostname": "i9-ws"
+        }
+      },
+      "spec": {
+        "taints": [
+          {
+            "effect": "NoSchedule",
+            "key": "node.shizuha/workstation",
+            "value": "true"
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "s1",
+        "uid": "9689ff34-be9e-486a-b1bb-3780177e239f",
+        "labels": {
+          "kubernetes.io/arch": "amd64",
+          "kubernetes.io/hostname": "s1"
+        }
+      },
+      "spec": {
+        "taints": [
+          {
+            "effect": "NoSchedule",
+            "key": "operator",
+            "value": "unschedulable"
+          },
+          {
+            "effect": "NoSchedule",
+            "key": "node.shizuha/workstation",
+            "value": "true"
+          }
+        ]
+      }
+    }
+  ]
+}

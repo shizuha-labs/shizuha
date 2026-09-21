@@ -2,13 +2,24 @@ import Database from 'better-sqlite3';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
+import { pinPreparedStatements } from '../shared/sqlite-statement-cache.js';
 import type { Message } from '../agent/types.js';
+import type { ToolResult } from '../tools/types.js';
 import type { InterruptCheckpoint, Session } from './types.js';
 import type { ProviderPrefixSnapshot } from '../telemetry/provider-prefix-continuity.js';
 import { stableJson } from '../telemetry/prefix-fingerprint.js';
 
 function hashJson(value: unknown): string {
   return createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+export interface ToolAttemptIdentity {
+  sessionId: string;
+  generation: string;
+  ownerId: string;
+  inboundMessageId: string;
+  executionId: string;
+  sessionEpoch: number;
 }
 
 export type ExpensiveTurnRecoveryStatus =
@@ -78,6 +89,13 @@ interface StoredMessageRow {
   timestamp: number;
 }
 
+/**
+ * Default on-disk session state path (matches the StateStore constructor default).
+ */
+export function defaultStateDbPath(): string {
+  return path.join(process.env['HOME'] ?? '.', '.config', 'shizuha', 'state.db');
+}
+
 export class StateStore {
   private db: Database.Database;
 
@@ -87,6 +105,7 @@ export class StateStore {
     const file = dbPath ?? path.join(dir, 'state.db');
 
     this.db = new Database(file);
+    pinPreparedStatements(this.db);
     this.db.pragma('journal_mode = WAL');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
@@ -223,6 +242,31 @@ export class StateStore {
         admitted_at INTEGER NOT NULL,
         completed_at INTEGER
       );
+      CREATE TABLE IF NOT EXISTS session_tool_turns (
+        session_id TEXT NOT NULL,
+        generation TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        inbound_message_id TEXT NOT NULL,
+        execution_id TEXT NOT NULL,
+        session_epoch INTEGER NOT NULL,
+        state TEXT NOT NULL DEFAULT 'open',
+        history_json TEXT,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (session_id, generation)
+      );
+      CREATE TABLE IF NOT EXISTS session_tool_attempts (
+        session_id TEXT NOT NULL,
+        generation TEXT NOT NULL,
+        tool_call_id TEXT NOT NULL,
+        invocation INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        input_json TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'running',
+        result_json TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        PRIMARY KEY (session_id, generation, tool_call_id, invocation)
+      );
       CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
       CREATE INDEX IF NOT EXISTS idx_session_message_transcript_session
         ON session_message_transcript(session_id, timestamp, id);
@@ -330,6 +374,36 @@ export class StateStore {
     migrateTranscript.immediate();
   }
 
+  /**
+   * Non-mutating session-existence probe (SCLI-418/SCLI-400).
+   *
+   * Returns whether a persisted session with `id` exists WITHOUT creating or
+   * mutating any state file: if the default state DB does not exist, the
+   * session cannot exist (state-free false); if it does, the probe opens the
+   * DB read-only and queries the `sessions` table. Used by resume-style
+   * entrypoints so a missing/invalid session rejects with zero local
+   * filesystem side effects.
+   */
+  static sessionExists(id: string, dbPath?: string): boolean {
+    const file = dbPath ?? defaultStateDbPath();
+    if (!fs.existsSync(file)) return false;
+    let db: Database.Database | null = null;
+    try {
+      db = new Database(file, { readonly: true, fileMustExist: true });
+      const row = db.prepare('SELECT id FROM sessions WHERE id = ?').get(id) as
+        | { id: string }
+        | undefined;
+      return row !== undefined;
+    } catch {
+      // Corrupt/foreign DB: fall back to a best-effort write-open is NOT
+      // acceptable here (that would mutate). Conservatively report the session
+      // as existing so the normal lookup path surfaces the real error.
+      return true;
+    } finally {
+      if (db) db.close();
+    }
+  }
+
   inboundProcessingCompleted(_sessionId: string, messageId: string): boolean {
     const row = this.db.prepare(
       `SELECT state FROM session_inbound_processing
@@ -352,6 +426,19 @@ export class StateStore {
        SET state = 'completed', completed_at = ?
        WHERE message_id = ?`,
     ).run(Date.now(), messageId);
+  }
+
+  /** PLAT-8787: durably-completed inbound message ids, oldest first — the
+   * reconnect re-ack backlog (acks are sent once at turn end; a failed send
+   * there leaves the server row unacked and causes a byte-identical replay
+   * re-delivery). */
+  completedInboundMessageIds(): string[] {
+    const rows = this.db.prepare(
+      `SELECT message_id FROM session_inbound_processing
+       WHERE state = 'completed'
+       ORDER BY completed_at ASC, admitted_at ASC`,
+    ).all() as { message_id: string }[];
+    return rows.map((r) => r.message_id);
   }
 
   /** Create a new session */
@@ -422,6 +509,159 @@ export class StateStore {
 
     // Index text content for full-text search
     this.indexMessage(sessionId, message.role, content, timestamp);
+  }
+
+  private ensureToolTurn(identity: ToolAttemptIdentity): any {
+    if ([identity.sessionId, identity.generation, identity.ownerId, identity.inboundMessageId, identity.executionId]
+      .some((value) => typeof value !== 'string' || !value.trim()) || !Number.isInteger(identity.sessionEpoch)) {
+      throw new Error('Tool attempt identity is incomplete');
+    }
+    if (!this.db.prepare('SELECT id FROM sessions WHERE id = ?').get(identity.sessionId)) {
+      throw new Error('Tool attempt session is absent');
+    }
+    this.db.prepare(`INSERT OR IGNORE INTO session_tool_turns
+      (session_id, generation, owner_id, inbound_message_id, execution_id, session_epoch, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(identity.sessionId, identity.generation, identity.ownerId,
+      identity.inboundMessageId, identity.executionId, identity.sessionEpoch, Date.now());
+    const turn = this.db.prepare('SELECT * FROM session_tool_turns WHERE session_id = ? AND generation = ?')
+      .get(identity.sessionId, identity.generation) as any;
+    if (turn.owner_id !== identity.ownerId || turn.inbound_message_id !== identity.inboundMessageId
+      || turn.execution_id !== identity.executionId || turn.session_epoch !== identity.sessionEpoch) {
+      throw new Error('Tool attempt owner changed');
+    }
+    return turn;
+  }
+
+  private toolTransaction<Result>(action: () => Result): Result {
+    if (this.db.inTransaction) throw new Error('Tool checkpoint must own its commit boundary');
+    const synchronous = this.db.pragma('synchronous', { simple: true });
+    this.db.pragma('synchronous = FULL');
+    try {
+      return this.db.transaction(action)();
+    } finally {
+      this.db.pragma(`synchronous = ${synchronous}`);
+    }
+  }
+
+  beginToolAttempt(identity: ToolAttemptIdentity, toolCallId: string, name: string, input: unknown, invocation: number): void {
+    this.toolTransaction(() => {
+      if (!toolCallId || !name || !Number.isInteger(invocation) || invocation < 1) throw new Error('Invalid tool attempt');
+      const turn = this.ensureToolTurn(identity);
+      if (turn.state !== 'open') throw new Error('Tool turn is already finalized');
+      this.db.prepare(`INSERT INTO session_tool_attempts
+        (session_id, generation, tool_call_id, invocation, name, input_json, started_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(identity.sessionId, identity.generation, toolCallId,
+        invocation, name, JSON.stringify(input), Date.now());
+    });
+  }
+
+  completeToolAttempt(identity: ToolAttemptIdentity, toolCallId: string, invocation: number, result: ToolResult, interrupted = false): void {
+    this.toolTransaction(() => {
+      const turn = this.ensureToolTurn(identity);
+      if (turn.state !== 'open') throw new Error('Tool turn is already finalized');
+      const attempt = this.db.prepare(`SELECT * FROM session_tool_attempts
+        WHERE session_id = ? AND generation = ? AND tool_call_id = ? AND invocation = ?`)
+        .get(identity.sessionId, identity.generation, toolCallId, invocation) as any;
+      if (!attempt || result.toolUseId !== toolCallId) throw new Error('Tool attempt does not match');
+      const serialized = JSON.stringify(result);
+      const state = interrupted ? 'interrupted' : 'completed';
+      if (attempt.state !== 'running') {
+        if (attempt.state === state && attempt.result_json === serialized) return;
+        throw new Error('Tool attempt already has a different outcome');
+      }
+      this.db.prepare(`UPDATE session_tool_attempts SET state = ?, result_json = ?, finished_at = ?
+        WHERE session_id = ? AND generation = ? AND tool_call_id = ? AND invocation = ?`)
+        .run(state, serialized, Date.now(), identity.sessionId, identity.generation, toolCallId, invocation);
+    });
+  }
+
+  finalizeToolTurn(identity: ToolAttemptIdentity, messages: Message[]): Message[] {
+    return this.toolTransaction(() => {
+      const turn = this.ensureToolTurn(identity);
+      const serialized = JSON.stringify(messages);
+      if (turn.state === 'finalized' && turn.history_json === serialized) return [];
+      if (turn.state !== 'open') throw new Error('Tool turn finalization changed');
+      const includedCalls = new Set(messages.flatMap((message) => Array.isArray(message.content)
+        ? message.content.filter((block) => block.type === 'tool_use').map((block) => block.id) : []));
+      const latest = this.latestToolAttempts(identity.sessionId, identity.generation);
+      if (latest.some((attempt) => includedCalls.has(attempt.tool_call_id) && attempt.state === 'running')) {
+        throw new Error('Tool turn still has unresolved attempts');
+      }
+      const attempts = latest.filter((attempt) => !includedCalls.has(attempt.tool_call_id));
+      const persisted = [...messages, ...this.toolAttemptMessages(turn, attempts)];
+      for (const message of persisted) this.appendMessage(identity.sessionId, message);
+      this.db.prepare(`UPDATE session_tool_turns SET state = 'finalized', history_json = ?
+        WHERE session_id = ? AND generation = ?`).run(serialized, identity.sessionId, identity.generation);
+      return persisted;
+    });
+  }
+
+  private latestToolAttempts(sessionId: string, generation: string): any[] {
+    const rows = this.db.prepare(`SELECT * FROM session_tool_attempts
+      WHERE session_id = ? AND generation = ? ORDER BY started_at, rowid`).all(sessionId, generation) as any[];
+    const latest = new Map<string, any>();
+    for (const attempt of rows) latest.set(attempt.tool_call_id, {
+      ...attempt, attempt_count: (latest.get(attempt.tool_call_id)?.attempt_count ?? 0) + 1,
+    });
+    return [...latest.values()];
+  }
+
+  private toolAttemptMessages(turn: any, attempts: any[]): Message[] {
+    if (!attempts.length) return [];
+    const results = attempts.map((attempt) => {
+      const result: ToolResult = attempt.result_json ? JSON.parse(attempt.result_json) : {
+        toolUseId: attempt.tool_call_id,
+        content: 'This tool attempt has no durable completion record. Outcome is unknown; side effects may have occurred. Inspect current state before deciding whether to retry.',
+        isError: true,
+        metadata: { executionOutcome: 'unknown', interrupted: true },
+      };
+      if (attempt.state === 'running') {
+        this.db.prepare(`UPDATE session_tool_attempts SET state = 'interrupted', result_json = ?, finished_at = ?
+          WHERE session_id = ? AND generation = ? AND tool_call_id = ? AND invocation = ?`)
+          .run(JSON.stringify(result), Date.now(), turn.session_id, turn.generation, attempt.tool_call_id, attempt.invocation);
+      }
+      const oversized = result.image?.base64 && result.image.base64.length > 128 * 1024;
+      const retryNote = attempt.attempt_count > 1
+        ? `This call had ${attempt.attempt_count} recorded execution attempts. The latest outcome follows; earlier attempts may also have produced side effects.\n` : '';
+      return { type: 'tool_result' as const, toolUseId: result.toolUseId,
+        content: retryNote + (oversized ? `${result.content ?? ''}\n[Image omitted from session history: ${Math.round(result.image!.base64.length * 0.75 / 1024)}KB exceeds the persistence cap. Re-capture if needed.]` : result.content),
+        isError: result.isError, ...(!oversized && result.image ? { image: result.image } : {}) };
+    });
+    return [
+      { id: `tool-recovery:${turn.generation}:calls`, executionId: turn.execution_id, role: 'assistant',
+        content: attempts.map((attempt) => ({ type: 'tool_use' as const, id: attempt.tool_call_id,
+          name: attempt.name, input: JSON.parse(attempt.input_json) })), timestamp: Date.now() },
+      { id: `tool-recovery:${turn.generation}:results`, executionId: turn.execution_id, role: 'user', content: results, timestamp: Date.now() },
+    ];
+  }
+
+  recoverToolTurns(sessionId: string, ownerId: string, sessionEpoch: number, generation?: string): Message[] {
+    return this.toolTransaction(() => {
+      const turns = this.db.prepare(`SELECT * FROM session_tool_turns
+        WHERE session_id = ? AND session_epoch = ? AND state = 'open' AND ${generation ? 'generation = ? AND owner_id = ?' : 'owner_id != ?'}
+        ORDER BY created_at, rowid`).all(...(generation ? [sessionId, sessionEpoch, generation, ownerId] : [sessionId, sessionEpoch, ownerId])) as any[];
+      const recovered: Message[] = [];
+      for (const turn of turns) {
+        const messages = this.toolAttemptMessages(turn, this.latestToolAttempts(sessionId, turn.generation));
+        for (const message of messages) this.appendMessage(sessionId, message);
+        recovered.push(...messages);
+        this.db.prepare(`UPDATE session_tool_turns SET state = 'recovered' WHERE session_id = ? AND generation = ?`)
+          .run(sessionId, turn.generation);
+      }
+      return recovered;
+    });
+  }
+
+  recoveredHeartbeatTool(identity: ToolAttemptIdentity, name: string, input: unknown): ToolResult | null {
+    const row = this.db.prepare(`SELECT attempt.result_json FROM session_tool_turns AS turn
+      JOIN session_tool_attempts AS attempt ON attempt.session_id = turn.session_id AND attempt.generation = turn.generation
+      WHERE turn.session_id = ? AND turn.session_epoch = ? AND turn.inbound_message_id = ? AND turn.execution_id = ?
+        AND turn.owner_id != ? AND turn.state IN ('recovered', 'finalized') AND turn.generation LIKE 'heartbeat:%'
+        AND attempt.name = ? AND attempt.input_json = ? AND attempt.result_json IS NOT NULL
+      ORDER BY turn.created_at DESC, attempt.invocation DESC LIMIT 1`)
+      .get(identity.sessionId, identity.sessionEpoch, identity.inboundMessageId, identity.executionId,
+        identity.ownerId, name, JSON.stringify(input)) as { result_json: string } | undefined;
+    return row ? JSON.parse(row.result_json) as ToolResult : null;
   }
 
   /** Index a message in the FTS5 table for full-text search */
@@ -744,12 +984,14 @@ export class StateStore {
     // Any history REWRITE invalidates the frozen wire prefix: the stored
     // payload no longer corresponds to the internal history, and the next
     // payload must be a fresh serialization (cache-breaking by nature).
-    try { this.clearWirePrefix(sessionId); } catch { /* table may predate */ }
     const del = this.db.prepare('DELETE FROM messages WHERE session_id = ?');
     const ins = this.db.prepare(
       'INSERT INTO messages (session_id, message_id, execution_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
     );
     const txn = this.db.transaction(() => {
+      // Prefix invalidation and projection replacement commit together. A
+      // failed insert must retain the exact prior provider cache identity.
+      this.clearWirePrefix(sessionId);
       del.run(sessionId);
       for (const msg of messages) {
         const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
@@ -1232,6 +1474,8 @@ export class StateStore {
   /** Delete a session and all its messages */
   deleteSession(id: string): boolean {
     const txn = this.db.transaction(() => {
+      this.db.prepare('DELETE FROM session_tool_attempts WHERE session_id = ?').run(id);
+      this.db.prepare('DELETE FROM session_tool_turns WHERE session_id = ?').run(id);
       this.db.prepare('DELETE FROM messages_fts WHERE session_id = ?').run(id);
       this.db.prepare('DELETE FROM messages WHERE session_id = ?').run(id);
       this.db.prepare('DELETE FROM session_message_transcript WHERE session_id = ?').run(id);

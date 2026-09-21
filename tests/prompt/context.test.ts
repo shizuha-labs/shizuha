@@ -5,6 +5,7 @@ import {
   getSafetyFactor,
   needsCompaction,
   nextProviderCallFits,
+  stripStaleWorkingImages,
 } from '../../src/prompt/context.js';
 import type { Message } from '../../src/agent/types.js';
 
@@ -96,6 +97,44 @@ describe('estimateTokens', () => {
     const oneTokens = estimateTokens(one);
     const twoTokens = estimateTokens(two);
     expect(twoTokens).toBeGreaterThan(oneTokens);
+  });
+});
+
+describe('stripStaleWorkingImages', () => {
+  function shot(id: string, bytes: string): Message {
+    return {
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        toolUseId: id,
+        content: `Screenshot ${id}`,
+        image: { base64: bytes, mediaType: 'image/png' },
+      }],
+    };
+  }
+
+  it('keeps the newest screenshot and drops older ones from the working set', () => {
+    const source = [shot('a', 'AAAA'), shot('b', 'BBBB'), shot('c', 'CCCC')];
+    const { messages, stripped } = stripStaleWorkingImages(source, 1);
+    expect(stripped).toBe(2);
+    expect(source[0]).toEqual(shot('a', 'AAAA'));
+    const remaining = messages.flatMap((message) =>
+      Array.isArray(message.content)
+        ? message.content.filter((block) => block.type === 'tool_result' && 'image' in block && block.image)
+        : [],
+    );
+    expect(remaining).toHaveLength(1);
+    expect((remaining[0] as { image?: { base64: string } }).image?.base64).toBe('CCCC');
+    expect(JSON.stringify(messages[0])).toContain('Stale screenshot omitted from working context');
+    expect(JSON.stringify(messages[1])).toContain('Stale screenshot omitted from working context');
+    expect(JSON.stringify(messages[2])).not.toContain('Stale screenshot omitted');
+  });
+
+  it('is a no-op when the working set already has at most keepNewest images', () => {
+    const source = [shot('only', 'XXXX')];
+    const { messages, stripped } = stripStaleWorkingImages(source, 1);
+    expect(stripped).toBe(0);
+    expect(messages).toBe(source);
   });
 });
 
@@ -196,12 +235,14 @@ describe('PLAT-4192 cortex-tier compaction threshold', () => {
   // summary until the original task was gone. The trigger now tracks the
   // announced window; TTFT tuning moves to the per-agent env knobs.
   it('scales the trigger with the announced window instead of a flat cap', () => {
+    // PLAT-9194: default fraction is T_high = 0.60 (deterministic band with
+    // the 0.40 hierarchical-pass floor); window-scaling principle unchanged.
     expect(compactionThresholdFor(maxTokens) * maxTokens)
-      .toBe(Math.round(maxTokens * 0.75));
-    expect(needsCompaction(messages, maxTokens, 'DeepSeek-V4-Flash', 0, 0, 196_608)).toBe(false);
-    expect(needsCompaction(messages, maxTokens, 'DeepSeek-V4-Flash', 0, 0, 196_609)).toBe(true);
+      .toBe(Math.round(maxTokens * 0.60));
+    expect(needsCompaction(messages, maxTokens, 'DeepSeek-V4-Flash', 0, 0, 157_286)).toBe(false);
+    expect(needsCompaction(messages, maxTokens, 'DeepSeek-V4-Flash', 0, 0, 157_287)).toBe(true);
     expect(compactionThresholdFor(524_288) * 524_288)
-      .toBe(Math.round(524_288 * 0.75));
+      .toBe(Math.round(524_288 * 0.60));
   });
 
   it('never lets a larger window compact earlier than a smaller one', () => {
@@ -219,9 +260,10 @@ describe('PLAT-4192 cortex-tier compaction threshold', () => {
     // 2026-08-05 (shizuha2): the former per-model-name tier check silently
     // excluded a variant spelling and its branch's trigger coincided with the
     // hard-fit ceiling, so proactive compaction never fired. The rule is now a
-    // pure function of the window: 0.75 × 262,144 = 196,608 for everything,
-    // comfortably below the 212,992 hard-fit ceiling (49,152 headroom).
-    expect(compactionThresholdFor(maxTokens) * maxTokens).toBe(Math.round(maxTokens * 0.75));
+    // pure function of the window: 0.60 × 262,144 = 157,286 for everything
+    // (PLAT-9194 T_high), comfortably below the 212,992 hard-fit ceiling
+    // (49,152 headroom).
+    expect(compactionThresholdFor(maxTokens) * maxTokens).toBe(Math.round(maxTokens * 0.60));
     expect(compactionThresholdFor(maxTokens) * maxTokens)
       .toBeLessThan(maxTokens - 49_152);
   });
@@ -237,9 +279,10 @@ describe('PLAT-4192 cortex-tier compaction threshold', () => {
       expect(compactionThresholdFor(maxTokens) * maxTokens).toBe(212_992);
       process.env.SHIZUHA_CORTEX_COMPACTION_TRIGGER_TOKENS = '80000junk';
       // Invalid absolute override → falls back to the window-scaled default
-      // (was a flat 64_000 before the 2026-08-04 inversion fix).
+      // (was a flat 64_000 before the 2026-08-04 inversion fix; the default
+      // fraction is now the PLAT-9194 T_high = 0.60).
       expect(compactionThresholdFor(maxTokens) * maxTokens)
-        .toBe(Math.round(maxTokens * 0.75));
+        .toBe(Math.round(maxTokens * 0.60));
     } finally {
       if (prior === undefined) delete process.env.SHIZUHA_CORTEX_COMPACTION_TRIGGER_TOKENS;
       else process.env.SHIZUHA_CORTEX_COMPACTION_TRIGGER_TOKENS = prior;
@@ -395,9 +438,9 @@ describe('compaction trigger is a pure function of the window — no model-name 
   // trigger keys ONLY on the window size the provider announces.
   const WINDOW = 524_288;
 
-  it('every 524K model compacts at the same 0.75 trigger regardless of name', () => {
+  it('every 524K model compacts at the same 0.60 trigger regardless of name', () => {
     const expected = compactionThresholdFor(WINDOW);
-    expect(Math.round(expected * WINDOW)).toBe(Math.round(WINDOW * 0.75));
+    expect(Math.round(expected * WINDOW)).toBe(Math.round(WINDOW * 0.60));
   });
 
   it('the trigger is strictly below the backend fit ceiling', () => {
@@ -422,11 +465,11 @@ describe('raw-floor safety net — stale anchor must not suppress compaction (20
   // compacting. The raw-floor check makes needsCompaction fire on the raw
   // (uninflated) full-context estimate so a stale anchor can never win.
   const WINDOW = 524_288;
-  const trigger = Math.round(WINDOW * compactionThresholdFor(WINDOW)); // 0.75 → 393,216
+  const trigger = Math.round(WINDOW * compactionThresholdFor(WINDOW)); // PLAT-9194 T_high 0.60 → 307,200
 
   it('compacts when raw full-context exceeds threshold even if the anchor under-reports', () => {
-    // Build a transcript whose raw estimate alone exceeds the 0.75 trigger.
-    // ~4000 tokens * 100 messages = 400K raw (> 393,216) regardless of anchor.
+    // Build a transcript whose raw estimate alone exceeds the 0.60 trigger.
+    // ~4000 tokens * 100 messages = 400K raw (> 307,200) regardless of anchor.
     const longText = 'word '.repeat(4000); // ~4000 tokens
     const messages: Message[] = Array.from({ length: 100 }, (_, i) => ({
       role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
@@ -460,7 +503,7 @@ describe('raw-floor safety net — stale anchor must not suppress compaction (20
       messages.push({ role: 'user', content: 'normal turn text '.repeat(40) });
       messages.push({ role: 'assistant', content: 'processing '.repeat(20) });
     }
-    // ~1.6M chars ≈ 400K tokens raw — enough alone to cross the 393,216 trigger.
+    // ~1.6M chars ≈ 400K tokens raw — enough alone to cross the 307,200 trigger.
     messages.push({
       role: 'user',
       content: [{ type: 'tool_result', toolUseId: 'tc-big', content: 'data '.repeat(400_000) }],
@@ -475,18 +518,21 @@ describe('paired-baseline exemption — anchored truth beats raw overcount (agen
   const WINDOW = 524_288;
 
   it('does NOT compact a session with real headroom when the anchor pair is present', () => {
-    // agent-ryo: provider truth 324K on a 524K window (62%), but the raw
-    // char-based estimate of the same history reads ~20% higher and crossed
-    // the 0.75 trigger, extractively collapsing 529 messages to 6. With the
-    // PAIRED baseline (raw estimate captured for the exact anchored request),
-    // growth is differential: estimated = 324K + 1.1×(rawNow − rawBaseline).
+    // agent-ryo: provider truth 280K on a 524K window (~53%, inside the
+    // PLAT-9194 steady-state band [40%, 60%]), but the raw char-based estimate
+    // of the same history reads ~20% higher and crossed the trigger,
+    // extractively collapsing 529 messages to 6. With the PAIRED baseline
+    // (raw estimate captured for the exact anchored request), growth is
+    // differential: estimated = 280K + 1.1×(rawNow − rawBaseline).
+    // (Originally 324K/62% under the 0.75 trigger; the PLAT-9194 T_high=0.60
+    // fires at 62% BY DESIGN, so the fixture moved inside the band.)
     const longText = 'word '.repeat(4000);
     const messages: Message[] = Array.from({ length: 100 }, (_, i) => ({
       role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
       content: longText,
     }));
     const rawNow = 400_000; // what the raw estimator reads for this history
-    const providerTruth = 324_286; // what the provider actually tokenized
+    const providerTruth = 280_000; // what the provider actually tokenized
     // Baseline captured at the last request — same history, so ≈ rawNow.
     expect(
       needsCompaction(messages, WINDOW, 'DeepSeek-V4-Flash', 0, 0, providerTruth, rawNow),

@@ -17,6 +17,7 @@
  */
 
 import { statSync as fsStatSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { BUILTIN_TOOLSETS } from '../tools/toolsets.js';
 import { assertWorkspaceDir } from '../utils/fs.js';
 
@@ -139,6 +140,50 @@ export function requireOptionalNonEmpty(
 export const CHANNEL_MODES = ['mention', 'dm', 'all'] as const;
 export type ChannelModeOpt = (typeof CHANNEL_MODES)[number];
 
+/** Maximum accepted length for a --model selector (SCLI-564). */
+export const MODEL_MAX_LENGTH = 2048;
+
+/**
+ * Optional --model selector that must be semantically valid WHEN present
+ * (SCLI-564). A model selector is an authority/routing input written into
+ * startup summaries and provider/client construction, so an invalid explicit
+ * value must fail preflight BEFORE any auth, state write, provider/client
+ * construction, listener binding, or startup logging.
+ *
+ * Rejects: explicit-empty/whitespace-only, whitespace/control-bearing (space,
+ * TAB, LF, ESC, DEL, Unicode em-space), and over-limit (>2048) values. Absent/
+ * undefined stays optional. The diagnostic never reflects raw control bytes.
+ */
+export function requireOptionalModel(
+  field: string,
+  value: unknown,
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = String(value);
+  if (raw.trim() === '') {
+    throw new OptionPreflightError(
+      field,
+      '',
+      `Invalid --${field} ${JSON.stringify('')}; expected a non-empty model selector`,
+    );
+  }
+  if (/[\s\u0000-\u001f\u007f]/.test(raw)) {
+    throw new OptionPreflightError(
+      field,
+      '',
+      `Invalid --${field}: model selector must not contain whitespace or control characters`,
+    );
+  }
+  if (raw.length > MODEL_MAX_LENGTH) {
+    throw new OptionPreflightError(
+      field,
+      '',
+      `Invalid --${field}: exceeds ${MODEL_MAX_LENGTH} characters`,
+    );
+  }
+  return raw;
+}
+
 /**
  * Canonical decimal TCP port in 1..65535.
  * Rejects non-decimal junk suffixes, negatives, zero, and >65535.
@@ -183,6 +228,64 @@ export function requirePort(
     );
   }
   return n;
+}
+
+/**
+ * Bind-host grammar (SCLI-555): accepts only a bounded hostname/IP/address
+ * compatible with the listener API. Rejects empty, whitespace/control,
+ * path-like (`../tmp/socket`), URL-like (`http://127.0.0.1`), overlong
+ * (>= 2048-byte hostname), and any character outside the hostname/IP charset —
+ * BEFORE any session/auth/skill/child/metrics/listener work so the failure is
+ * a bounded `--host` diagnostic, never a raw Node DNS/bind stack.
+ */
+export function requireBindHost(field: string, value: unknown): string {
+  const raw = String(value ?? '');
+  if (raw.trim() === '') {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; expected a non-empty host/address`,
+    );
+  }
+  if (/[\s\u0000-\u001f]/.test(raw)) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; expected a host/address with no whitespace/control characters`,
+    );
+  }
+  if (raw.length > 255) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      // Wording note (SCLI-555 rebase): must not contain the substring "at " —
+      // the SCLI-566 bounded-diagnostic assertion forbids /at / to exclude raw
+      // stack lines ("at fn (...)"), and "at most" tripped it (run 6781).
+      `Invalid --${field} ${JSON.stringify(raw.length > 64 ? `${raw.slice(0, 64)}…` : raw)}; host/address exceeds the 255-character limit`,
+    );
+  }
+  if (raw.includes('/') || raw.includes('\\') || raw.includes('..')) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; expected a hostname/IP address, not a path`,
+    );
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; expected a hostname/IP address, not a URL`,
+    );
+  }
+  if (!/^[A-Za-z0-9.:\[\]-]+$/.test(raw)) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; expected a hostname/IP address (letters, digits, '.', ':', '-', '[', ']')`,
+    );
+  }
+  return raw;
 }
 
 export function requireNonNegativeInt(
@@ -262,6 +365,89 @@ export function requireFiniteNumber(
   return n;
 }
 
+/**
+ * Canonical bind host for a listener (SCLI-566).
+ *
+ * Rejects pre-init, before any DNS/socket/bind work:
+ *  - explicit-empty / whitespace / control-bearing values (never an
+ *    empty-host listener bind),
+ *  - malformed values (path separators, bare colons, brackets, oversized),
+ *  - syntactically invalid IP/hostname values,
+ *  - and — for a syntactically valid hostname that does not resolve — a
+ *    bounded diagnostic instead of a raw `node:dns` getaddrinfo stack.
+ *
+ * A valid explicit IP or resolvable hostname passes through unchanged.
+ */
+export function requireHost(field: string, value: unknown, optional = false): string | undefined {
+  if (value === undefined || value === null) {
+    if (optional) return undefined;
+    throw new OptionPreflightError(field, '', `Missing required option --${field}`);
+  }
+  const raw = String(value);
+  if (raw.trim() === '' || /[\s\u0000-\u001f]/.test(raw)) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; expected a non-empty host/address with no whitespace/control characters`,
+    );
+  }
+  if (raw.length > 253) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; host/address exceeds 253 characters`,
+    );
+  }
+  // Path separators and bare colons (outside a bracketed IPv6 literal) are
+  // never valid listener hosts.
+  if (raw.includes('/')) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; expected a host/address, not a path`,
+    );
+  }
+  const bracketedIpv6 = /^\[[0-9a-fA-F:.]+\]$/.test(raw);
+  if (!bracketedIpv6 && raw.includes(':')) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; expected a host/address (IPv6 must be bracketed)`,
+    );
+  }
+  if (raw.includes('[') || raw.includes(']')) {
+    if (!bracketedIpv6) {
+      throw new OptionPreflightError(
+        field,
+        raw,
+        `Invalid --${field} ${JSON.stringify(raw)}; unexpected brackets in host/address`,
+      );
+    }
+  }
+
+  // Strip brackets for an IPv6 literal.
+  const candidate = bracketedIpv6 ? raw.slice(1, -1) : raw;
+  if (isIP(candidate) !== 0) {
+    return raw; // Valid IPv4/IPv6 literal — no DNS needed.
+  }
+
+  // Hostname grammar: dot-separated labels of letters/digits/hyphens, each
+  // 1-63 chars, not starting/ending with a hyphen.
+  if (!/^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(candidate)) {
+    throw new OptionPreflightError(
+      field,
+      raw,
+      `Invalid --${field} ${JSON.stringify(raw)}; expected a valid hostname or IP address`,
+    );
+  }
+
+  // A syntactically valid hostname that does not resolve is caught at the
+  // listener boundary (server.ts) and converted to a bounded diagnostic —
+  // never a raw `node:dns` getaddrinfo stack. No DNS work happens here:
+  // this preflight is purely syntactic, before any DNS/socket/bind work.
+  return raw;
+}
+
 export interface CommonAgentOpts {
   mode?: unknown;
   thinking?: unknown;
@@ -289,6 +475,10 @@ export interface CommonAgentOpts {
   toolset?: unknown;
   /** Optional working directory — when present it must resolve to a directory. */
   cwd?: unknown;
+  /** Optional --model selector — non-empty, no whitespace/control, bounded (SCLI-564). */
+  model?: unknown;
+  /** Optional inline context prompt — non-empty, no control chars, bounded length. */
+  contextPrompt?: unknown;
 }
 
 export function validateCommonAgentOptions(opts: CommonAgentOpts): {
@@ -308,6 +498,8 @@ export function validateCommonAgentOptions(opts: CommonAgentOpts): {
   contextPromptFile?: string;
   toolset?: ToolsetOpt;
   cwd?: string;
+  model?: string;
+  contextPrompt?: string;
 } {
   // SCLI-492/SCLI-418: optional enums fail CLOSED on explicit-empty/whitespace.
   const modeOptional = opts.optionalEnums === true || opts.mode === undefined;
@@ -368,18 +560,14 @@ export function validateCommonAgentOptions(opts: CommonAgentOpts): {
     ? requirePort('imessage-webhook-port', opts.imessageWebhookPort)
     : undefined;
 
-  // Optional bind host: non-empty, no whitespace/control (rejects --host=).
+  // Optional bind host: bounded hostname/IP/address grammar (SCLI-555).
+  // Rejects empty, whitespace/control, path-like, URL-like, overlong, and
+  // out-of-charset values before any listener/DNS work. Supersedes the
+  // earlier requireHost bind-host check (SCLI-566 lineage): requireBindHost
+  // is a strict superset of its rejections.
   let host: string | undefined;
   if (opts.host !== undefined && opts.host !== null) {
-    const rawHost = String(opts.host);
-    if (rawHost.trim() === '' || /[\s\u0000-\u001f]/.test(rawHost)) {
-      throw new OptionPreflightError(
-        'host',
-        rawHost,
-        `Invalid --host ${JSON.stringify(rawHost)}; expected a non-empty host/address with no whitespace/control characters`,
-      );
-    }
-    host = rawHost;
+    host = requireBindHost('host', opts.host);
   }
 
   // Optional context-prompt file: non-empty path; reject FIFOs (they would
@@ -430,10 +618,62 @@ export function validateCommonAgentOptions(opts: CommonAgentOpts): {
     }
   }
 
+  // Optional model selector: non-empty, no whitespace/control/newline. SCLI-588:
+  // a malformed --model must fail locally and finitely BEFORE any session
+  // creation, provider dispatch, or durable state mutation — never hang trying
+  // to pull a garbage selector or create state.db for it.
+  let model: string | undefined;
+  if (opts.model !== undefined && opts.model !== null) {
+    const rawModel = String(opts.model);
+    if (rawModel.trim() === '' || /[\s\u0000-\u001f\u007f]/.test(rawModel)) {
+      throw new OptionPreflightError(
+        'model',
+        rawModel,
+        `Invalid --model ${JSON.stringify(rawModel)}; expected a non-empty model selector with no whitespace or control characters`,
+      );
+    }
+    model = rawModel;
+  }
+
+  // Optional inline context prompt (SCLI-547): reject explicit-empty/blank,
+  // control-bearing (ANSI escape, embedded LF/TAB, DEL), and over-limit values
+  // BEFORE any filesystem/child-process/listener/runtime work. The context
+  // prompt is written into workspace instruction files (AGENTS.md etc.), so a
+  // malformed payload is an instruction-file trust boundary — it must never
+  // reach a write. Multi-line prompts go through --context-prompt-file, which
+  // is validated separately (non-empty, regular file).
+  let contextPrompt: string | undefined;
+  if (opts.contextPrompt !== undefined && opts.contextPrompt !== null) {
+    const rawPrompt = String(opts.contextPrompt);
+    if (rawPrompt.trim() === '') {
+      throw new OptionPreflightError(
+        'context-prompt',
+        '',
+        `Invalid --context-prompt ${JSON.stringify('')}; expected a non-empty prompt`,
+      );
+    }
+    if (/[\u0000-\u001f\u007f]/.test(rawPrompt)) {
+      throw new OptionPreflightError(
+        'context-prompt',
+        rawPrompt,
+        `Invalid --context-prompt: control characters are not allowed (use --context-prompt-file for multi-line prompts)`,
+      );
+    }
+    if (rawPrompt.length > 4096) {
+      throw new OptionPreflightError(
+        'context-prompt',
+        rawPrompt,
+        `Invalid --context-prompt: exceeds 4096 characters (use --context-prompt-file for larger prompts)`,
+      );
+    }
+    contextPrompt = rawPrompt;
+  }
+
   return {
     mode, thinking, effort, port, maxTurns, temperature, sandbox,
     lineWebhookPort, whatsappWebhookPort, imessageWebhookPort,
-    discordMode, slackMode, host, contextPromptFile, toolset, cwd,
+    discordMode, slackMode, host, contextPromptFile, toolset, cwd, contextPrompt,
+    model: requireOptionalModel('model', opts.model),
   };
 }
 

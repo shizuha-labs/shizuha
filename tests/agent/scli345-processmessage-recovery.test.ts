@@ -122,6 +122,7 @@ describe('SCLI-345 processMessage production second cycle', () => {
     const ch = mockChannel('ch-1');
     agent.channels = new Map([['ch-1', ch]]);
     agent.running = true;
+    agent.injectHeartbeatTaskSnapshot = vi.fn(async () => null);
     return agent;
   }
 

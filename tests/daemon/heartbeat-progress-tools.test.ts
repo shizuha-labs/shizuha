@@ -33,7 +33,7 @@ function turn(names: string[], { failed = false } = {}) {
 }
 
 describe('SCLI work tools count as progress', () => {
-  for (const tool of ['bash', 'edit', 'write', 'notebook', 'apply_patch', 'task']) {
+  for (const tool of ['edit', 'write', 'notebook', 'apply_patch', 'task']) {
     it(`counts ${tool} as a progress event`, () => {
       const record = recordHeartbeatQueueDrainTurn(`agent-${tool}`, turn([tool]) as never);
       expect(
@@ -44,6 +44,15 @@ describe('SCLI work tools count as progress', () => {
     });
   }
 
+  it('counts bash as progress only when the same drain also mutated something', () => {
+    const record = recordHeartbeatQueueDrainTurn(
+      'agent-bash-with-edit',
+      turn(['bash', 'edit']) as never,
+    );
+    expect(record.progressEventCount).toBeGreaterThan(0);
+    expect(record.outcome).toBe('worked_task');
+  });
+
   it('a working SCLI turn is worked_task, not needs_help', () => {
     // shion's shape: ready work AND real tool use, several heartbeats deep.
     const outcome = evaluateHeartbeatQueueDrainOutcome({
@@ -53,6 +62,54 @@ describe('SCLI work tools count as progress', () => {
       needsHelpAfter: 2,
     });
     expect(outcome.outcome).toBe('worked_task');
+  });
+});
+
+describe('bash-only completed heartbeats are not progress (Sato 2026-08-17)', () => {
+  it('does not count a bash-only drain as progress', () => {
+    const record = recordHeartbeatQueueDrainTurn(
+      'agent-sato-reread',
+      turn(['bash', 'bash']) as never,
+    );
+    expect(record.progressEventCount).toBe(0);
+  });
+
+  it('does not count exec_command-only as progress', () => {
+    const record = recordHeartbeatQueueDrainTurn(
+      'agent-exec-only',
+      turn(['exec_command']) as never,
+    );
+    expect(record.progressEventCount).toBe(0);
+  });
+
+  it('escalates a ready seat that only shells on consecutive heartbeats', () => {
+    const id = `sato-spin-${Math.abs(Date.now() % 100000)}`;
+    const first = recordHeartbeatQueueDrainTurn(id, turn(['bash']) as never);
+    expect(first.outcome).not.toBe('worked_task');
+    const second = recordHeartbeatQueueDrainTurn(id, turn(['bash', 'bash']) as never);
+    expect(second.outcome).toBe('needs_help');
+  });
+
+  it('Pulse-observed bash-only heartbeats do not count as worked_task', () => {
+    const id = `sato-pulse-bash-${Math.abs((Date.now() + 7) % 100000)}`;
+    const drain = {
+      toolCalls: [
+        { name: 'mcp__shizuha-pulse__pulse_get_my_alerts' },
+        { name: 'mcp__shizuha-pulse__pulse_get_my_tasks' },
+        { name: 'bash' },
+      ],
+      toolResults: [
+        { isError: false, content: 'No firing alerts' },
+        { isError: false, content: 'Found 3 task(s) — 3 actionable.\n\n- **BKSK-5**: x\n  Status: in_progress | Priority: urgent\n' },
+        { isError: false, content: 'ok' },
+      ],
+    };
+    const first = recordHeartbeatQueueDrainTurn(id, drain as never);
+    expect(first.progressEventCount).toBe(0);
+    expect(first.readyTaskCount).toBeGreaterThan(0);
+    expect(first.outcome).toBe('ready_no_progress');
+    const second = recordHeartbeatQueueDrainTurn(id, drain as never);
+    expect(second.outcome).toBe('needs_help');
   });
 });
 

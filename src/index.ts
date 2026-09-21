@@ -1,9 +1,13 @@
 import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { Command } from 'commander';
+import { CLI_VERSION } from './shared/version.js';
 import { runAgent, createTurnTelemetrySink, setActiveTelemetryWindow } from './agent/loop.js';
 import { TurnTelemetryWindow, recordTurnTelemetry } from './telemetry/turn-telemetry.js';
 import {
   classifyPromptSource,
+  classifyPromptText,
   estimatePromptTokenBudget,
   heartbeatBudgetConfig,
   type HeartbeatCompactionAction,
@@ -12,6 +16,7 @@ import { StruggleAnalyzer } from './agent/struggle-analyzer.js';
 import { setupStrugglePulseAutoFiler } from './telemetry/struggle-auto-filer.js';
 import { toNDJSON } from './events/stream.js';
 import { writeExecEvent, type ExecAcc } from './cli/exec-channel.js';
+import { validateImageSelector } from './cli/image-selector.js';
 import { loadConfig } from './config/loader.js';
 import { redactConfigForOutput } from './config/redaction.js';
 import { launchTUI } from './tui/App.js';
@@ -19,6 +24,7 @@ import { StateStore } from './state/store.js';
 import type { AgentConfig, MCPServerConfig } from './agent/types.js';
 import type { PermissionMode } from './permissions/types.js';
 import { logger } from './utils/logger.js';
+import { assertWorkspaceDir } from './utils/fs.js';
 import { inert, isInert } from './utils/display.js';
 import {
   BackgroundTaskWaitController,
@@ -27,16 +33,21 @@ import {
 } from './agent/background-task-wait.js';
 import {
   exitOnOptionPreflightError,
+  OptionPreflightError,
   preflightOrExit,
+  requireOptionalEnumNonEmpty,
   requireOptionalNonEmpty,
+  PERMISSION_MODES,
+  validateCommonAgentOptions,
 } from './cli/option-preflight.js';
+import { preflightMcpServersOrExit } from './cli/mcp-preflight.js';
 import {
-  AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
   incompleteTurnError,
   MAX_THINKING_ONLY_RECOVERY,
   shouldContinueAutonomousMaxTokens,
 } from './agent/incomplete-turn.js';
 import { reasoningTextFromContent } from './agent/content.js';
+import { versionQueryError } from './cli/version-query.js';
 
 // Keep CLI output clean from Node runtime deprecation warnings.
 process.noDeprecation = true;
@@ -44,12 +55,42 @@ process.noDeprecation = true;
 
 const program = new Command();
 program.option('--profile <name>', 'Plugin profile: default | fleet');
-program.hook('preAction', (thisCommand) => {
+program.hook('preAction', (thisCommand, actionCommand) => {
   const profile = thisCommand.optsWithGlobals()['profile'];
   if (typeof profile === 'string' && profile.trim()) {
     process.env['SHIZUHA_PROFILE'] = profile.trim();
   }
+  // SCLI-531: root `--json` is only applicable to the root action combined with
+  // -p/--prompt. When it is combined with a named command (regardless of token
+  // order — e.g. `shizuha --json status`), reject fail-closed UNLESS that exact
+  // command declares its own documented structured-output contract (its own
+  // `--json` option, e.g. exec/whoami/pulse list). Without this, `--json status`
+  // / `--json doctor` silently drop the flag and run the human/TUI path with
+  // exit 0, which automation mistakes for NDJSON success.
+  if (program.opts().json && actionCommand !== program) {
+    const hasOwnJson = actionCommand.options.some((o) => o.long === '--json');
+    if (!hasOwnJson) {
+      console.error(
+        `Error: --json is not applicable to the '${actionCommand.name()}' command; use it with -p/--prompt on the root (shizuha --json -p "...") or the command's own structured-output flag`,
+      );
+      process.exit(1);
+    }
+  }
 });
+
+const SHIZUHA_LOGIN_REQUIRED = 'Not logged in. Run: shizuha login';
+
+/**
+ * Enforce the same local Shizuha identity boundary as `auth whoami` before a
+ * command reads or mutates user-owned platform state.
+ */
+async function requireShizuhaLogin(): Promise<boolean> {
+  const { readShizuhaAuth } = await import('./config/shizuhaAuth.js');
+  if (readShizuhaAuth()) return true;
+  console.error(SHIZUHA_LOGIN_REQUIRED);
+  process.exitCode = 1;
+  return false;
+}
 
 function truncateInline(value: string, max = 220): string {
   const normalized = value.replace(/\s+/g, ' ').trim();
@@ -89,8 +130,14 @@ function formatToolInvocation(toolName: string, input: Record<string, unknown>):
 program
   .name('shizuha')
   .description('Shizuha universal coding agent')
-  .version('0.1.0')
+  .version(CLI_VERSION)
   .enablePositionalOptions()
+  // SCLI-580: commander's built-in --help exits before the root action, so an
+  // invalid --mode combined with --help (either order) was masked as success.
+  // exitOverride lets the parse site catch the help exit AFTER commander has
+  // fully parsed the argv (opts are populated) and reject an invalid mode with
+  // the same field-specific diagnostic as the action path.
+  .exitOverride()
   .option('-p, --prompt <text>', 'Run a prompt non-interactively (like exec)')
   .option('--model <model>', 'Model to use')
   .option('--cwd <dir>', 'Working directory')
@@ -109,10 +156,34 @@ program
       maxTurns: opts.maxTurns,
       temperature: opts.temperature,
       sandbox: opts.sandbox,
+      model: opts.model,
     });
 
+    // SCLI-531: root --json is ONLY valid combined with a nonblank -p/--prompt
+    // (the exec-mode NDJSON contract). Bare `--json`, `--json --resume <id>`,
+    // or any other root composition must reject fail-closed BEFORE the
+    // renderer/session/state initialization below — never silently fall through
+    // to a fresh interactive TUI with a polished human frame and exit 0.
+    if (opts.json && !(typeof opts.prompt === 'string' && opts.prompt.trim() !== '')) {
+      console.error(
+        'Error: --json requires -p/--prompt (e.g. shizuha --json -p "..." or shizuha --json --prompt "...")',
+      );
+      process.exit(1);
+    }
+
+    // SCLI-411: an explicit -p/--prompt selects headless execution. A
+    // present-but-empty/whitespace prompt must reject nonzero BEFORE any
+    // auth/provider/TUI/state work — never fall back to interactive mode.
+    if (opts.prompt !== undefined) {
+      try {
+        requireOptionalNonEmpty('prompt', opts.prompt);
+      } catch (err) {
+        exitOnOptionPreflightError(err);
+      }
+    }
+
     // If -p is given, run in exec mode (non-interactive)
-    if (opts.prompt) {
+    if (opts.prompt !== undefined) {
       const config: AgentConfig = {
         model: opts.model,
         cwd: opts.cwd as string,
@@ -166,17 +237,65 @@ program
   .option('--model <model>', 'Override the stored session model')
   .option('--mode <mode>', 'Permission mode (plan/supervised/autonomous)')
   .action((sessionId: string, opts) => {
-    // PLAT-5893/SCLI-178: resume exposes --mode like the root/exec/gateway
-    // actions. Run the same shared option-domain preflight BEFORE any session
-    // load / TUI launch — an invalid/case-mismatched/empty/whitespace --mode
-    // must reject pre-init instead of entering the full resume path and
-    // rendering a blank permission-mode footer.
+    // PLAT-5893/SCLI-178/SCLI-523: resume exposes --mode/--cwd like the
+    // root/exec/gateway actions. Run the same shared option-domain preflight
+    // BEFORE any session load / TUI launch — an invalid/case-mismatched/
+    // empty/whitespace --mode or empty/whitespace/non-directory --cwd must
+    // reject pre-init instead of entering the full resume path and rendering
+    // a blank permission-mode footer or silently accepting a bad cwd override.
     const pf = preflightOrExit({
       mode: opts.mode,
+      model: opts.model,
+      cwd: opts.cwd,
     });
 
+    if (!sessionId.trim() || /^[\s\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+$/.test(sessionId)) {
+      // SCLI-490: an empty/whitespace-only session-id must be rejected before
+      // lookup — otherwise it reaches the identifier-free "Session not found:"
+      // verdict and cannot tell the user whether the argument was missing,
+      // stripped, or actually looked up.
+      console.error('error: session-id must be a non-empty value');
+      process.exitCode = 1;
+      return;
+    }
     if (!isInert(sessionId)) {
       console.error(`Invalid session id: ${inert(sessionId)}`);
+      process.exitCode = 1;
+      return;
+    }
+    // SCLI-418/SCLI-400: validate the optional --mode before any session-store /
+    // TUI init. Explicit-empty (--mode=), whitespace-only, and out-of-domain
+    // values must fail closed with a bounded diagnostic — never reach the state
+    // lookup or launch a fresh TUI with an unknowable permission posture.
+    try {
+      const modeValue = (opts.mode as unknown) ?? undefined;
+      if (modeValue !== undefined) {
+        requireOptionalEnumNonEmpty('mode', modeValue, PERMISSION_MODES);
+      }
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    // SCLI-523: a failed read-only session lookup must be state-free. StateStore
+    // eagerly creates ~/.config/shizuha/state.db on construction, so a syntactically
+    // valid but unknown session id must not mutate a pristine HOME. If no state.db
+    // exists there is nothing to look up — reject before constructing the store.
+    const stateDbPath = path.join(process.env['HOME'] ?? '.', '.config', 'shizuha', 'state.db');
+    if (!fs.existsSync(stateDbPath)) {
+      console.error(`Session not found: ${inert(sessionId)}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    // SCLI-418 acceptance #2: reject a missing session BEFORE any state file is
+    // created. StateStore's constructor eagerly mkdirs + opens + migrates the
+    // DB, so a plain `new StateStore().loadSession(...)` leaves a fresh state.db
+    // behind even on `Session not found`. Probe read-only (no DB -> no session,
+    // state-free) and only open the real store when a session actually exists.
+    if (!StateStore.sessionExists(sessionId)) {
+      console.error(`Session not found: ${inert(sessionId)}`);
       process.exitCode = 1;
       return;
     }
@@ -190,7 +309,7 @@ program
     }
 
     launchTUI({
-      cwd: (opts.cwd as string | undefined) ?? session.cwd,
+      cwd: (pf.cwd as string | undefined) ?? session.cwd,
       model: opts.model as string | undefined,
       mode: pf.mode as PermissionMode | undefined,
       resumeSessionId: sessionId,
@@ -223,7 +342,16 @@ program
       temperature: opts.temperature,
       sandbox: opts.sandbox,
       toolset: opts.toolset,
+      model: opts.model,
     });
+
+    // SCLI-411: exec -p is required; a present-but-empty/whitespace prompt must
+    // reject nonzero locally before any auth/provider work.
+    try {
+      requireOptionalNonEmpty('prompt', opts.prompt);
+    } catch (err) {
+      exitOnOptionPreflightError(err);
+    }
 
     const mcpServers: MCPServerConfig[] = (opts.mcpServer as string[]).map((cmd, i) => ({
       name: `mcp_${i}`,
@@ -231,6 +359,10 @@ program
       command: cmd.split(' ')[0]!,
       args: cmd.split(' ').slice(1),
     }));
+
+    // SCLI-517: fail closed on explicitly-requested --mcp-server entries before
+    // any provider/session/state initialization.
+    await preflightMcpServersOrExit(mcpServers);
 
     const config: AgentConfig = {
       model: opts.model,
@@ -260,15 +392,23 @@ program
     let completeSeen = false;
     const acc: ExecAcc = { finalText: '', failed: false, bufferedDiags: [] };
 
-    for await (const event of runAgentWithPrompt(agentConfig, opts.prompt as string, opts.resume as string | undefined)) {
-      if (event.type === 'error') {
-        hadFatalError = true;
-      } else if (event.type === 'turn_complete') {
-        hadFatalError = false;
-      } else if (event.type === 'complete') {
-        completeSeen = true;
+    try {
+      for await (const event of runAgentWithPrompt(agentConfig, opts.prompt as string, opts.resume as string | undefined, true)) {
+        if (event.type === 'error') {
+          hadFatalError = true;
+        } else if (event.type === 'turn_complete') {
+          hadFatalError = false;
+        } else if (event.type === 'complete') {
+          completeSeen = true;
+        }
+        writeExecEvent(event, isJSON, acc);
       }
-      writeExecEvent(event, isJSON, acc);
+    } catch (err) {
+      // SCLI-517: a requested --mcp-server failed to connect — fail closed with
+      // ONE bounded diagnostic, never a raw Node/bundle stack.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Error: ${msg}`);
+      process.exit(1);
     }
     // Force exit — provider HTTP keep-alive pools (e.g. undici Agent in vllm provider
     // with 60s keepAliveTimeout) keep the event loop alive otherwise, hanging the CLI
@@ -276,6 +416,14 @@ program
     // one-shot; the OS reaps any lingering sockets.
     process.exit(hadFatalError || !completeSeen ? 1 : 0);
   });
+
+/** SCLI-565: true when a --system-prompt override is empty or whitespace-only
+ * (ASCII + Unicode whitespace, e.g. U+00A0, U+2003, U+3000). A blank override
+ * would silently replace the governing instruction scaffold with nothing. */
+export function isBlankSystemPromptValue(value: string): boolean {
+  if (value.trim() === '') return true;
+  return /^[\s\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$/.test(value);
+}
 
 program
   .command('pipe')
@@ -294,9 +442,23 @@ program
       thinking: opts.thinking,
       effort: opts.effort,
       maxTurns: opts.maxTurns,
+      model: opts.model,
     });
 
     const { createInterface } = await import('readline');
+
+    // SCLI-565: an explicitly-provided --system-prompt that is empty or
+    // whitespace-only silently replaces the governing instruction scaffold
+    // with nothing (the warm-pool pipe exits 0 with no diagnostic). Reject it
+    // non-zero BEFORE any session startup or state mutation. Absent option
+    // (undefined) is fine — it means "no override", not "blank override".
+    if (opts.systemPrompt !== undefined && isBlankSystemPromptValue(opts.systemPrompt as string)) {
+      process.stderr.write(
+        'error: --system-prompt must be a non-blank value; empty and ' +
+          'whitespace-only overrides are rejected (SCLI-565)\n',
+      );
+      process.exit(2);
+    }
 
     // Parse MCP servers from name:{jsonconfig} format (from chatbot_service)
     const mcpServers: MCPServerConfig[] = (opts.mcpServer as string[]).map((spec) => {
@@ -369,7 +531,31 @@ program
       }
       const { userContent, incomingSessionId } = classified;
       const sessionKey = incomingSessionId.trim() || DEFAULT_PIPE_SESSION_KEY;
-      const resumeSessionId = pipeSessionMap.get(sessionKey);
+      // PLAT-9185: enforce the runtime lifecycle invariant at the pipe
+      // entrypoint. Autonomous heartbeat/scheduled turns start a CLEAN
+      // session — they must NOT resume the predecessor transcript. Seat
+      // telemetry (2,190 runs, jun): 95.5% of successor heartbeat runs
+      // inherited the prior run's full accumulated context (63% of runs
+      // STARTED above 150K prompt tokens; longest monotone chain 176 runs;
+      // max 373K) because every scheduler tick resumed the persistent
+      // session. Pulse + memory + the working tree are the durable state;
+      // the transcript is not. The predecessor session is disposed
+      // (unload lifecycle) instead of silently retained.
+      const incomingKind = classifyPromptText(userContent);
+      let resumeSessionId = pipeSessionMap.get(sessionKey);
+      if (incomingKind === 'heartbeat' || incomingKind === 'scheduled') {
+        if (resumeSessionId) {
+          try {
+            const { StateStore } = await import('./state/store.js');
+            new StateStore().deleteSession(resumeSessionId);
+          } catch (err) {
+            // Disposal is best-effort hygiene; a failed delete must never
+            // block the turn. The clean-start decision is unaffected.
+            logger.warn({ err, resumeSessionId }, 'heartbeat session disposal failed (non-fatal)');
+          }
+        }
+        resumeSessionId = undefined;
+      }
 
       const config: AgentConfig = {
         model: opts.model as string,
@@ -498,14 +684,17 @@ program
   .option('-p, --port <n>', 'Port number', '8015')
   .option('-h, --host <addr>', 'Host address', '0.0.0.0')
   .action(async (opts) => {
-    // PLAT-5893: legacy serve shares the SCLI-400 port preflight. Invalid ports
-    // reject pre-start with a bounded diagnostic — never a raw ERR_SOCKET_BAD_PORT.
+    // PLAT-5893/SCLI-566: legacy serve shares the SCLI-400 port AND host
+    // preflight. Invalid ports and invalid/empty hosts reject pre-start with a
+    // bounded diagnostic — never a raw ERR_SOCKET_BAD_PORT / node:dns
+    // getaddrinfo stack, and never an empty-host listener bind.
     const pf = preflightOrExit({
       port: opts.port,
       requirePortField: true,
+      host: opts.host,
     });
     const { startServer } = await import('./server.js');
-    await startServer(pf.port!, opts.host as string);
+    await startServer(pf.port!, (pf.host ?? '0.0.0.0') as string);
   });
 
 program
@@ -568,6 +757,7 @@ program
       imessageWebhookPort: opts.imessageWebhookPort,
       host: opts.host,
       contextPromptFile: opts.contextPromptFile,
+      contextPrompt: opts.contextPrompt,
     });
 
     const { AgentProcess } = await import('./gateway/agent-process.js');
@@ -611,6 +801,7 @@ program
       getRuntimeHealth: () => agent.getRuntimeHealth(),
       armRuntimeRollDrain: (request) => agent.armRuntimeRollDrain(request),
       getRuntimeRollDrain: () => agent.runtimeRollDrainSnapshot(),
+      getVoiceS2SHost: () => agent.getVoiceS2SHost(),
     });
     agent.registerChannel(httpChannel);
 
@@ -874,6 +1065,8 @@ program
       requirePortField: true,
       host: opts.host,
       contextPromptFile: opts.contextPromptFile,
+      model: opts.model,
+      contextPrompt: opts.contextPrompt,
     });
     const { startClaudeBridge } = await import('./claude-bridge/index.js');
     if (pf.contextPromptFile) {
@@ -912,15 +1105,33 @@ program
   .option('--agent-name <name>', 'Agent display name')
   .option('--agent-username <username>', 'Agent username')
   .option('--context-prompt <prompt>', 'System prompt appendix')
+  .option('--context-prompt-file <path>', 'System prompt appendix read from a file (avoids the OS argv size limit)')
   .action(async (opts) => {
-    // SCLI-400: semantic preflight before bridge bootstrap.
+    // SCLI-400: semantic preflight before bridge bootstrap. SCLI-558: pass
+    // --cwd through the shared preflight (SCLI-529 contract) so empty /
+    // whitespace / nonexistent / regular-file / FIFO / dangling-symlink values
+    // fail before broker/auth/state/listener work, matching codex/openclaw.
     const pf = preflightOrExit({
       thinking: opts.thinking,
       effort: opts.effort,
       port: opts.port,
       requirePortField: true,
       host: opts.host,
+      cwd: opts.cwd,
+      model: opts.model,
+      contextPrompt: opts.contextPrompt,
+      contextPromptFile: opts.contextPromptFile,
     });
+    let contextPrompt = pf.contextPrompt;
+    if (pf.contextPromptFile) {
+      try {
+        const fsmod = await import('node:fs');
+        contextPrompt = fsmod.readFileSync(pf.contextPromptFile, 'utf-8');
+      } catch (err) {
+        console.error(`Error: Invalid --context-prompt-file ${JSON.stringify(String(pf.contextPromptFile))}; ${(err as Error).message}`);
+        process.exit(1);
+      }
+    }
     const { startAntigravityBridge } = await import('./antigravity-bridge/index.js');
     await startAntigravityBridge({
       port: pf.port!,
@@ -929,8 +1140,8 @@ program
       agentId: opts.agentId as string | undefined,
       agentName: opts.agentName as string | undefined,
       agentUsername: opts.agentUsername as string | undefined,
-      contextPrompt: opts.contextPrompt as string | undefined,
-      cwd: opts.cwd as string,
+      contextPrompt,
+      cwd: pf.cwd,
     });
   });
 
@@ -971,7 +1182,9 @@ program
       requirePortField: true,
       host: opts.host,
       contextPromptFile: opts.contextPromptFile,
+      contextPrompt: opts.contextPrompt,
       cwd: (opts.cwd as string | undefined) ?? '/workspace',
+      model: opts.model,
     });
     const { startCodexBridge } = await import('./codex-bridge/index.js');
     // Prometheus metrics server on :9103 (SCLI-74). The codex-bridge HTTP port
@@ -1015,7 +1228,7 @@ program
   .option('--agent-id <id>', 'Agent identity')
   .option('--agent-name <name>', 'Agent display name')
   .option('--agent-username <username>', 'Agent username')
-  .option('--effort <level>', 'Reasoning effort')
+  .option('--effort <level>', 'Reasoning effort (low/medium/high/xhigh/ultra/max)')
   .option('--thinking <level>', 'Thinking level')
   .option('--context-prompt <prompt>', 'System prompt appendix')
   .option('--context-prompt-file <path>', 'System prompt appendix read from a file (avoids the OS argv size limit)')
@@ -1028,7 +1241,9 @@ program
       requirePortField: true,
       host: opts.host,
       contextPromptFile: opts.contextPromptFile,
+      contextPrompt: opts.contextPrompt,
       cwd: (opts.cwd as string | undefined) ?? '/workspace',
+      model: opts.model,
     });
     const { startOpenClawBridge } = await import('./openclaw-bridge/index.js');
     let contextPrompt = opts.contextPrompt as string | undefined;
@@ -1086,15 +1301,24 @@ program
   )
   .allowUnknownOption(true)
   .action(async (opts) => {
+    // SCLI-403: validate all proxy startup config BEFORE announcing startup or
+    // initializing the stdio loop. Any invalid --upstream-url / --header yields
+    // one concise CLI diagnostic and a nonzero exit — never a raw Node stack.
     const { resolveProxyConfig, runMcpProxy } = await import('./mcp-proxy/server.js');
-    const config = resolveProxyConfig(
-      {
-        name: opts.name as string | undefined,
-        upstreamUrl: opts.upstreamUrl as string | undefined,
-        header: opts.header as string[] | undefined,
-      },
-      process.env,
-    );
+    let config;
+    try {
+      config = resolveProxyConfig(
+        {
+          name: opts.name as string | undefined,
+          upstreamUrl: opts.upstreamUrl as string | undefined,
+          header: opts.header as string[] | undefined,
+        },
+        process.env,
+      );
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exit(1);
+    }
     await runMcpProxy(config);
   });
 
@@ -1109,22 +1333,32 @@ program
   .option('--liveness-interval <ms>', 'Liveness probe interval in ms', '30000')
   .allowUnknownOption(true)
   .action(async (opts) => {
-    const { runMcpMultiplexer } = await import('./mcp-multiplexer/server.js');
+    const { runMcpMultiplexer, validateMcpMultiplexerConfig } = await import('./mcp-multiplexer/server.js');
     const servicesJson = (opts.services as string) || process.env['MCP_MUX_SERVICES'] || '[]';
-    let services: Array<{ name: string; url: string; headers: Record<string, string> }>;
+    let parsedServices: unknown;
     try {
-      services = JSON.parse(servicesJson) as Array<{ name: string; url: string; headers: Record<string, string> }>;
+      parsedServices = JSON.parse(servicesJson);
     } catch {
       console.error('mcp-multiplexer: --services must be valid JSON array');
       process.exit(1);
     }
-    if (!Array.isArray(services) || services.length === 0) {
-      console.error('mcp-multiplexer: at least one upstream service is required');
+    // SCLI-401: validate every service entry and the liveness interval BEFORE
+    // creating connections or announcing startup. Invalid config exits nonzero
+    // with a bounded field/index-specific diagnostic (no raw stack, no bundle
+    // path, no retry loop, no success wording).
+    const validated = validateMcpMultiplexerConfig(parsedServices, opts.livenessInterval as string);
+    if (!validated.ok) {
+      console.error(validated.error);
+      process.exit(1);
+    }
+    const agentAudience = (process.env['AGENT_ID'] || process.env['AGENT_USERNAME'] || '').trim();
+    if (!agentAudience) {
+      console.error('mcp-multiplexer: AGENT_ID or AGENT_USERNAME is required for signed projection audience binding');
       process.exit(1);
     }
     await runMcpMultiplexer({
-      services,
-      livenessIntervalMs: parseInt(opts.livenessInterval as string, 10) || 30000,
+      ...validated.config,
+      agentAudience,
     });
   });
 
@@ -1133,7 +1367,40 @@ program
   .description('Show resolved configuration')
   .option('--cwd <dir>', 'Working directory')
   .action(async (opts) => {
-    const config = await loadConfig(opts.cwd as string);
+    // SCLI-402: an explicit --cwd selector (either placement — before or after
+    // the subcommand) must be authoritative for the resolved config and must
+    // resolve to an existing directory. Never silently fall back to the caller
+    // CWD or exit 0 for a bad path.
+    const globals = program.opts() as Record<string, unknown>;
+    const cwdValue = (opts.cwd ?? globals.cwd) as string | undefined;
+    let workDir: string | undefined;
+    if (cwdValue !== undefined) {
+      try {
+        workDir = assertWorkspaceDir(cwdValue);
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    }
+    // SCLI-440: `config` is a configuration-truth surface. A present-but-
+    // malformed/non-regular/unreadable .mcp.json is NOT equivalent to no
+    // config — fail nonzero with a concise diagnostic BEFORE printing
+    // resolved configuration, naming the path, the problem, and recovery.
+    // (The loader itself still skips unusable candidates so runtime callers
+    // degrade gracefully; this gate is command-level only.)
+    const { inspectMcpJsonCandidate } = await import('./config/loader.js');
+    const cwd = workDir ?? process.cwd();
+    const inspection = await inspectMcpJsonCandidate(cwd);
+    if (inspection.kind === 'suspect') {
+      const message =
+        `Project MCP config ${inspection.path} ${inspection.reason}. ` +
+        'Fix or remove the file, or set SHIZUHA_DISABLE_MCP_JSON=1 to bypass .mcp.json entirely.';
+      console.error(message);
+      process.exitCode = 1;
+      return;
+    }
+    const config = await loadConfig(workDir);
+
     console.log(JSON.stringify(redactConfigForOutput(config), null, 2));
   });
 
@@ -1147,8 +1414,20 @@ devicesCmd
   .command('list')
   .description('List all paired devices')
   .action(async () => {
-    const { listDevices: ld } = await import('./devices/store.js');
-    const devices = ld();
+    if (!(await requireShizuhaLogin())) return;
+    const { listDevices: ld, DeviceStoreCorruptError } = await import('./devices/store.js');
+    let devices;
+    try {
+      devices = ld();
+    } catch (err) {
+      if (err instanceof DeviceStoreCorruptError) {
+        // SCLI-422: a corrupt registry must never render as an empty one.
+        console.error(err.message);
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
     if (devices.length === 0) {
       console.log('No paired devices.');
       return;
@@ -1170,13 +1449,29 @@ devicesCmd
   .command('revoke <deviceId>')
   .description('Revoke a paired device')
   .action(async (deviceId: string) => {
+    if (!(await requireShizuhaLogin())) return;
+    if (deviceId.trim().length === 0) {
+      console.error('Invalid deviceId: must be non-empty after trimming.');
+      process.exitCode = 1;
+      return;
+    }
     if (!isInert(deviceId)) {
       console.error(`Invalid device id: ${inert(deviceId)}`);
       process.exitCode = 1;
       return;
     }
-    const { removeDevice: rd } = await import('./devices/store.js');
-    const ok = rd(deviceId);
+    const { removeDevice: rd, DeviceStoreCorruptError } = await import('./devices/store.js');
+    let ok;
+    try {
+      ok = rd(deviceId);
+    } catch (err) {
+      if (err instanceof DeviceStoreCorruptError) {
+        console.error(err.message);
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
     if (ok) {
       console.log(`Device ${inert(deviceId)} revoked.`);
     } else {
@@ -1190,12 +1485,22 @@ program
   .description('Generate a pairing code for remote device access')
   .option('--show-code', 'Display the pairing code and exit')
   .action(async (opts) => {
+    if (!(await requireShizuhaLogin())) return;
     const { generatePairingCode: gpc, formatCode: fc, CODE_TTL_MS: ttl } = await import('./devices/pairing.js');
-    const { addPendingCode: apc } = await import('./devices/store.js');
+    const { addPendingCode: apc, DeviceStoreCorruptError } = await import('./devices/store.js');
 
     const code = gpc();
     const now = Date.now();
-    apc({ code, createdAt: now, expiresAt: now + ttl });
+    try {
+      apc({ code, createdAt: now, expiresAt: now + ttl });
+    } catch (err) {
+      if (err instanceof DeviceStoreCorruptError) {
+        console.error(err.message);
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
 
     const formatted = fc(code);
     console.log(`\nPairing code: ${formatted}`);
@@ -1240,14 +1545,17 @@ authCmd
 
     if (!token) {
       // Interactive prompt
-      const readline = await import('node:readline');
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      token = await new Promise<string>((resolve) => {
-        rl.question('  Paste your Claude API key or OAuth token: ', (answer) => {
-          rl.close();
-          resolve(answer.trim());
-        });
-      });
+      const { promptRequired, InputCancelledError } = await import('./utils/prompt.js');
+      try {
+        token = await promptRequired('  Paste your Claude API key or OAuth token: ');
+      } catch (err) {
+        if (err instanceof InputCancelledError) {
+          console.error('  Input cancelled (EOF) — no token saved.');
+          process.exitCode = 1;
+          return;
+        }
+        throw err;
+      }
     }
 
     if (!token) {
@@ -1298,14 +1606,17 @@ authCmd
     const { setCortexApiKey, readCredentials } = await import('./config/credentials.js');
 
     if (!key) {
-      const readline = await import('node:readline');
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      key = await new Promise<string>((resolve) => {
-        rl.question('  Paste your Cortex API key (sk-cortex-…): ', (answer) => {
-          rl.close();
-          resolve(answer.trim());
-        });
-      });
+      const { promptRequired, InputCancelledError } = await import('./utils/prompt.js');
+      try {
+        key = await promptRequired('  Paste your Cortex API key (sk-cortex-…): ');
+      } catch (err) {
+        if (err instanceof InputCancelledError) {
+          console.error('  Input cancelled (EOF) — no key saved.');
+          process.exitCode = 1;
+          return;
+        }
+        throw err;
+      }
     }
 
     if (!key) {
@@ -1322,9 +1633,18 @@ authCmd
       console.log('\n  Cortex key already saved.');
       return;
     }
-    setCortexApiKey(key);
+    // SCLI-438: fail closed on a hostile/non-regular credential store or parent
+    // with one concise diagnostic — never a raw stack, never a destructive
+    // replacement, never a hang on a FIFO.
+    try {
+      setCortexApiKey(key);
+    } catch (err) {
+      console.error(`\n  ${(err as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
     console.log('\n  Cortex key saved to ~/.shizuha/credentials.json');
-    console.log('  Use it: shizuha exec -p "hello" --model cortex/DeepSeek-V4-Flash');
+    console.log('  Use it: shizuha exec -p "hello" --model cortex/grok-4.6');
     console.log('  Or just run: shizuha');
   });
 
@@ -1449,7 +1769,8 @@ authCmd
 
     // Shizuha ID
     if (shizuhaStatus.loggedIn) {
-      console.log(`  Shizuha ID: ${shizuhaStatus.username} (logged in)`);
+      const source = shizuhaStatus.source === 'fleet-runtime' ? ' (fleet runtime identity)' : ' (logged in)';
+      console.log(`  Shizuha ID: ${shizuhaStatus.username}${source}`);
     } else {
       console.log('  Shizuha ID: not logged in');
     }
@@ -1529,15 +1850,32 @@ authCmd
   .option('--json', 'Output JSON')
   .option('--live', 'Verify against Shizuha ID before printing')
   .action(async (opts) => {
-    const { readShizuhaAuth, verifyShizuhaAuthIdentity } = await import('./config/shizuhaAuth.js');
-    const auth = readShizuhaAuth();
-    if (!auth) {
-      const message = 'Not logged in. Run: shizuha login';
+    const { readShizuhaAuthSafe, verifyShizuhaAuthIdentity, getShizuhaAuthStatus, resolveRuntimeIdentity } = await import('./config/shizuhaAuth.js');
+    const safe = readShizuhaAuthSafe();
+    if (safe.kind === 'invalid') {
+      // SCLI-439: present-but-corrupt/non-regular store is NOT "logged out".
+      // Report the persisted auth store as suspect with a safe recovery path,
+      // never instructing an ordinary login as if no store existed.
+      const message = `Persisted auth store is corrupt or unreadable (${safe.reason}). Inspect ~/.shizuha/auth.json; safe recovery: remove or repair it, then run: shizuha login`;
+      if (opts.json) console.log(JSON.stringify({ loggedIn: false, error: message, corruptStore: true }, null, 2));
+      else console.error(message);
+      process.exitCode = 1;
+      return;
+    }
+    const status = getShizuhaAuthStatus();
+    if (!status.loggedIn) {
+      const message = SHIZUHA_LOGIN_REQUIRED;
+
       if (opts.json) console.log(JSON.stringify({ loggedIn: false, error: message }, null, 2));
       else console.error(message);
       process.exitCode = 1;
       return;
     }
+    // SCLI-393: a fleet runtime is authenticated via the injected agent
+    // identity (env), not an interactive auth.json. Surface it explicitly.
+    const auth = safe.kind === 'ok' ? safe.state : null;
+    const runtimeIdentity = !auth ? resolveRuntimeIdentity() : null;
+    const username = status.username;
 
     let liveUsername: string | undefined;
     if (opts.live) {
@@ -1547,16 +1885,14 @@ authCmd
         if (opts.json) {
           console.log(JSON.stringify({
             loggedIn: true,
-            username: auth.username,
-            userId: auth.userId,
-            idApiBaseUrl: auth.idApiBaseUrl,
+            username,
+            source: status.source ?? 'interactive',
             liveVerified: false,
             error: (err as Error).message,
           }, null, 2));
         } else {
-          console.log(`Username: ${auth.username}`);
-          if (auth.userId != null) console.log(`User ID: ${auth.userId}`);
-          if (auth.idApiBaseUrl) console.log(`Platform: ${auth.idApiBaseUrl}`);
+          console.log(`Username: ${username}`);
+          if (status.source === 'fleet-runtime') console.log('Source: fleet runtime identity');
           console.log(`Live verification: failed (${(err as Error).message})`);
         }
         process.exitCode = 1;
@@ -1566,11 +1902,12 @@ authCmd
 
     const payload = {
       loggedIn: true,
-      username: liveUsername ?? auth.username,
-      userId: auth.userId,
-      idApiBaseUrl: auth.idApiBaseUrl,
-      accessTokenExpiresAt: auth.accessTokenExpiresAt,
-      refreshTokenExpiresAt: auth.refreshTokenExpiresAt,
+      username: liveUsername ?? username,
+      userId: auth?.userId ?? runtimeIdentity?.userId,
+      idApiBaseUrl: auth?.idApiBaseUrl,
+      source: status.source ?? 'interactive',
+      accessTokenExpiresAt: auth?.accessTokenExpiresAt,
+      refreshTokenExpiresAt: auth?.refreshTokenExpiresAt,
       liveVerified: opts.live ? true : undefined,
     };
 
@@ -1582,6 +1919,7 @@ authCmd
     console.log(`Username: ${payload.username}`);
     if (payload.userId != null) console.log(`User ID: ${payload.userId}`);
     if (payload.idApiBaseUrl) console.log(`Platform: ${payload.idApiBaseUrl}`);
+    if (payload.source === 'fleet-runtime') console.log('Source: fleet runtime identity');
     if (payload.accessTokenExpiresAt) console.log(`Access token expires: ${payload.accessTokenExpiresAt}`);
     if (payload.refreshTokenExpiresAt) console.log(`Refresh token expires: ${payload.refreshTokenExpiresAt}`);
     if (opts.live) console.log('Live verification: ok');
@@ -1725,13 +2063,40 @@ program
 program
   .command('up')
   .description('Start agent runtimes (like tailscale up)')
-  .option('--agent <name>', 'Start specific agent(s) (comma-separated)', '')
+  .option('--agent <name>', 'Start specific agent(s) (comma-separated)')
   .option('--platform <url>', 'Platform URL (default: from login)')
   .option('--bare-metal', 'Run agents as local processes instead of containers')
   .option('--image <image>', 'Docker image for containers', 'shizuha-agent-runtime:latest')
   .option('--foreground', 'Run in foreground instead of daemonizing')
   .option('--no-service', 'Skip service installation (run in foreground only)')
   .action(async (opts) => {
+    // SCLI-563: an explicitly supplied `--agent` is a scope decision and must
+    // never collapse to omission's all-agents default. Commander stores
+    // `undefined` when --agent is omitted but `''` when it is passed empty
+    // (`--agent=` / `--agent ''`), so PRESENCE is the signal, not truthiness.
+    // Reject malformed selectors here — before any auth, state, skill, network,
+    // listener, or daemon work — so an explicit scoped selector can never
+    // silently become an all-agents startup.
+    let agentFilter: string[] = [];
+    if (opts.agent !== undefined) {
+      const spec = String(opts.agent);
+      const shown = JSON.stringify(spec.length > 64 ? `${spec.slice(0, 64)}…` : spec);
+      const reject = (why: string): undefined => {
+        console.error(`Invalid --agent value ${shown}: ${why}`);
+        process.exitCode = 1;
+        return undefined;
+      };
+      if (!spec.trim()) return reject('expected a non-empty agent name; refusing to start all agents');
+      if (/[\u0000-\u001f\u007f]/.test(spec)) return reject('control characters are not allowed');
+      const segments = spec.split(',').map((s) => s.trim());
+      if (segments.some((s) => !s)) return reject('empty agent name in comma-separated list');
+      if (segments.some((s) => s === '.' || s === '..' || /[/\\]/.test(s))) {
+        return reject('agent names must not be paths');
+      }
+      if (spec.length > 2048 || segments.some((s) => s.length > 256)) return reject('agent name is too long');
+      agentFilter = segments;
+    }
+
     const { readShizuhaAuth, getValidShizuhaAccessToken } = await import('./config/shizuhaAuth.js');
     const { startDaemon } = await import('./daemon/manager.js');
     const { isDaemonRunning } = await import('./daemon/state.js');
@@ -1739,6 +2104,16 @@ program
     const fs = await import('node:fs');
     const path = await import('node:path');
     const os = await import('node:os');
+
+    // SCLI-559: validate the final --image selector BEFORE any initialization
+    // or state mutation. Empty/whitespace/control-bearing, URL-shaped, and
+    // unreasonable-length values must fail nonzero with a field-specific
+    // single-line diagnostic and create no HOME/XDG state.
+    const imageErr = validateImageSelector(opts.image as string);
+    if (imageErr) {
+      console.error(`shizuha: invalid --image: ${imageErr}`);
+      process.exit(2);
+    }
 
     // Host-local fleet daemon retirement (k3s cutover): refuse accidental
     // `shizuha up` on hosts that still carry ~/.shizuha/agents.json for the
@@ -1841,11 +2216,6 @@ program
     const wsHost = platformUrl.replace(/^https?:\/\//, '');
     const wsUrl = `${wsProto}://${wsHost}/agent/ws/runner/`;
 
-    // Parse agent filter
-    const agentFilter = (opts.agent as string)
-      ? (opts.agent as string).split(',').map((s: string) => s.trim()).filter(Boolean)
-      : [];
-
     if (!isDaemonReentry) {
       console.log('Shizuha Runtime v0.1.0');
       console.log(`Mode: ${accessToken ? `platform (${identity})` : 'local'}`);
@@ -1874,6 +2244,16 @@ program
 
     // Keep the process alive — the daemon runs forever via HTTP server + intervals
     await new Promise(() => {});
+  });
+
+program
+  .command('desktop')
+  .description('Open Shizuha Desktop — local GUI with Hina-style live voice')
+  .option('--no-open', 'Start/probe the core but do not open a browser')
+  .action(async (opts) => {
+    const { openShizuhaDesktop } = await import('./desktop/launch.js');
+    const code = await openShizuhaDesktop({ openBrowser: opts.open !== false });
+    if (code !== 0) process.exitCode = code;
   });
 
 program
@@ -1915,8 +2295,22 @@ program
       }
     }
 
-    // Also stop any legacy daemon
-    if (stopDaemon()) {
+    // Also stop any legacy daemon. SCLI-587: stopDaemon now waits boundedly for
+    // the daemon + owned children to exit (escalating to SIGKILL) and only
+    // clears PID/state after exit — so a still-alive daemon is reported as a
+    // non-zero actionable error with its live PID state preserved, never a
+    // false "Shizuha stopped."
+    const daemonResult = stopDaemon();
+    if (daemonResult.remainingPids.length > 0) {
+      console.error(
+        `Shizuha daemon PID ${daemonResult.remainingPids.join(', ')} did not stop after SIGTERM` +
+        (daemonResult.escalated ? ' and SIGKILL' : '') + '.',
+      );
+      console.error('Live PID state preserved at ~/.shizuha/daemon.pid — run "shizuha down" again or "shizuha status" to inspect.');
+      process.exitCode = 1;
+      return;
+    }
+    if (daemonResult.stopped) {
       stopped = true;
     }
 
@@ -1945,6 +2339,16 @@ program
   });
 
 program
+  .command('usage')
+  .description('Show remaining Shizuha Code weekly Cortex allowance')
+  .action(async () => {
+    const { fetchCortexUsage, renderCortexUsage } = await import('./provider/cortex-usage.js');
+    const view = await fetchCortexUsage();
+    console.log(renderCortexUsage(view));
+    if (!view.configured) process.exitCode = 2;
+  });
+
+program
   .command('login')
   .description('Authenticate with the Shizuha platform')
   .option('-u, --username <username>', 'Username')
@@ -1963,24 +2367,28 @@ program
     }
 
     const { loginToShizuhaId } = await import('./config/shizuhaAuth.js');
-    const readline = await import('node:readline');
 
     let username = opts.username as string | undefined;
     let password = opts.password as string | undefined;
 
     if (!username || !password) {
-      const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-      });
+      const { promptLine, InputCancelledError } = await import('./utils/prompt.js');
+      const { createInterface } = await import('node:readline');
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
 
-      const ask = (q: string): Promise<string> =>
-        new Promise((resolve) => rl.question(q, resolve));
-
-      if (!username) username = await ask('Username: ');
-      if (!password) password = await ask('Password: ');
-
-      rl.close();
+      try {
+        if (!username) username = await promptLine(rl, 'Username: ');
+        if (!password) password = await promptLine(rl, 'Password: ');
+      } catch (err) {
+        if (err instanceof InputCancelledError) {
+          console.error('Input cancelled (EOF) — login aborted, no credentials saved.');
+          process.exitCode = 1;
+          return;
+        }
+        throw err;
+      } finally {
+        rl.close();
+      }
     }
 
     try {
@@ -2022,18 +2430,55 @@ program
     }
   });
 
+// SCLI-520: `pulse help list surplus` must reject the surplus operand instead
+// of silently printing `pulse list` help and exiting 0. Commander's implicit
+// help command drops surplus operands before dispatch (_dispatchHelpCommand
+// only receives operands[1]); declaring an explicit `help [command]` subcommand
+// makes commander's argument-count validation reject surplus operands with a
+// specific diagnostic, while the action below still shows the target's help.
+pulseCmd
+  .command('help [command]')
+  .description('Display help for a command')
+  .action((command: string | undefined) => {
+    // SCLI-520: explicit-empty / whitespace-only help targets stay fail-closed
+    // (a blank target is not a valid help request — reject, don't fall through
+    // to the generic pulse help page).
+    if (command !== undefined && command.trim() === '') {
+      console.error(`Error: invalid help target ${JSON.stringify(command)}; expected a command name`);
+      process.exitCode = 1;
+      return;
+    }
+    if (command) {
+      const target = pulseCmd.commands.find(
+        (c) => c.name() === command || (typeof c.alias === 'function' && c.alias() === command),
+      );
+      if (target) {
+        target.help();
+        return;
+      }
+      // Unknown help target — mirror commander's error path (help + error).
+      pulseCmd.help({ error: true });
+      return;
+    }
+    pulseCmd.help();
+  });
+
 program
   .command('logout')
   .description('Clear stored authentication')
   .action(async () => {
     const { clearShizuhaAuth } = await import('./config/shizuhaAuth.js');
+    const { clearAllProviderCredentials } = await import('./config/credentials.js');
     const { stopDaemon } = await import('./daemon/manager.js');
 
     // Stop daemon if running
     stopDaemon();
 
-    // Clear auth
+    // SCLI-414: logout must be honest — clear BOTH the platform auth AND all
+    // stored provider credentials (Cortex/OpenAI/Anthropic/Google/Codex/Copilot)
+    // so no provider authority survives a sign-out.
     clearShizuhaAuth();
+    clearAllProviderCredentials();
     console.log('Logged out. Authentication cleared.');
   });
 
@@ -2052,6 +2497,16 @@ program
   .description('Check system health and diagnose issues')
   .option('-m, --model <model>', 'Selected model to probe for live reachability')
   .action(async (opts: { model?: string }) => {
+    // SCLI-579: a supplied-but-blank --model selector must fail closed BEFORE
+    // doctor runs or mutates state. Never treat --model= / whitespace-only as
+    // "no model selected" and certify healthy with exit 0.
+    if (opts.model !== undefined) {
+      try {
+        requireOptionalNonEmpty('model', opts.model);
+      } catch (err) {
+        exitOnOptionPreflightError(err);
+      }
+    }
     const { runDoctor, printChecks } = await import('./commands/doctor.js');
     const checks = await runDoctor(process.cwd(), {
       selectedModel: opts.model || process.env['SHIZUHA_MODEL'] || undefined,
@@ -2064,7 +2519,11 @@ program
 program
   .command('provision-agent <username>')
   .description('Provision a new agent: create shizuha-id account, write scoped .mcp.json, seed OAuth credentials')
-  .option('--role <role>', 'Agent role (reviewer|architect|engineer|qa|security|docs|analytics|devops|social)', 'engineer')
+  // Keep the default inside validateProvisionInputs(), not Commander. That
+  // preserves the only semantic distinction that matters here: option absent
+  // means "engineer", while an explicitly supplied empty value remains ""
+  // and is rejected before account/network/state work.
+  .option('--role <role>', 'Agent role (reviewer|architect|engineer|qa|security|docs|analytics|devops|social)')
   .option('--home <path>', 'Agent home directory (default: /home/<username>)')
   .option('--platform-url <url>', 'Platform base URL (overrides SHIZUHA_PLATFORM_URL)')
   .option('--admin-token <token>', 'Admin token for account approval (overrides SHIZUHA_ADMIN_TOKEN)')
@@ -2101,7 +2560,24 @@ program
     const all = fs.readdirSync(workspacesRoot, { withFileTypes: true })
       .filter(e => e.isDirectory())
       .map(e => e.name);
-    const targets = opts.agent ? all.filter(n => n === opts.agent) : all;
+    // Track option PRESENCE separately from value (SCLI-412): commander sets
+    // `undefined` when --agent is omitted but `''` when it is passed empty
+    // (`-a ''` / `--agent=`). An empty string is falsy, so the old
+    // `opts.agent ? filter : all` collapsed an explicit-empty selector into an
+    // all-workspace force overwrite. Only true option absence may select all
+    // workspaces; a present-but-empty value is a caller error.
+    let targets: string[];
+    const agent = opts.agent !== undefined ? String(opts.agent).trim() : undefined;
+    if (opts.agent !== undefined) {
+      if (!agent) {
+        console.error(`Invalid --agent value: ${JSON.stringify(opts.agent)} — expected a non-empty username; refusing to reseed all workspaces.`);
+        process.exitCode = 1;
+        return;
+      }
+      targets = all.filter(n => n === agent);
+    } else {
+      targets = all;
+    }
     if (targets.length === 0) {
       console.error(opts.agent
         ? `No workspace found for agent '${inert(opts.agent)}' under ${workspacesRoot}`
@@ -2149,7 +2625,126 @@ program
     if (failed > 0) process.exitCode = 1;
   });
 
-program.parse();
+program
+  .command('workspace-gc')
+  .description(
+    'Prune aged per-task scratch in ~/.shizuha/work and ~/.shizuha/tmp (PLAT-6053). ' +
+    'Removes only git clones that are clean + fully pushed + on-branch + no-stash + aged, ' +
+    'and tmp entries older than --days with no live process cwd inside. Never touches ' +
+    'browser/login state, audits, or sessions. DRY-RUN by default (verify-before-destroy).',
+  )
+  .option('--dry-run', 'Log RM/KEEP decisions without deleting (default: true)')
+  .option('--no-dry-run', 'Actually delete aged scratch')
+  .option('--days <n>', 'Prune entries older than N days (default: 7)', '7')
+  .option('--home <dir>', 'Agent home directory (default: $HOME)')
+  .action(async (opts) => {
+    const { runWorkspaceGc } = await import('./workspace-gc.js');
+    const days = Number.parseInt(opts.days as string, 10);
+    const pruneDays = Number.isFinite(days) && days > 0 ? days : 7;
+    const result = await runWorkspaceGc({
+      homeDir: opts.home as string | undefined,
+      pruneDays,
+      dryRun: opts.dryRun !== false,
+    });
+    for (const e of result.entries) {
+      console.log(`${e.decision === 'RM' ? 'RM  ' : 'KEEP'} [${e.area}] ${e.name} — ${e.reason}`);
+    }
+    console.log(
+      `workspace-gc ${result.dryRun ? 'dry-run' : 'done'}: removed=${result.removed} kept=${result.kept} ` +
+        `freedBytes=${result.freedBytes} (pruneDays=${result.pruneDays})`,
+    );
+    if (!result.dryRun && result.removed === 0 && result.kept === 0) {
+      process.exitCode = 0;
+    }
+  });
+
+// SCLI-521: reject structurally invalid argv that carries `--version` / `-V`
+// BEFORE commander's built-in `.version()` can mask it with an eager exit 0.
+// A valid lone version query returns null and commander prints CLI_VERSION.
+const versionQueryErr = versionQueryError(process.argv.slice(2));
+if (versionQueryErr) {
+  console.error(versionQueryErr);
+  process.exit(1);
+}
+
+// SCLI-395: an unknown subcommand must ALWAYS exit nonzero and name the
+// rejected token — including when followed by --help. Commander short-circuits
+// `--help` to root help + exit 0 before its unknown-command path runs, so an
+// arbitrary typo was byte-identical to successful root help for humans and
+// automation. This pre-parse gate rejects the first positional token when it is
+// not a registered command, regardless of trailing flags.
+function rejectUnknownCommand(program: Command, argv: string[]): void {
+  const commandNames = new Set(program.commands.map((c) => c.name()));
+  commandNames.add('help'); // commander auto-registers a help command
+  const valueFlags = new Set<string>();
+  for (const opt of program.options) {
+    if (opt.required || opt.optional) {
+      if (opt.short) valueFlags.add(opt.short);
+      if (opt.long) valueFlags.add(opt.long);
+    }
+  }
+  const args = argv.slice(2);
+  let i = 0;
+  while (i < args.length) {
+    const tok = args[i]!;
+    if (tok === '--') { i += 1; break; }
+    if (tok.startsWith('--')) {
+      if (tok.includes('=')) { i += 1; continue; } // --opt=value
+      i += valueFlags.has(tok) ? 2 : 1;
+      continue;
+    }
+    if (tok.startsWith('-') && tok.length > 1) {
+      i += valueFlags.has(tok) ? 2 : 1;
+      continue;
+    }
+    break; // first positional
+  }
+  const first = args[i];
+  if (first && !commandNames.has(first)) {
+    console.error(`Unknown command '${first}'.`);
+    console.error(`Run '${program.name() || 'shizuha'} --help' to see available commands.`);
+    process.exit(1);
+  }
+}
+
+rejectUnknownCommand(program, process.argv);
+
+// SCLI-580: --help must not mask an invalid --mode. Commander parses the FULL
+// argv (populating opts) before it fires the built-in help exit, so with
+// exitOverride we catch the help exit here and validate the root's parsed
+// option domains first. An invalid/blank --mode combined with --help (either
+// order) now rejects nonzero with the same field-specific diagnostic as the
+// action path; a valid mode (or subcommand help) exits 0 with help already
+// printed by commander.
+try {
+  program.parse();
+} catch (err) {
+  // For help and parse errors, Commander stops before an action starts. Keep
+  // its status and let Node drain normally: forcing process.exit here can
+  // join V8 compiler workers while they wait for a foreground GC, deadlocking
+  // even `serve --help` (nodejs/node#54918, exit-time variant).
+  process.exitCode = (err as { exitCode?: number } | null)?.exitCode ?? 1;
+  if (
+    err &&
+    typeof err === 'object' &&
+    (err as { code?: string }).code === 'commander.helpDisplayed'
+  ) {
+    try {
+      validateCommonAgentOptions({
+        mode: program.opts().mode,
+        thinking: program.opts().thinking,
+        effort: program.opts().effort,
+        maxTurns: program.opts().maxTurns,
+        temperature: program.opts().temperature,
+        sandbox: program.opts().sandbox,
+      });
+    } catch (e) {
+      if (!(e instanceof OptionPreflightError)) throw e;
+      console.error(`Error: ${e.message}`);
+      process.exitCode = 1;
+    }
+  }
+}
 
 // Helper: run agent with an initial user prompt
 import type { AgentEvent } from './events/types.js';
@@ -2159,6 +2754,7 @@ async function* runAgentWithPrompt(
   config: AgentConfig,
   prompt: string,
   resumeSessionId?: string,
+  failClosedMcp = false,
 ): AsyncGenerator<AgentEvent> {
   // We need to inject the user message into the conversation.
   // The cleanest way: wrap runAgent and inject messages into the store.
@@ -2220,9 +2816,17 @@ async function* runAgentWithPrompt(
     model = providerReg.resolveAutoModel();
   }
 
+  // SCLI-623: resolveWithModel() returns BOTH the provider and the canonical
+  // (prefix-stripped) model name. resolveAutoModel() may return a provider-
+  // prefixed spec (e.g. `openai:DeepSeek-V4-Flash` when a custom OpenAI-
+  // compatible endpoint is configured); resolve() alone keeps that prefix on
+  // the local `model` variable, which then gets sent verbatim to the upstream
+  // API (Cortex 404s on `openai:DeepSeek-V4-Flash`). Mirror agent-process.ts.
   let provider;
   try {
-    provider = providerReg.resolve(model);
+    const resolved = providerReg.resolveWithModel(model);
+    provider = resolved.provider;
+    model = resolved.resolvedModel;
   } catch (err) {
     const msg = (err as Error).message;
     // If the error already contains setup instructions (e.g. from codex auth check),
@@ -2298,6 +2902,27 @@ async function* runAgentWithPrompt(
       }
     }
     mcpManager.setToolRegistry(toolRegistry);
+  }
+
+  // SCLI-517: when the caller explicitly requested --mcp-server entries and one
+  // of them failed to connect (spawn/initialize/tools-list), fail closed instead
+  // of silently running with a reduced tool surface. Only failures of the
+  // explicitly-requested servers are fatal; config-file servers keep the
+  // degraded-mode notice path.
+  if (failClosedMcp && (config.mcpServers?.length ?? 0) > 0) {
+    const requested = config.mcpServers ?? [];
+    const requestedNames = new Set(requested.map((s) => s.name));
+    const requestedFailures = mcpManager.failedServers.filter((f) => requestedNames.has(f.name));
+    if (requestedFailures.length > 0) {
+      const failedList = requestedFailures
+        .map((f: { name: string; error: string }) => `- ${f.name}: ${f.error}`)
+        .join('\n');
+      throw new Error(
+        `--mcp-server connection failed (${requestedFailures.length} of ${requested.length} requested server(s) unusable):\n` +
+        failedList +
+        `\n\nFix the --mcp-server value(s) and retry. No provider/session state was initialized.`,
+      );
+    }
   }
 
   const toolSearchConfig = cfg.mcp.toolSearch;
@@ -2830,15 +3455,8 @@ async function* runAgentWithPrompt(
           thinkingOnlyRecoveryCount++;
           logger.warn(
             { turnIndex, attempt: thinkingOnlyRecoveryCount, outputTokens: result.outputTokens, stopReason: result.stopReason },
-            'SCLI: max_tokens hit on a thinking-only autonomous turn — continuing so the model can tool-call',
+            'SCLI: max_tokens hit on a thinking-only autonomous turn — continuing from persisted prefix (no Continue lecture)',
           );
-          const continueMsg: Message = {
-            role: 'user',
-            content: AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
-            timestamp: Date.now(),
-          };
-          messages.push(continueMsg);
-          store.appendMessage(session.id, continueMsg);
           continue;
         }
         const incompleteError = incompleteTurnError(result.stopReason);
@@ -2870,14 +3488,7 @@ async function* runAgentWithPrompt(
         }
         if (!strippedCheck && modelProfile.supportsThinking && truncationRecoveryCount < MAX_TRUNCATION_RECOVERY) {
           truncationRecoveryCount++;
-          process.stderr.write(`[thinking-only] Turn ${turnIndex}: model produced thinking but no action — re-prompting\n`);
-          const continueMsg: Message = {
-            role: 'user',
-            content: 'Continue. Use your tools to implement the solution.',
-            timestamp: Date.now(),
-          };
-          messages.push(continueMsg);
-          store.appendMessage(session.id, continueMsg);
+          process.stderr.write(`[thinking-only] Turn ${turnIndex}: model produced thinking but no action — continuing from prefix\n`);
           continue;
         }
 

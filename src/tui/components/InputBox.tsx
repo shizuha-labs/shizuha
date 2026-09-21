@@ -4,6 +4,7 @@ import { theme as palette } from '../theme.js';
 import { MultiLineInput } from './MultiLineInput.js';
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import { getComposerTheme } from '../utils/composerTheme.js';
+import { currentInputDispatchWasConsumed } from '../renderer/inputDispatch.js';
 
 
 interface InputBoxProps {
@@ -37,6 +38,7 @@ const DEFAULT_SLASH_COMMANDS = [
   { name: '/copy', description: 'Copy last response' },
   { name: '/think', description: 'Set Claude thinking (on/off)' },
   { name: '/effort', description: 'Set Codex reasoning effort' },
+  { name: '/mouse', description: 'Toggle mouse capture (off = tmux scrollback)' },
   { name: '/config', description: 'Settings shortcuts' },
   { name: '/session', description: 'Session manager' },
   { name: '/resume', description: 'Resume session (alias)' },
@@ -45,7 +47,7 @@ const DEFAULT_SLASH_COMMANDS = [
   { name: '/review', description: 'Code review diff' },
   { name: '/rename', description: 'Rename session' },
   { name: '/init', description: 'Create AGENTS.md' },
-  { name: '/mcp', description: 'List MCP tools' },
+  { name: '/mcp', description: 'Toggle MCP servers (persisted)' },
   { name: '/statusline', description: 'Configure status bar' },
   { name: '/memory', description: 'View/edit memory' },
   { name: '/verbose', description: 'Toggle verbosity' },
@@ -104,6 +106,7 @@ export const InputBox: React.FC<InputBoxProps> = React.memo(({
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [completions, setCompletions] = useState<string[] | null>(null);
+  const draftBeforeHistoryRef = useRef('');
   const { columns, rows } = useTerminalSize();
 
   useEffect(() => {
@@ -119,6 +122,7 @@ export const InputBox: React.FC<InputBoxProps> = React.memo(({
 
   const inputBoxHandlerRef = useRef<(input: string, key: any) => void>(() => {});
   inputBoxHandlerRef.current = (_input: string, key: any) => {
+    if (currentInputDispatchWasConsumed()) return;
     if (key.meta && key.upArrow && queuedCount > 0 && onDequeueQueuedPrompts) {
       const prompts = onDequeueQueuedPrompts();
       if (prompts.length > 0) {
@@ -127,8 +131,6 @@ export const InputBox: React.FC<InputBoxProps> = React.memo(({
         setCompletions(null);
       }
     } else if (key.escape) {
-      setValue('');
-      setHistoryIndex(-1);
       setCompletions(null);
     } else if (key.ctrl && _input === 'u') {
       setValue('');
@@ -137,14 +139,16 @@ export const InputBox: React.FC<InputBoxProps> = React.memo(({
       setValue('');
       setCompletions(null);
     } else if (key.upArrow && history.length > 0) {
+      if (historyIndex < 0) draftBeforeHistoryRef.current = value;
       const newIndex = Math.min(historyIndex + 1, history.length - 1);
       setHistoryIndex(newIndex);
       setValue(history[newIndex] ?? '');
       setCompletions(null);
-    } else if (key.downArrow) {
+    } else if (key.downArrow && historyIndex >= 0) {
       if (historyIndex <= 0) {
         setHistoryIndex(-1);
-        setValue('');
+        setValue(draftBeforeHistoryRef.current);
+        draftBeforeHistoryRef.current = '';
       } else {
         const newIndex = historyIndex - 1;
         setHistoryIndex(newIndex);
@@ -204,6 +208,7 @@ export const InputBox: React.FC<InputBoxProps> = React.memo(({
     if (!trimmed) return;
     setHistory((prev) => [trimmed, ...prev]);
     setHistoryIndex(-1);
+    draftBeforeHistoryRef.current = '';
     setValue('');
     setCompletions(null);
     onSubmit(trimmed);
@@ -288,6 +293,7 @@ export const InputBox: React.FC<InputBoxProps> = React.memo(({
             rightGutter={rightGutter}
             width={inputWidth}
             maxRows={Math.max(3, Math.floor(rows * 0.3))}
+            cursorAtEndOnExternalValue
           />
           <Text color={inputForeground} backgroundColor={inputBackground}>{highlightFill}</Text>
         </Box>

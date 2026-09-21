@@ -1,4 +1,4 @@
-import type { CronStore } from './store.js';
+import type { CronStore, CronJob } from './store.js';
 import type { InboundMessage, ChannelType } from '../gateway/types.js';
 import { logger } from '../utils/logger.js';
 
@@ -39,6 +39,17 @@ export class CronScheduler {
       clearInterval(this.timer);
       this.timer = null;
     }
+  }
+
+  /**
+   * List currently active (enabled) scheduled jobs.
+   *
+   * SCLI-618: the SessionStop lifecycle hook needs to know which cron jobs are
+   * still scheduled so hooks can react to background work on shutdown. Reads
+   * the shared store's enabled jobs without mutating anything.
+   */
+  listActiveJobs(): CronJob[] {
+    return this.store.listJobs(false);
   }
 
   private async tick(): Promise<void> {

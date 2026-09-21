@@ -11,162 +11,38 @@
  *  - InputBox always visible at bottom
  *  - Multiple terminal sizes (80x24, 120x50, 60x20)
  *
- * Requires: tmux, SHIZUHA_RUN_TMUX_RENDER_E2E=1
+ * Runs in default CI whenever tmux is installed. Missing tmux in CI is a
+ * failure, not an env-var skip.
  */
-import { beforeAll, describe, expect, it } from 'vitest';
-import { execFileSync, execSync } from 'node:child_process';
+import { beforeAll, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import {
+  capture,
+  captureWithScrollback,
+  ensureDistBuilt,
+  historySize,
+  killTmux,
+  launchShizuha,
+  launchTmux,
+  paneFlags,
+  projectDir,
+  sendKeys,
+  sendLiteral,
+  sendWheel,
+  shQuote,
+  sleepMs,
+  stageProviderCredentials,
+  tmuxE2eDescribe,
+  uniqueMarker,
+  waitForPattern,
+} from './helpers/tmux-e2e.js';
 
-const projectDir = path.resolve(import.meta.dirname!, '../..');
-
-function shQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-function run(command: string, cwd = projectDir): string {
-  return execSync(command, { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
-}
-
-async function sleepMs(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, ms));
-}
-
-function hasTmux(): boolean {
-  try {
-    run('tmux -V');
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function stageProviderCredentials(tempHome: string): boolean {
-  // Copy shizuha config
-  const srcDir = path.join(os.homedir(), '.shizuha');
-  const dstDir = path.join(tempHome, '.shizuha');
-  const candidates = ['credentials.json', 'auth.json', 'jwt_token', 'config.toml'];
-  let copiedAny = false;
-  for (const file of candidates) {
-    const src = path.join(srcDir, file);
-    const dst = path.join(dstDir, file);
-    if (fs.existsSync(src)) {
-      fs.mkdirSync(path.dirname(dst), { recursive: true });
-      fs.copyFileSync(src, dst);
-      copiedAny = true;
-    }
-  }
-  // Copy codex credentials (for gpt-5.x-codex models)
-  const codexSrc = path.join(os.homedir(), '.codex');
-  const codexDst = path.join(tempHome, '.codex');
-  if (fs.existsSync(codexSrc)) {
-    try {
-      fs.cpSync(codexSrc, codexDst, { recursive: true });
-      copiedAny = true;
-    } catch { /* ignore */ }
-  }
-  return copiedAny;
-}
-
-function newSessionName(prefix: string): string {
-  return `${prefix}_${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
-}
-
-function launchTmux(
-  name: string,
-  width: number,
-  height: number,
-  command: string,
-): { session: string; target: string } {
-  const session = newSessionName(name);
-  const target = `${session}:0.0`;
-  run(`tmux new-session -d -x ${width} -y ${height} -s ${shQuote(session)} ${shQuote(command)}`);
-  // Some detached tmux servers ignore new-session -x/-y until a window resize.
-  // Resize explicitly so renderer assertions exercise the requested viewport.
-  run(`tmux resize-window -t ${shQuote(`${session}:0`)} -x ${width} -y ${height}`);
-  return { session, target };
-}
-
-function killTmux(session: string): void {
-  try {
-    run(`tmux kill-session -t ${shQuote(session)}`);
-  } catch {
-    // ignore
-  }
-}
-
-/** Capture visible pane content */
-function capture(target: string, startLine = -320): string {
-  return run(`tmux capture-pane -p -t ${shQuote(target)} -S ${startLine}`);
-}
-
-/** Capture scrollback + visible content */
-function captureWithScrollback(target: string, lines = 2000): string {
-  return run(`tmux capture-pane -p -t ${shQuote(target)} -S -${lines}`);
-}
-
-function sendKeys(target: string, ...keys: string[]): void {
-  const normalized = keys.map((key) => key === 'Enter' ? 'C-m' : key);
-  const args = normalized.map(shQuote).join(' ');
-  run(`tmux send-keys -t ${shQuote(target)} ${args}`);
-}
-
-function sendLiteral(target: string, text: string): void {
-  run(`tmux send-keys -t ${shQuote(target)} -l ${shQuote(text)}`);
-}
-
-async function waitForPattern(target: string, pattern: RegExp, timeoutMs: number): Promise<string> {
-  const started = Date.now();
-  let last = '';
-  while (Date.now() - started < timeoutMs) {
-    last = capture(target);
-    if (pattern.test(last)) return last;
-    await sleepMs(100);
-  }
-  throw new Error(`Timeout waiting for ${pattern}. Last capture:\n${last.slice(-2000)}`);
-}
-
-/** Wait for pattern with scrollback capture */
-async function waitForScrollbackPattern(target: string, pattern: RegExp, timeoutMs: number): Promise<string> {
-  const started = Date.now();
-  let last = '';
-  while (Date.now() - started < timeoutMs) {
-    last = captureWithScrollback(target);
-    if (pattern.test(last)) return last;
-    await sleepMs(200);
-  }
-  throw new Error(`Timeout waiting for scrollback ${pattern}. Last capture:\n${last.slice(-2000)}`);
-}
-
-/** Launch shizuha with isolated state but real credentials */
-function launchShizuha(
-  tempHome: string,
-  name: string,
-  width: number,
-  height: number,
-): { session: string; target: string } {
-  const launchCommand = `cd ${shQuote(projectDir)} && HOME=${shQuote(tempHome)} FORCE_COLOR=0 node dist/shizuha.js --model gpt-5.3-codex`;
-  return launchTmux(name, width, height, launchCommand);
-}
-
-/** Launch shizuha with real HOME (for API tests) — uses real credentials */
-function launchShizuhaReal(
-  name: string,
-  width: number,
-  height: number,
-): { session: string; target: string } {
-  const launchCommand = `cd ${shQuote(projectDir)} && FORCE_COLOR=0 node dist/shizuha.js --model gpt-5.3-codex`;
-  return launchTmux(name, width, height, launchCommand);
-}
-
-const runSuite = hasTmux() && process.env['SHIZUHA_RUN_TMUX_RENDER_E2E'] === '1';
-const tmuxDescribe = runSuite ? describe : describe.skip;
-
-tmuxDescribe('TUI tmux renderer e2e tests', () => {
+tmuxE2eDescribe('TUI tmux renderer e2e tests', () => {
   beforeAll(() => {
-    run('npm run build');
-  }, 35000);
+    ensureDistBuilt();
+  }, 60000);
 
   // ─── Test 1: Initial render — correct structure ───
   it('renders header, input box, and status bar on startup', async () => {
@@ -200,47 +76,138 @@ tmuxDescribe('TUI tmux renderer e2e tests', () => {
     }
   }, 30_000);
 
-  // ─── Test 2: Animations work in tmux ───
-  it('shows animated spinner and live timer in tmux during processing', async () => {
-    const { session, target } = launchShizuhaReal('render_anim', 80, 24);
+  it('preserves drafts across idle Down and idle Escape', async () => {
+    const cases = [
+      { name: 'down_single', key: 'Down', parts: ['valuable draft'], expected: ['valuable draftX'] },
+      { name: 'down_multiline', key: 'Down', parts: ['line1', 'line2'], expected: ['line1', 'line2X'] },
+      { name: 'escape_single', key: 'Escape', parts: ['valuable draft'], expected: ['valuable draftX'] },
+      { name: 'escape_multiline', key: 'Escape', parts: ['line1', 'line2'], expected: ['line1', 'line2X'] },
+    ];
+
+    for (const testCase of cases) {
+      const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), `shizuha-down-${testCase.name}-`));
+      const { session, target } = launchShizuha(tempHome, `down_${testCase.name}`, 120, 40);
+
+      try {
+        await waitForPattern(target, /Type a message|❯/, 15_000);
+        sendLiteral(target, testCase.parts.join('\n'));
+
+        sendKeys(target, testCase.key);
+        // Inter-key delay is REQUIRED, not flake-proofing: back-to-back tmux
+        // sends coalesce into one stdin chunk while the app renders the draft,
+        // and Ink's parseKeypress parses one keypress per chunk — '\x1b[BX'
+        // parses as a single `down` (trailing X swallowed into the sequence,
+        // input=''), '\x1bX' parses as meta+X (MultiLineInput ignores meta).
+        // Same pattern as e2e-tmux-edgecases' per-key sleepMs(15).
+        await sleepMs(80);
+        sendLiteral(target, 'X');
+        await sleepMs(200);
+
+        const frame = capture(target);
+        for (const expected of testCase.expected) {
+          expect(frame).toContain(expected);
+        }
+      } finally {
+        killTmux(session);
+        fs.rmSync(tempHome, { recursive: true, force: true });
+      }
+    }
+  }, 40_000);
+
+  // SCLI-774: the SCLI-461 fixture WITHOUT the inter-key sleep. Back-to-back
+  // tmux sends coalesce into one stdin chunk ('\x1b[BX'); the pre-fix runtime
+  // swallowed the trailing X (parseKeypress parses one keypress per chunk,
+  // fnKeyRe has no end anchor). The chunk-split fix must make the zero-delay
+  // version pass — this is the real user-facing input-loss shape (fast
+  // typing, SSH batching, paste containing arrow keys).
+  it('preserves drafts across ZERO-DELAY Down+X coalesced chunks (SCLI-774)', async () => {
+    const cases = [
+      { name: 'zerodelay_down', key: 'Down', parts: ['valuable draft'], expected: ['valuable draftX'] },
+      { name: 'zerodelay_escape', key: 'Escape', parts: ['valuable draft'], expected: ['valuable draftX'] },
+    ];
+
+    for (const testCase of cases) {
+      const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), `shizuha-${testCase.name}-`));
+      const { session, target } = launchShizuha(tempHome, testCase.name, 120, 40);
+
+      try {
+        await waitForPattern(target, /Type a message|❯/, 15_000);
+        sendLiteral(target, testCase.parts.join('\n'));
+        // Let the draft render before the coalesced pair — the zero-delay
+        // contract is between Down and X (one stdin chunk), not between the
+        // draft and the app finishing mount (a keystroke during init lands
+        // before the stdin listener attaches and is lost at the tty layer,
+        // which is NOT the SCLI-774 drop).
+        await sleepMs(300);
+
+        // NO inter-key sleep: Down and X must coalesce into one stdin chunk.
+        sendKeys(target, testCase.key);
+        sendLiteral(target, 'X');
+        await sleepMs(200);
+
+        const frame = capture(target);
+        for (const expected of testCase.expected) {
+          expect(frame).toContain(expected);
+        }
+      } finally {
+        killTmux(session);
+        fs.rmSync(tempHome, { recursive: true, force: true });
+      }
+    }
+  }, 40_000);
+
+  it('history navigation preserves drafts (SCLI-461)', async () => {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'shizuha-history-draft-'));
+    const { session, target } = launchShizuha(tempHome, 'history_draft', 120, 40);
+    try {
+      await waitForPattern(target, /Type a message|❯/, 15_000);
+      sendLiteral(target, '/status');
+      sendKeys(target, 'Enter');
+      await waitForPattern(target, /Session:/, 15_000);
+
+      sendLiteral(target, 'draft-xyz');
+      sendKeys(target, 'Up');
+      await sleepMs(80);
+      sendKeys(target, 'Down');
+      await sleepMs(80);
+      sendLiteral(target, 'X');
+      await sleepMs(200);
+
+      expect(capture(target)).toContain('draft-xyzX');
+    } finally {
+      killTmux(session);
+      fs.rmSync(tempHome, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  // ─── Test 2: Live pane actually changes while a local command runs ───
+  it('pane content advances while a slow local command runs', async () => {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'shizuha-render-anim-'));
+    stageProviderCredentials(tempHome);
+    const { session, target } = launchShizuha(tempHome, 'render_anim', 80, 24);
+    const marker = uniqueMarker('tick');
 
     try {
       await waitForPattern(target, /Type a message|❯/, 15_000);
-
-      // Send a prompt to trigger processing
-      sendLiteral(target, 'say hello');
+      sendLiteral(target, `!sh -c 'i=0; while [ $i -lt 6 ]; do echo ${marker}_$i; i=$((i+1)); sleep 0.35; done'`);
+      await waitForPattern(target, new RegExp(marker), 10_000);
       sendKeys(target, 'Enter');
 
-      // Wait for thinking indicator
-      await waitForPattern(target, /Thinking|live/, 15_000);
-
-      // Capture multiple frames to verify animation (spinner/timer changes)
-      const frames: string[] = [];
-      for (let i = 0; i < 12; i++) {
+      const seen = new Set<string>();
+      const deadline = Date.now() + 12_000;
+      while (Date.now() < deadline && seen.size < 3) {
         await sleepMs(200);
-        frames.push(capture(target));
+        const frame = capture(target);
+        for (let i = 0; i < 6; i++) {
+          if (frame.includes(`${marker}_${i}`)) seen.add(String(i));
+        }
       }
-
-      // Animation indicators: spinner characters OR live timer
-      const spinnerPattern = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
-      const livePattern = /live \d+s/;
-      const animatedFrames = frames.filter(
-        (f) => spinnerPattern.test(f) || livePattern.test(f),
-      );
-      // At least some frames should show animation indicators
-      // (model may respond quickly, so we're lenient)
-      expect(animatedFrames.length).toBeGreaterThan(0);
-
-      // Wait for response to finish (best-effort)
-      try {
-        await waitForPattern(target, /idle/, 60_000);
-      } catch {
-        // Timeout is acceptable — animation was verified above
-      }
+      expect(seen.size, `live command did not advance on screen: ${[...seen]}`).toBeGreaterThanOrEqual(2);
     } finally {
       killTmux(session);
+      fs.rmSync(tempHome, { recursive: true, force: true });
     }
-  }, 90_000);
+  }, 30_000);
 
   // ─── Test 3: No content truncation ───
   it('shows full agent output without truncation notices', async () => {
@@ -252,21 +219,16 @@ tmuxDescribe('TUI tmux renderer e2e tests', () => {
       await waitForPattern(target, /Type a message|❯/, 15_000);
 
       // Use !command to generate long output locally (no API needed)
-      sendLiteral(target, '!seq 1 40');
+      const marker = uniqueMarker('seq');
+      sendLiteral(target, `!sh -c 'i=1; while [ $i -le 40 ]; do echo ${marker}_$i; i=$((i+1)); done'`);
+      await waitForPattern(target, new RegExp(marker), 10_000);
       sendKeys(target, 'Enter');
-      await sleepMs(1500);
+      const full = await waitForPattern(target, new RegExp(`${marker}_40`), 15_000);
 
-      // Capture full output (visible + scrollback)
-      const full = captureWithScrollback(target);
-
-      // Should NOT contain truncation notices
       expect(full).not.toMatch(/\+\d+ lines.*verbose/);
       expect(full).not.toMatch(/\+\d+ lines.*pager/);
       expect(full).not.toMatch(/earlier lines hidden while streaming/);
-
-      // Should contain the generated output
-      expect(full).toContain('40');
-      expect(full).toMatch(/!seq 1 40|! seq 1 40/);
+      expect(full).toContain(`${marker}_40`);
     } finally {
       killTmux(session);
       fs.rmSync(tempHome, { recursive: true, force: true });
@@ -282,36 +244,21 @@ tmuxDescribe('TUI tmux renderer e2e tests', () => {
     try {
       await waitForPattern(target, /Type a message|❯/, 15_000);
 
-      // Generate output that exceeds 24 rows: 40 paragraph-separated lines
-      // = ~80 visual lines (each "LINE_NNN\n\n" = 2 lines in markdown).
-      sendLiteral(target, '!printf "LINE_%03d\\n\\n" $(seq 1 40)');
+      const marker = uniqueMarker('line');
+      sendLiteral(target, `!sh -c 'i=1; while [ $i -le 40 ]; do printf "${marker}_%03d\\n\\n" $i; i=$((i+1)); done'`);
+      await waitForPattern(target, new RegExp(marker), 10_000);
       sendKeys(target, 'Enter');
-      await sleepMs(5000);
-
-      // InputBox must be accessible
-      const defaultCapture = capture(target);
+      const defaultCapture = await waitForPattern(target, new RegExp(`${marker}_040`), 15_000);
       expect(defaultCapture).toMatch(/❯|Type a message/);
+      expect(paneFlags(target)).toBe('1 0 1');
 
-      const paneState = execFileSync('tmux', [
-        'display-message', '-p', '-t', target,
-        '#{alternate_on} #{history_size} #{mouse_any_flag}',
-      ], { encoding: 'utf-8' }).trim();
-      expect(paneState).toBe('1 0 1');
-      expect(defaultCapture).toContain('LINE_040');
-
-      // Real SGR wheel reports move the source-backed conversation viewport;
-      // tmux history deliberately remains empty (Grok/Claude-style TUI).
-      for (let i = 0; i < 14; i++) {
-        execFileSync('tmux', ['send-keys', '-t', target, '-l', '\x1b[<64;20;12M']);
-      }
-      await sleepMs(500);
+      sendWheel(target, 'up', 14);
+      await sleepMs(400);
       const scrolled = capture(target);
-      expect(scrolled).toMatch(/LINE_00[1-9]|LINE_01\d/);
+      expect(scrolled).not.toBe(defaultCapture);
+      expect(scrolled).toMatch(new RegExp(`${marker}_0(0[1-9]|1\\d)`));
       expect(scrolled).toMatch(/❯|Type a message/);
-      const historyAfter = execFileSync('tmux', [
-        'display-message', '-p', '-t', target, '#{history_size}',
-      ], { encoding: 'utf-8' }).trim();
-      expect(historyAfter).toBe('0');
+      expect(historySize(target)).toBe('0');
     } finally {
       killTmux(session);
       fs.rmSync(tempHome, { recursive: true, force: true });
@@ -374,96 +321,69 @@ tmuxDescribe('TUI tmux renderer e2e tests', () => {
   }, 30_000);
 
   // ─── Test 7: Input box stays visible during long response ───
-  it('input box remains visible while streaming long content', async () => {
-    const { session, target } = launchShizuhaReal('render_input_visible', 80, 24);
+  it('input box remains visible while a long local command streams', async () => {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'shizuha-render-input-'));
+    stageProviderCredentials(tempHome);
+    const { session, target } = launchShizuha(tempHome, 'render_input_visible', 80, 24);
+    const marker = uniqueMarker('stream');
 
     try {
       await waitForPattern(target, /Type a message|❯/, 15_000);
-
-      sendLiteral(target, 'write a long essay about the solar system, at least 40 lines');
+      sendLiteral(target, `!sh -c 'i=1; while [ $i -le 12 ]; do echo ${marker}_$i; i=$((i+1)); sleep 0.25; done'`);
+      await waitForPattern(target, new RegExp(marker), 10_000);
       sendKeys(target, 'Enter');
+      await waitForPattern(target, new RegExp(`${marker}_1`), 10_000);
 
-      // Wait for streaming to start
-      await waitForPattern(target, /live|Thinking/, 15_000);
-
-      // Check multiple frames during streaming
       const violations: string[] = [];
-      for (let i = 0; i < 15; i++) {
-        await sleepMs(1500);
+      for (let i = 0; i < 8; i++) {
+        await sleepMs(250);
         const frame = capture(target, -24);
-        const hasInput = /❯|Type a message|Enter to queue/.test(frame);
-        const hasStatusRule = /─{10,}/.test(frame);
-        if (!hasInput) violations.push(`frame ${i}: missing input box`);
-        if (!hasStatusRule) violations.push(`frame ${i}: missing status rule`);
+        if (!/❯|Type a message|Enter to queue/.test(frame)) violations.push(`frame ${i}: missing input box`);
+        if (!/─{10,}/.test(frame)) violations.push(`frame ${i}: missing status rule`);
       }
-
       expect(violations).toEqual([]);
-
-      // Wait for completion (best-effort — API can be slow)
-      try {
-        await waitForPattern(target, /idle/, 90_000);
-        // Final check: input and status visible after completion
-        const final = capture(target, -24);
-        expect(final).toMatch(/❯|Type a message/);
-        expect(final).toMatch(/─{10,}/);
-      } catch {
-        // Timeout is OK — the streaming frame checks above are what matters
-      }
+      await waitForPattern(target, new RegExp(`${marker}_12`), 10_000);
+      const final = capture(target, -24);
+      expect(final).toMatch(/❯|Type a message/);
+      expect(final).toMatch(/─{10,}/);
     } finally {
       killTmux(session);
+      fs.rmSync(tempHome, { recursive: true, force: true });
     }
-  }, 180_000);
+  }, 40_000);
 
   // ─── Test 8: No duplicate/garbled lines (rendering integrity) ───
-  it('no garbled or duplicate status bars during streaming', async () => {
-    const { session, target } = launchShizuhaReal('render_garble', 80, 24);
+  it('no garbled or duplicate status bars during a live local stream', async () => {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'shizuha-render-garble-'));
+    stageProviderCredentials(tempHome);
+    const { session, target } = launchShizuha(tempHome, 'render_garble', 80, 24);
+    const marker = uniqueMarker('garble');
 
     try {
       await waitForPattern(target, /Type a message|❯/, 15_000);
-
-      sendLiteral(target, 'explain recursion in detail with examples');
+      sendLiteral(target, `!sh -c 'i=1; while [ $i -le 10 ]; do echo ${marker}_$i; i=$((i+1)); sleep 0.2; done'`);
+      await waitForPattern(target, new RegExp(marker), 10_000);
       sendKeys(target, 'Enter');
+      await waitForPattern(target, new RegExp(`${marker}_1`), 10_000);
 
-      await waitForPattern(target, /live|Thinking/, 15_000);
-
-      // Capture frames and check for duplicated status bars
       const violations: string[] = [];
-      for (let i = 0; i < 10; i++) {
-        await sleepMs(800);
+      for (let i = 0; i < 8; i++) {
+        await sleepMs(200);
         const frame = capture(target, -24);
         const lines = frame.split('\n');
-
-        // Count status rule lines (─────) — should be exactly 1
         const ruleCount = lines.filter((l) => /^─{10,}$/.test(l.trim())).length;
-        if (ruleCount > 1) {
-          violations.push(`frame ${i}: ${ruleCount} status rules (expected 1)`);
-        }
-
-        // Count mode indicators — should be exactly 1
+        if (ruleCount > 1) violations.push(`frame ${i}: ${ruleCount} status rules (expected 1)`);
         const modeCount = lines.filter((l) => /\bsup\b|\bauto\b|\bplan\b/.test(l)).length;
-        if (modeCount > 1) {
-          violations.push(`frame ${i}: ${modeCount} mode indicators (expected 1)`);
-        }
-
-        // Count input prompts — should be exactly 1
+        if (modeCount > 1) violations.push(`frame ${i}: ${modeCount} mode indicators (expected 1)`);
         const inputCount = lines.filter((l) => /❯/.test(l)).length;
-        if (inputCount > 1) {
-          violations.push(`frame ${i}: ${inputCount} input prompts (expected 1)`);
-        }
+        if (inputCount > 1) violations.push(`frame ${i}: ${inputCount} input prompts (expected 1)`);
       }
-
       expect(violations).toEqual([]);
-
-      // Wait for response to finish (best-effort — API can be slow)
-      try {
-        await waitForPattern(target, /idle/, 90_000);
-      } catch {
-        // Timeout is OK — the rendering integrity check above is what matters
-      }
     } finally {
       killTmux(session);
+      fs.rmSync(tempHome, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, 30_000);
 
   // ─── Test 9: Launch from bottom of scrollback-full pane ───
   it('renders correctly when launched after heavy scrollback', async () => {
@@ -472,7 +392,7 @@ tmuxDescribe('TUI tmux renderer e2e tests', () => {
 
     // Fill the pane with 300 lines of output, then launch shizuha
     const prefill = 'for i in $(seq 1 300); do printf "scrollback-fill-%03d\\n" "$i"; done';
-    const launchCommand = `cd ${shQuote(projectDir)} && ${prefill} && HOME=${shQuote(tempHome)} FORCE_COLOR=0 node dist/shizuha.js --model gpt-5.3-codex`;
+    const launchCommand = `cd ${shQuote(projectDir)} && ${prefill} && HOME=${shQuote(tempHome)} SHIZUHA_DISABLE_MCP_JSON=1 FORCE_COLOR=0 node dist/shizuha.js --model test-model`;
     const { session, target } = launchTmux('render_bottom', 80, 24, launchCommand);
 
     try {
@@ -506,6 +426,7 @@ tmuxDescribe('TUI tmux renderer e2e tests', () => {
       // Use !command with markdown-like output (bullet points)
       // The output gets rendered through renderMarkdown for completed messages
       sendLiteral(target, '!printf "* item one\\n* item two\\n* item three\\n"');
+      await waitForPattern(target, /item three/, 10_000);
       sendKeys(target, 'Enter');
       await sleepMs(1500);
 
@@ -531,11 +452,12 @@ tmuxDescribe('TUI tmux renderer e2e tests', () => {
       await waitForPattern(target, /Type a message|❯/, 15_000);
 
       // Open session picker
+      const before = capture(target);
       sendLiteral(target, '/resume');
+      await waitForPattern(target, /\/resume/, 8_000);
       sendKeys(target, 'Enter');
-      await sleepMs(500);
-
-      const frame = capture(target);
+      const frame = await waitForPattern(target, /Sessions|No sessions|☰/, 8_000);
+      expect(frame).not.toBe(before);
 
       // Session picker should show
       const hasSessionUI = /Sessions|No sessions|☰/.test(frame);
@@ -560,4 +482,60 @@ tmuxDescribe('TUI tmux renderer e2e tests', () => {
       fs.rmSync(tempHome, { recursive: true, force: true });
     }
   }, 30_000);
+
+  // ─── Test 12: Alt+Backspace (ESC DEL) deletes the previous word ───
+  // SCLI-452 real-PTY regression at the required 80×24, 120×40, 200×50 sizes.
+  // ESC DEL must map to backward-word deletion (same semantics as Ctrl+W), not
+  // ordinary single-character Backspace, and must handle Unicode word runs.
+  it.each([
+    { width: 80, height: 24, name: '80x24' },
+    { width: 120, height: 40, name: '120x40' },
+    { width: 200, height: 50, name: '200x50' },
+  ])('Alt+Backspace deletes the previous word at $name', async ({ width, height, name }) => {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), `shizuha-render-altbs-${name}-`));
+    stageProviderCredentials(tempHome);
+    const { session, target } = launchShizuha(tempHome, `render_altbs_${name}`, width, height);
+
+    try {
+      await waitForPattern(target, /Type a message|❯/, 15_000);
+
+      // ESC DEL = Alt+Backspace, sent as the raw two-byte chord \x1b\x7f.
+      const escDel = '\x1b\x7f';
+
+      // ASCII: "one two three" + Alt+Backspace -> "one two " (word deleted).
+      sendLiteral(target, 'one two three');
+      await sleepMs(300);
+      sendLiteral(target, escDel);
+      await sleepMs(300);
+      let frame = capture(target);
+      expect(frame).toContain('one two');
+      expect(frame).not.toContain('three');
+
+      // Unicode: "alpha café" + Alt+Backspace -> "alpha " (whole word deleted,
+      // not just the non-ASCII "é").
+      sendKeys(target, 'C-u');
+      await sleepMs(300);
+      sendLiteral(target, 'alpha café');
+      await sleepMs(300);
+      sendLiteral(target, escDel);
+      await sleepMs(300);
+      frame = capture(target);
+      expect(frame).toContain('alpha');
+      expect(frame).not.toContain('café');
+
+      // Ordinary Backspace is unchanged: single-cluster delete.
+      sendKeys(target, 'C-u');
+      await sleepMs(300);
+      sendLiteral(target, 'abc');
+      await sleepMs(300);
+      sendKeys(target, 'BSpace');
+      await sleepMs(300);
+      frame = capture(target);
+      expect(frame).toContain('ab');
+      expect(frame).not.toContain('abc');
+    } finally {
+      killTmux(session);
+      fs.rmSync(tempHome, { recursive: true, force: true });
+    }
+  }, 45_000);
 }, 600_000); // 10min global timeout for the suite

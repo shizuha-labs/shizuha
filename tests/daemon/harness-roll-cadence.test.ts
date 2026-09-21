@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  harnessRollEnabledSet,
   harnessRollHasCapacity,
   harnessRollInFlightReady,
   resolveHarnessRollBusyRecheckMs,
@@ -30,6 +31,22 @@ function deployment(overrides: Partial<K8sDeploymentState> = {}): K8sDeploymentS
 }
 
 describe('SCLI-331 harness-roll cadence', () => {
+  it('treats Hive-active seats as rollable even when the host enabled file omits them', () => {
+    const enabled = harnessRollEnabledSet(
+      ['host-only'],
+      ['killed'],
+      [
+        { id: 'hina', status: 'active' },
+        { id: 'killed', status: 'active' },
+        { id: 'paused', status: 'paused' },
+      ],
+    );
+    expect(enabled.has('host-only')).toBe(true);
+    expect(enabled.has('hina')).toBe(true);
+    expect(enabled.has('killed')).toBe(false);
+    expect(enabled.has('paused')).toBe(false);
+  });
+
   it('bounds busy-fence rechecks away from a hot poll', () => {
     expect(resolveHarnessRollBusyRecheckMs(undefined)).toBe(15_000);
     expect(resolveHarnessRollBusyRecheckMs(1)).toBe(5_000);

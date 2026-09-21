@@ -64,6 +64,7 @@ import {
   estimateTokens,
   getSafetyFactor,
   needsCompaction,
+  stripStaleWorkingImages,
 } from '../prompt/context.js';
 import {
   estimatePromptTokenBudget,
@@ -577,6 +578,8 @@ export class AgentSession extends EventEmitter {
     } = await import('../tools/tool-search.js');
 
     this.mcpManager = new MCPManager();
+    const { loadSettings } = await import('./utils/settings.js');
+    this.mcpManager.applyDisabledServers(loadSettings().disabledMcpServers ?? []);
     if (mcpConfigs.length === 0) return;
 
     // Do NOT race connectAll against a short global timeout.
@@ -1229,6 +1232,16 @@ export class AgentSession extends EventEmitter {
       );
 
       if (!result.compacted) {
+        // Codex/Grok never block session init on a stalled summary. Deadline
+        // and transient skips return compacted=false; retrying them here would
+        // pin resume (and "Failed to initialize") for the full backoff loop.
+        if (phase === 'resume') {
+          logger.warn(
+            { attempts, phase },
+            'TUI resume semantic compaction did not commit — continuing init so working context can be bounded',
+          );
+          return { compacted: false, attempts };
+        }
         const retryDelayMs = Math.min(5_000, 250 * (2 ** Math.min(attempts - 1, 5)));
         await new Promise<void>((resolve, reject) => {
           const signal = options?.abortSignal;
@@ -1328,8 +1341,10 @@ export class AgentSession extends EventEmitter {
 
     // Cortex/vLLM context metadata is deployment state, not a client constant.
     // Refresh it before persisting the user prompt or making any compaction /
-    // trimming decision. If metadata is unavailable, preserve the transcript
-    // byte-for-byte and let the user retry rather than guessing a window.
+    // trimming decision. getServedModel keeps last-known metadata on timeout/5xx
+    // (shizuha1 2026-09-21: a 3s /v1/models blip was misread as "model missing"
+    // while GLM-5.3-Flash was still listed). Fail closed only when live catalog
+    // omits the model, or we have never discovered a window for this process.
     const providerDiscovery = provider as unknown as {
       getServedModel?: (
         preferredModel?: string,
@@ -1515,6 +1530,7 @@ export class AgentSession extends EventEmitter {
     const MAX_TRUNCATION_RECOVERY = 3;
     const MAX_EMPTY_TOOL_RESULT_RECOVERY = 1;
     const MAX_NON_THINKING_REASONING_RECOVERY = 1;
+    const MAX_THINKING_ONLY_RECOVERY = 3;
     const MAX_PROGRESS_ONLY_RECOVERY = 2;
     // One auto-retry after a chatter-guard stop: the spin was real, but going
     // idle forces the operator to re-prompt. A single forced tool call is enough
@@ -1523,6 +1539,7 @@ export class AgentSession extends EventEmitter {
     let truncationRecoveryCount = 0;
     let emptyToolResultRecoveryCount = 0;
     let nonThinkingReasoningRecoveryCount = 0;
+    let thinkingOnlyRecoveryCount = 0;
     let progressOnlyRecoveryCount = 0;
     let degeneracyRecoveryCount = 0;
     let interrupted = false;
@@ -1733,6 +1750,8 @@ export class AgentSession extends EventEmitter {
         let result: Awaited<ReturnType<typeof executeTurn>>;
         let providerRequestRawPromptTokens = 0;
         let recoveredFromContextOverflow = false;
+        let strippedStaleImages = false;
+        let boundedAfterOverflow = false;
         for (let retryAttempt = 0; ; retryAttempt++) {
           try {
             result = await executeTurn(
@@ -1850,6 +1869,34 @@ export class AgentSession extends EventEmitter {
               continue;
             }
             if (isContextOverflow && recoveredFromContextOverflow) {
+              if (!strippedStaleImages) {
+                const stripped = this.stripStaleWorkingImages(1);
+                strippedStaleImages = true;
+                if (stripped > 0) {
+                  logger.warn(
+                    { sessionId: this.sessionId, stripped },
+                    'TUI overflow: omitted stale screenshots from working context after compaction still exceeded the served window',
+                  );
+                  if (this.sessionId) this.store.replaceMessages(this.sessionId, this.messages);
+                  continue;
+                }
+              }
+              if (!boundedAfterOverflow) {
+                boundedAfterOverflow = true;
+                const before = this.messages.length;
+                const trim = this.boundResumeWorkingContext(
+                  this.sessionId ?? 'live',
+                  before,
+                  estimateTokens(this.messages, this._model),
+                  maxContextTokens,
+                  contextWindowCeiling,
+                  Math.max(1024, contextWindowCeiling),
+                );
+                if (trim.dropped > 0) {
+                  if (this.sessionId) this.store.replaceMessages(this.sessionId, this.messages);
+                  continue;
+                }
+              }
               throw new Error(
                 `Provider rejected the prompt after semantic compaction; preserved the full active projection instead of trimming it (${errMsg})`,
               );
@@ -2133,6 +2180,8 @@ export class AgentSession extends EventEmitter {
           const _isThinkingOnly = !_txt.replace(/<think>[\s\S]*?<\/think>/g, '').trim() && _txt.length > 0;
           const continuing = result.toolCalls.length > 0
             || result.stopReason === 'interrupted'
+            || (_hasReasoningOnly && modelProfile.supportsThinking
+              && thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY)
             || (_hasReasoningOnly && !modelProfile.supportsThinking
               && nonThinkingReasoningRecoveryCount < MAX_NON_THINKING_REASONING_RECOVERY)
             || (_isThinkingOnly && (
@@ -2248,62 +2297,89 @@ export class AgentSession extends EventEmitter {
             contentHead: contentCheckStr.slice(0, 100),
             contentTail: contentCheckStr.slice(-100),
           }, 'TUI empty-response check');
-          // GLM/local-model fallback: the answer landed entirely in the reasoning
-          // channel (model emitted <think> content but no post-think text). Surface
-          // it as the answer and stop, instead of nudge-looping — these models
-          // ignore the "Continue" nudge and keep re-reasoning until we error out.
+          // Thinking-model reasoning-only: keep the reasoning block on the
+          // persisted message for prefix-cache, but do not copy it onto the
+          // user-visible content channel. Live thinking already streamed as
+          // reasoning_text; the settled transcript should be the answer only
+          // (operator 2026-09-10). Nudge-looping GLM just re-reasons.
           if (!hasActionableText) {
             const reasoningStr = reasoningTextFromContent(contentForCheck);
             if (reasoningStr.length > 0) {
               if (modelProfile.supportsThinking) {
-                logger.info({ turnIndex, reasoningLen: reasoningStr.length }, 'TUI: surfaced reasoning-only answer (no text content)');
-                this.emit('agent_event', { type: 'content', text: reasoningStr, timestamp: Date.now() });
-                // Turn is over — deliver anything the user queued while it ran.
-                if (this.drainQueuedInput()) continue;
-                break;
-              }
-              logger.warn(
-                { turnIndex, reasoningLen: reasoningStr.length, model: this._model },
-                'TUI: non-thinking model returned reasoning-only output; treating as invalid provider response',
-              );
-              if (nonThinkingReasoningRecoveryCount < MAX_NON_THINKING_REASONING_RECOVERY) {
-                nonThinkingReasoningRecoveryCount++;
-                const continueMsg: Message = {
-                  role: 'user',
-                  content: 'Your previous response was not visible to the user. Reply again with the final answer in normal visible text only.',
-                  timestamp: Date.now(),
-                };
-                this.messages.push(continueMsg);
-                this.store.appendMessage(this.sessionId, continueMsg);
-                continue;
+                // Hidden CoT is not a finished answer. Breaking here (2026-09-10)
+                // dropped a GLM turn that had already planned hive_list_fleet_agents
+                // in hidden reasoning (stop=stop, 151 tokens, no tool_use). The
+                // assistant reasoning is already persisted; continue generation
+                // from that prefix. Do not inject a "you left off" user lecture
+                // (operator 2026-09-10) — that is the policy layer and it also
+                // hits hasRecentToolResult below with a misleading continue prompt.
+                logger.info({ turnIndex, reasoningLen: reasoningStr.length, stopReason: result.stopReason }, 'TUI: reasoning-only stop; continuing generation');
+                if (result.stopReason === 'max_tokens' || result.stopReason === 'stall_salvage') {
+                  if (this.drainQueuedInput()) continue;
+                  break;
+                }
+                // shizuha2 2026-09-19: GLM repetition_detected think-loop
+                // (`g/g/g/g` path mash). Continuing from that prefix re-fed the
+                // garbled CoT and the next tool_use copied it. Stop the loop.
+                if (result.stopReason === 'repetition') {
+                  logger.warn(
+                    { turnIndex, reasoningLen: reasoningStr.length },
+                    'TUI: GLM repetition_detected think-loop — not continuing generation from garbled CoT',
+                  );
+                  break;
+                }
+                if (thinkingOnlyRecoveryCount < MAX_THINKING_ONLY_RECOVERY) {
+                  thinkingOnlyRecoveryCount++;
+                  continue;
+                }
+              } else {
+                logger.warn(
+                  { turnIndex, reasoningLen: reasoningStr.length, model: this._model },
+                  'TUI: non-thinking model returned reasoning-only output; treating as invalid provider response',
+                );
+                if (nonThinkingReasoningRecoveryCount < MAX_NON_THINKING_REASONING_RECOVERY) {
+                  nonThinkingReasoningRecoveryCount++;
+                  const continueMsg: Message = {
+                    role: 'user',
+                    content: 'Your previous response was not visible to the user. Reply again with the final answer in normal visible text only.',
+                    timestamp: Date.now(),
+                  };
+                  this.messages.push(continueMsg);
+                  this.store.appendMessage(this.sessionId, continueMsg);
+                  continue;
+                }
               }
             }
           }
 
-          if (!hasActionableText && this.hasRecentToolResult() && emptyToolResultRecoveryCount < MAX_EMPTY_TOOL_RESULT_RECOVERY) {
+          if (result.stopReason === 'glm_observation' && this._mode !== 'plan') {
+            if (hasActionableText && progressOnlyRecoveryCount < MAX_PROGRESS_ONLY_RECOVERY) {
+              progressOnlyRecoveryCount++;
+              logger.warn(
+                { turnIndex, attempt: progressOnlyRecoveryCount, stopReason: result.stopReason },
+                'TUI: GLM <|observation|> stop without parsed tool_calls — continuing from prefix (no user lecture)',
+              );
+              continue;
+            }
+            // Empty observation: the provider already did one non-stream salvage.
+            // Continue-from-prefix re-emits the same swallowed 18 tokens (shizuha1
+            // 2026-09-11 07:40Z). Do not burn thinking-only retries or emit the
+            // generic "empty response after 3 recovery attempts" error.
+            if (!hasActionableText) {
+              logger.warn(
+                { turnIndex, stopReason: result.stopReason, outputTokens: result.outputTokens },
+                'TUI: GLM <|observation|> drop with empty text after salvage — not an empty-response retry loop',
+              );
+            }
+          } else if (!hasActionableText && this.hasRecentToolResult() && emptyToolResultRecoveryCount < MAX_EMPTY_TOOL_RESULT_RECOVERY) {
             emptyToolResultRecoveryCount++;
-            const continueMsg: Message = {
-              role: 'user',
-              content: 'Continue. If a tool result is available, answer the user directly from it.',
-              timestamp: Date.now(),
-            };
-            this.messages.push(continueMsg);
-            this.store.appendMessage(this.sessionId, continueMsg);
+            logger.warn({ turnIndex, attempt: emptyToolResultRecoveryCount }, 'TUI: empty after tool result — continuing from prefix (no Continue lecture)');
             continue;
-          }
-
-          if (!hasActionableText && modelProfile.supportsThinking && truncationRecoveryCount < MAX_TRUNCATION_RECOVERY) {
+          } else if (!hasActionableText && modelProfile.supportsThinking && truncationRecoveryCount < MAX_TRUNCATION_RECOVERY) {
             truncationRecoveryCount++;
-            const continueMsg: Message = {
-              role: 'user',
-              content: 'Continue. If a tool result is available, answer the user directly from it.',
-              timestamp: Date.now(),
-            };
-            this.messages.push(continueMsg);
-            this.store.appendMessage(this.sessionId, continueMsg);
+            logger.warn({ turnIndex, attempt: truncationRecoveryCount }, 'TUI: thinking-only empty — continuing from prefix (no Continue lecture)');
             continue;
-          }
-          if (!hasActionableText) {
+          } else if (!hasActionableText) {
             const recoveryAttempts = Math.max(truncationRecoveryCount, emptyToolResultRecoveryCount);
             const emptyResponseMessage = `Model returned an empty response after ${recoveryAttempts} recovery attempt${recoveryAttempts === 1 ? '' : 's'}. The last tool result is already in the transcript; submit a follow-up or resume after checking logs.`;
             logger.warn({
@@ -2327,13 +2403,10 @@ export class AgentSession extends EventEmitter {
           if (hasActionableText && this._mode !== 'plan' && isProgressOnlyAssistantText(strippedCheck)) {
             if (progressOnlyRecoveryCount < MAX_PROGRESS_ONLY_RECOVERY) {
               progressOnlyRecoveryCount++;
-              const continueMsg: Message = {
-                role: 'user',
-                content: `Your previous response was only a progress update, not a completed answer: "${strippedCheck.slice(0, 240)}"\n\nDo not stop after narrating the next step. If work remains, call the appropriate tool now. If the task is actually complete, give the final answer directly.`,
-                timestamp: Date.now(),
-              };
-              this.messages.push(continueMsg);
-              this.store.appendMessage(this.sessionId, continueMsg);
+              logger.warn(
+                { turnIndex, attempt: progressOnlyRecoveryCount, text: strippedCheck.slice(0, 240) },
+                'TUI: progress-only narration without tool call — continuing from prefix (no user lecture)',
+              );
               continue;
             }
 
@@ -2606,20 +2679,32 @@ export class AgentSession extends EventEmitter {
       reportedPromptTokens: this.effectiveReportedPromptTokens(),
       reportedRawEstimateTokens: this.effectiveReportedRawPromptTokens(),
     }).promptTokenEstimate > contextWindowCeiling;
-    const result = await this.enforceRequiredCompaction(
-      maxContextTokens,
-      {
-        customInstructions: 'The resumed session exceeded the backend fit budget. Semantically summarize only the oldest complete prefix while preserving the recent suffix verbatim.',
-        overheadTokens: this._systemOverheadTokens,
-        planFilePath: this._planFilePath ?? undefined,
-        abortSignal,
-      },
-      'resume',
-      hardFitRequired,
-      true,
-    );
+    let result: { compacted: boolean; attempts: number };
+    try {
+      result = await this.enforceRequiredCompaction(
+        maxContextTokens,
+        {
+          customInstructions: 'The resumed session exceeded the backend fit budget. Semantically summarize only the oldest complete prefix while preserving the recent suffix verbatim.',
+          overheadTokens: this._systemOverheadTokens,
+          planFilePath: this._planFilePath ?? undefined,
+          abortSignal,
+        },
+        'resume',
+        hardFitRequired,
+        true,
+      );
+    } catch (err) {
+      logger.warn(
+        { sessionId, err: (err as Error).message },
+        'TUI resume required compaction failed — preserving history; working context may still be bounded',
+      );
+      result = { compacted: false, attempts: 0 };
+    }
     if (!result.compacted) {
-      throw new Error('Required resume compaction returned without a semantic rewrite');
+      return this.boundResumeWorkingContext(
+        sessionId, beforeMessages, beforeTokens,
+        maxContextTokens, preflightCeiling, contextWindowCeiling,
+      );
     }
     if (abortSignal?.aborted) {
       throw abortSignal.reason ?? new Error('Session resume superseded');
@@ -2633,8 +2718,9 @@ export class AgentSession extends EventEmitter {
       reportedRawEstimateTokens: this.effectiveReportedRawPromptTokens(this.messages, 0),
     });
     if (promptBudget.promptTokenEstimate > contextWindowCeiling) {
-      throw new Error(
-        `Resume semantic compaction did not restore backend headroom (${promptBudget.promptTokenEstimate}/${contextWindowCeiling} tokens); history was preserved`,
+      return this.boundResumeWorkingContext(
+        sessionId, beforeMessages, beforeTokens,
+        maxContextTokens, preflightCeiling, contextWindowCeiling,
       );
     }
     logger.info(
@@ -2647,6 +2733,64 @@ export class AgentSession extends EventEmitter {
       afterMessages: this.messages.length,
       beforeTokens,
       afterTokens: promptBudget.promptTokenEstimate,
+      preflightCeiling,
+      contextWindowCeiling,
+      maxContextTokens,
+      responsiveBudgetExceeded: beforeTokens > preflightCeiling,
+      hardBudgetExceeded: beforeTokens > contextWindowCeiling,
+      contextWindowDiscoveryDeferred: false,
+    };
+  }
+
+  /** Drop all but the newest screenshot from the working projection. Transcript unchanged. */
+  private stripStaleWorkingImages(keepNewest = 1): number {
+    const result = stripStaleWorkingImages(this.messages, keepNewest);
+    if (result.stripped > 0) this.messages = result.messages;
+    return result.stripped;
+  }
+
+  /**
+   * Last-resort resume bound: keep the newest working-context messages that
+   * fit the backend ceiling. Append-only transcript is never touched.
+   */
+  private boundResumeWorkingContext(
+    sessionId: string,
+    beforeMessages: number,
+    beforeTokens: number,
+    maxContextTokens: number,
+    preflightCeiling: number,
+    contextWindowCeiling: number,
+  ): ResumeTrimResult {
+    const overhead = this._systemOverheadTokens;
+    let start = 0;
+    const fits = (slice: Message[]) =>
+      estimateTokens(slice, this._model) + overhead <= contextWindowCeiling;
+    while (start < this.messages.length - 1 && !fits(this.messages.slice(start))) {
+      start++;
+      while (
+        start < this.messages.length - 1
+        && Array.isArray(this.messages[start]?.content)
+        && (this.messages[start]!.content as Array<{ type: string }>).some((block) => block.type === 'tool_result')
+      ) {
+        start++;
+      }
+    }
+    const kept = this.messages.slice(start);
+    const dropped = this.messages.length - kept.length;
+    if (dropped > 0) {
+      this.messages = kept;
+      logger.warn(
+        { sessionId, dropped, afterMessages: kept.length, contextWindowCeiling },
+        'TUI resume bounded working context after semantic compaction could not rewrite; transcript unchanged',
+      );
+    }
+    const afterTokens = estimateTokens(this.messages, this._model) + overhead;
+    return {
+      dropped,
+      beforeMessages,
+      afterMessages: this.messages.length,
+      beforeTokens,
+      afterTokens,
       preflightCeiling,
       contextWindowCeiling,
       maxContextTokens,
@@ -2821,36 +2965,46 @@ export class AgentSession extends EventEmitter {
           this.effectiveReportedPromptTokens(),
           this.effectiveReportedRawPromptTokens(),
         );
-        const result = await this.enforceRequiredCompaction(
-          maxContextTokens,
-          {
-            overheadTokens: this._systemOverheadTokens,
-            planFilePath: this._planFilePath ?? undefined,
-            abortSignal,
-          },
-          'resume',
-          compactionRequired,
-        );
-        this.assertResumeCurrent(abortSignal, generation);
-        const afterTokens = effectiveContextTokens(
-          this.messages,
-          this._model,
-          this._systemOverheadTokens,
-        );
-        resumeCompaction = {
-          compacted: result.compacted,
-          method: 'provider_semantic',
-          attempts: result.attempts,
-          beforeMessages,
-          afterMessages: this.messages.length,
-          beforeTokens,
-          afterTokens,
-          thresholdTokens: Math.round(
-            maxContextTokens * compactionThresholdFor(maxContextTokens),
-          ),
-          maxContextTokens,
-        };
-        this._postCompactionRequestPending = result.compacted;
+        try {
+          const result = await this.enforceRequiredCompaction(
+            maxContextTokens,
+            {
+              overheadTokens: this._systemOverheadTokens,
+              planFilePath: this._planFilePath ?? undefined,
+              abortSignal,
+            },
+            'resume',
+            compactionRequired,
+          );
+          this.assertResumeCurrent(abortSignal, generation);
+          const afterTokens = effectiveContextTokens(
+            this.messages,
+            this._model,
+            this._systemOverheadTokens,
+          );
+          resumeCompaction = {
+            compacted: result.compacted,
+            method: 'provider_semantic',
+            attempts: result.attempts,
+            beforeMessages,
+            afterMessages: this.messages.length,
+            beforeTokens,
+            afterTokens,
+            thresholdTokens: Math.round(
+              maxContextTokens * compactionThresholdFor(maxContextTokens),
+            ),
+            maxContextTokens,
+          };
+          this._postCompactionRequestPending = result.compacted;
+        } catch (err) {
+          // Codex/Grok never fail session init because a summary stalled.
+          // History is preserved; prepareResumeTranscriptForUse may still
+          // bound the working set. Transcript remains append-only.
+          logger.warn(
+            { sessionId: session.id, err: (err as Error).message },
+            'TUI resume semantic compaction failed — preserving history and continuing init',
+          );
+        }
       }
     }
     const resumeTrim = await this.prepareResumeTranscriptForUse(
@@ -2930,6 +3084,18 @@ export class AgentSession extends EventEmitter {
    *  E.g. Claude thinking blocks use `thinking_0` IDs; Codex expects `rs_*` prefix.
    *  Returns 'cleared' if session was reset, 'ok' if same provider, 'error' if failed. */
   setModel(model: string): 'cleared' | 'ok' | 'error' {
+    // SCLI-623: a model identifier never contains whitespace. Reject any
+    // whitespace-containing spec at the boundary so a prompt string (e.g.
+    // "cortex/DeepSeek-V4-Flash Reply with exactly: …") can never be persisted
+    // into ~/.shizuha/settings.json's `model` field.
+    if (/\s/.test(model)) {
+      this.emit('agent_event', {
+        type: 'error',
+        error: `Cannot set model "${model}": model identifiers cannot contain whitespace`,
+        timestamp: Date.now(),
+      });
+      return 'error';
+    }
     if (this.resumeAbortController) {
       this.resumeGeneration++;
       this.resumeAbortController.abort(new Error('Session resume superseded by model change'));
@@ -3407,6 +3573,23 @@ export class AgentSession extends EventEmitter {
     } catch {
       return [];
     }
+  }
+
+  listMcpServers(): Array<{
+    name: string;
+    disabled: boolean;
+    connected: boolean;
+    tools: number;
+    error?: string;
+  }> {
+    return this.mcpManager?.listServers() ?? [];
+  }
+
+  async setMcpServerEnabled(name: string, enabled: boolean): Promise<{ ok: boolean; message: string }> {
+    if (!this.mcpManager) return { ok: false, message: 'MCP manager not ready' };
+    const { setMcpServerDisabled } = await import('./utils/settings.js');
+    setMcpServerDisabled(name, !enabled);
+    return this.mcpManager.setServerEnabled(name, enabled);
   }
 
   /**

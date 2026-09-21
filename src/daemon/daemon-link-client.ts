@@ -15,12 +15,17 @@ import { logger } from '../utils/logger.js';
 import type { AgentInfo, DaemonState } from './types.js';
 import { harnessReport } from './harness-versions.js';
 import { getHeartbeatQueueDrainOutcome } from './heartbeat-outcome.js';
+import type { AgentLifecycleState } from './agent-state-store.js';
 import {
   readRuntimeLaneFences,
   runtimeLaneFenceStatePath,
   writeRuntimeLaneFences,
   type PersistedRuntimeLaneFence,
 } from './runtime-lane-fence-state.js';
+import {
+  executeRecoveryAction,
+  type RecoveryActionFrame,
+} from './recovery-actions.js';
 
 export type DaemonLinkApplyConfig = (
   agentId: string,
@@ -65,6 +70,8 @@ export interface DaemonLinkClientOptions {
   token?: string;
   getAgents: () => AgentInfo[];
   getDaemonState?: () => DaemonState | null;
+  /** Hive lifecycle intent projected from the authoritative AgentStateStore. */
+  getLifecycleStates?: () => Map<string, AgentLifecycleState>;
   /** Latest real turn/output activity observed by the daemon for an agent. */
   getLastActiveAt?: (agentId: string) => string | undefined;
   applyConfig?: DaemonLinkApplyConfig;
@@ -170,6 +177,7 @@ function serializeAgentForDaemonLink(
   state: DaemonState | null | undefined,
   reason: string,
   lastActiveAt?: string,
+  lifecycleState?: AgentLifecycleState,
 ): Record<string, unknown> {
   const runtimeState = daemonStateForAgent(state, agent.id);
   const enabled = runtimeState?.enabled ?? agent.status !== 'disabled';
@@ -225,6 +233,8 @@ function serializeAgentForDaemonLink(
     status_message: runtimeState?.error ?? '',
     enabled,
     desired_enabled: enabled,
+    lifecycle_state: lifecycleState
+      ?? (enabled ? 'enabled' : 'operator_stopped'),
     runtime_state: runtimeState ? {
       status: runtimeState.status,
       enabled: runtimeState.enabled,
@@ -411,6 +421,7 @@ export class DaemonLinkClient {
         this.options.getDaemonState?.(),
         reason,
         this.options.getLastActiveAt?.(agent.id),
+        this.options.getLifecycleStates?.().get(agent.id),
       ),
     });
   }
@@ -439,6 +450,7 @@ export class DaemonLinkClient {
   sendSnapshot(reason = 'snapshot'): boolean {
     if (!this.isConnected) return false;
     const agents = this.options.getAgents();
+    const lifecycleStates = this.options.getLifecycleStates?.();
     for (const agent of agents) {
       this.sendJson({
         type: 'state_snapshot',
@@ -449,6 +461,7 @@ export class DaemonLinkClient {
           this.options.getDaemonState?.(),
           reason,
           this.options.getLastActiveAt?.(agent.id),
+          lifecycleStates?.get(agent.id),
         ),
       });
     }
@@ -619,6 +632,9 @@ export class DaemonLinkClient {
       case 'delete_agent':
       case 'agent_delete':
         await this.handleDeleteAgentFrame(frame, isCurrent);
+        break;
+      case 'recovery_action':
+        await this.handleRecoveryActionFrame(frame, isCurrent);
         break;
       case 'close_reason':
         logger.warn({ code: frame.code, message: frame.message }, 'DaemonLink closed by Hive');
@@ -812,6 +828,28 @@ export class DaemonLinkClient {
     }
   }
 
+  private async handleRecoveryActionFrame(
+    frame: DaemonLinkFrame,
+    isCurrent: SocketOwnershipGuard,
+  ): Promise<void> {
+    if (!isCurrent()) return;
+    const result = await executeRecoveryAction(frame as RecoveryActionFrame, {
+      findAgent: (key) => this.options.getAgents().find((agent) =>
+        agent.id === key
+        || agent.username === key
+        || `shizuha-agent-${agent.username}` === key
+      ) ?? null,
+    });
+    // The evaluator may complete after reconnect/stop. Never let socket A's
+    // result cross the existing ownership fence and publish through socket B.
+    if (!isCurrent()) return;
+    this.sendJson({
+      ...result,
+      seq: this.nextSeq(),
+      ack_seq: frame.seq ?? 0,
+    });
+  }
+
   private nextSeq(): number {
     this.seq += 1;
     return this.seq;
@@ -832,6 +870,7 @@ export function buildDaemonLinkClientFromEnv(
   deleteAgent: DaemonLinkDeleteAgent,
   getLastActiveAt?: (agentId: string) => string | undefined,
   probeRuntimeLaneHealth?: DaemonLinkProbeRuntimeLaneHealth,
+  getLifecycleStates?: () => Map<string, AgentLifecycleState>,
 ): DaemonLinkClient {
   return new DaemonLinkClient({
     platformUrl,
@@ -843,6 +882,7 @@ export function buildDaemonLinkClientFromEnv(
     getAgents,
     getDaemonState,
     getLastActiveAt,
+    getLifecycleStates,
     applyConfig,
     deleteAgent,
     probeRuntimeLaneHealth,

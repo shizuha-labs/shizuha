@@ -22,15 +22,46 @@ export const CORTEX_GROUP = 'Shizuha / Cortex';
  * An empty list (`[]`, reachable but serving nothing) shows no Cortex entries
  * rather than a stale default.
  */
+/** True when Cortex still serves this id. Dead backends must not appear;
+ *  a saturated KV-residency guard must — it is busy, not gone. */
+export function cortexCatalogRowIsListed(row: {
+  id: string;
+  available?: boolean;
+  status?: string;
+}): boolean {
+  const status = (row.status || '').toLowerCase();
+  if (status === 'unavailable') return false;
+  // CTX-885 advertises healthy-but-full models as available:false /
+  // status=residency_full so clients do not treat them as idle capacity.
+  // Dropping those rows hid cortex/GLM-5.3-Flash from every SCLI /model
+  // picker whenever Hive filled the 16 homes (operator 2026-09-06).
+  if (status === 'residency_full') return true;
+  return row.available !== false;
+}
+
 /** Drop Cortex rows that cannot serve. /v1/models used to keep
  *  available=false ids (dead adopted backends); SCLI /model listed them. */
 export function servableCortexModelIds(
   rows: Array<{ id: string; available?: boolean; status?: string }> | null,
 ): string[] | null {
   if (rows === null) return null;
-  return rows
-    .filter((m) => m.available !== false && m.status !== 'unavailable')
-    .map((m) => m.id);
+  return rows.filter(cortexCatalogRowIsListed).map((m) => m.id);
+}
+
+/** Partition a live catalog id into its picker row shape (CTX-971 / CTX-713).
+ * Cortex catalog ids are `alias/model`: first-party / wholesale-reseller
+ * entries advertise as `cortex/<model>`, onboarded third-party providers as
+ * `<seller_slug>/<model>`. A bare historical id (no `/`) stays a first-party
+ * Cortex row. All rows route through the Cortex gateway, so `provider` stays
+ * `cortex` for availability; only display/group vary by alias. */
+export function catalogRowShape(id: string): {
+  alias: string;
+  firstParty: boolean;
+} {
+  const slash = id.indexOf('/');
+  if (slash <= 0) return { alias: 'cortex', firstParty: true };
+  const alias = id.slice(0, slash);
+  return { alias, firstParty: alias === 'cortex' };
 }
 
 export function assembleCortexModels(liveModelIds: string[] | null): ModelInfo[] {
@@ -45,14 +76,33 @@ export function assembleCortexModels(liveModelIds: string[] | null): ModelInfo[]
       visibility: 'list',
     }];
   }
-  return liveModelIds.map((id) => ({
-    // CTX-67: clean model id slug (no cortex/ prefix); displayName branded.
-    slug: id,
-    displayName: `Cortex/${id}`,
-    description: 'Shizuha Cortex (hosted)',
-    provider: 'cortex',
-    group: CORTEX_GROUP,
-    reasoningLevels: [],
-    visibility: 'list',
-  }));
+  return liveModelIds.map((id) => {
+    const shape = catalogRowShape(id);
+    if (shape.firstParty) {
+      return {
+        // CTX-713: first-party catalog ids are cortex/<model> — show the slug
+        // as advertised; bare historical ids keep the readable Cortex/<id>.
+        slug: id,
+        displayName: id.includes('/') ? id : `Cortex/${id}`,
+        description: 'Shizuha Cortex (hosted)',
+        provider: 'cortex',
+        group: CORTEX_GROUP,
+        reasoningLevels: [],
+        visibility: 'list',
+      };
+    }
+    return {
+      // CTX-971: onboarded third-party providers advertise as
+      // <seller_slug>/<model> — render the slug RAW (never prefix it with
+      // Cortex/) and group under the seller's own alias header, so the
+      // marketplace catalog reads as advertised once cortex#120 lands.
+      slug: id,
+      displayName: id,
+      description: `Cortex marketplace — provider ${shape.alias}`,
+      provider: 'cortex',
+      group: shape.alias,
+      reasoningLevels: [],
+      visibility: 'list',
+    };
+  });
 }

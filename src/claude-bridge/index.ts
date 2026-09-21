@@ -20,6 +20,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 // @ts-ignore — ws has no declaration file
 import { WebSocketServer, WebSocket } from 'ws';
+import type { OrgProviderResolveResult } from '../auth/org-provider-resolver.js';
 import { HEARTBEAT_TRIGGER, writeBaseInstructions } from '../agent-base-instructions.js';
 import { resolveBrowserMcpServer } from '../browser-mcp.js';
 import { readAgentCredential } from '../auth/credential-resolver.js';
@@ -93,6 +94,102 @@ interface WsClient {
   userId: string;
   /** Active execution threadId (only one at a time per client) */
   activeThreadId: string | null;
+}
+
+// PLAT-4707: a Claude transcript can outlive the durable task/PR state that
+// produced it.  Keep the authority tuple small and typed: never persist task
+// bodies, Connect messages, credentials, or human prose in this sidecar.
+export type ClaudeSessionAuthorityRef =
+  | { kind: 'pulse_task'; taskKey: string }
+  | { kind: 'origin_pr'; repo: string; number: number };
+
+export interface ClaudeSessionAuthorityValue {
+  ref: ClaudeSessionAuthorityRef;
+  status: string;
+  version: string;
+  blockers?: Array<{ key: string; status: string; version: string }>;
+  headSha?: string;
+  mergeCommitSha?: string | null;
+}
+
+export interface ClaudeSessionProvenanceSnapshot {
+  schemaVersion: 1;
+  authorities: ClaudeSessionAuthorityValue[];
+}
+
+interface ClaudeSessionProvenanceRecord {
+  schemaVersion: 1;
+  sessionId: string;
+  capturedAt: string;
+  references: ClaudeSessionAuthorityRef[];
+  snapshot: ClaudeSessionProvenanceSnapshot;
+}
+
+export interface ClaudeSessionProvenanceDecision {
+  action: 'resume' | 'invalidate';
+  changedFields: string[];
+  oldDigest: string;
+  currentDigest: string;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function claudeSessionProvenanceDigest(snapshot: ClaudeSessionProvenanceSnapshot): string {
+  return crypto.createHash('sha256').update(canonicalJson(snapshot)).digest('hex');
+}
+
+export function extractClaudeSessionAuthorityRefs(content: string): ClaudeSessionAuthorityRef[] {
+  const refs = new Map<string, ClaudeSessionAuthorityRef>();
+  for (const match of content.matchAll(/\b([A-Z][A-Z0-9]{1,15}-\d+)\b/g)) {
+    const taskKey = match[1]!;
+    refs.set(`task:${taskKey}`, { kind: 'pulse_task', taskKey });
+  }
+  for (const match of content.matchAll(/https?:\/\/origin\.shizuha\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pulls\/(\d+)/g)) {
+    const repo = match[1]!;
+    const number = Number.parseInt(match[2]!, 10);
+    refs.set(`pr:${repo}#${number}`, { kind: 'origin_pr', repo, number });
+  }
+  // A single inbound payload must not fan out into an unbounded authority
+  // crawl.  Sixteen covers multi-PR/task handoffs while keeping the gate's
+  // worst-case latency and dependency load finite.
+  return [...refs.values()]
+    .sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b)))
+    .slice(0, 16);
+}
+
+export function decideClaudeSessionProvenance(
+  previous: ClaudeSessionProvenanceSnapshot,
+  current: ClaudeSessionProvenanceSnapshot,
+): ClaudeSessionProvenanceDecision {
+  const oldDigest = claudeSessionProvenanceDigest(previous);
+  const currentDigest = claudeSessionProvenanceDigest(current);
+  if (oldDigest === currentDigest) {
+    return { action: 'resume', changedFields: [], oldDigest, currentDigest };
+  }
+  const oldByRef = new Map(previous.authorities.map((entry) => [canonicalJson(entry.ref), entry]));
+  const currentByRef = new Map(current.authorities.map((entry) => [canonicalJson(entry.ref), entry]));
+  const changed = new Set<string>();
+  for (const key of new Set([...oldByRef.keys(), ...currentByRef.keys()])) {
+    const before = oldByRef.get(key) as Record<string, unknown> | undefined;
+    const after = currentByRef.get(key) as Record<string, unknown> | undefined;
+    if (!before || !after) {
+      changed.add('authority_set');
+      continue;
+    }
+    for (const field of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      if (field !== 'ref' && canonicalJson(before[field]) !== canonicalJson(after[field])) changed.add(field);
+    }
+  }
+  return { action: 'invalidate', changedFields: [...changed].sort(), oldDigest, currentDigest };
 }
 
 // ── SCLI-61: poisoned-session (wedge) detection ──
@@ -187,13 +284,18 @@ function isBridgePromptDebugEnabled(): boolean {
   return process.env['SHIZUHA_DEBUG_BRIDGE_PROMPTS'] === '1';
 }
 
-function summarizePromptForLog(prompt: string | null | undefined): Record<string, unknown> {
+export function summarizePromptForLog(prompt: string | null | undefined): Record<string, unknown> {
   const trimmed = prompt?.trim() ?? '';
   return {
     present: trimmed.length > 0,
     length: trimmed.length,
     hasIdentityHeader: trimmed.includes('## Shizuha Agent Identity'),
-    firstLine: trimmed.split('\n')[0] ?? '',
+    // SCLI-546: never disclose prompt text, first-line content, escaped
+    // controls, or prefixes in startup logs. Only a one-way SHA-256 digest is
+    // emitted, so a 65 KiB prompt cannot amplify a log line and prompt content
+    // never reaches ordinary log sinks. The full prompt is only ever printed
+    // behind the explicit SHIZUHA_DEBUG_BRIDGE_PROMPTS=1 opt-in.
+    digest: trimmed ? crypto.createHash('sha256').update(trimmed).digest('hex') : null,
   };
 }
 
@@ -220,6 +322,74 @@ export function resolveModelTokenPolicy(opts: {
     );
   }
   return opts.envToken || opts.hostPoolToken || '';
+}
+
+/**
+ * HIVE-2166 slice 3 (HIVE-314 S3): resolve the agent→org→Cortex provider
+ * context BEFORE the model-token flow. Pre-cutover this is INERT: the sidecar
+ * /org-provider/resolve endpoint does not exist yet, so fetchOrgProviderResolution
+ * returns null and the caller proceeds with the existing token-source policy.
+ * When the coordinator endpoint lands, a resolved context carries the org-scoped
+ * provider/model override and the same-org isolation invariant is enforced
+ * server-side AND re-checked here (assertSameOrgCandidates inside the client).
+ *
+ * Contract (exported for tests):
+ *   - NEVER throws: resolution unavailability must not crash-loop the spawn
+ *     (PLAT-879 discipline) — every failure mode resolves to `null`.
+ *   - Invariant violations are fail-loud: the reporter fires (redacted error
+ *     log here; the Pulse finding + Security DMs wire in with the coordinator
+ *     cutover) and the result resolves to `null` so the existing token flow
+ *     proceeds pre-cutover. Post-cutover the caller must refuse to spawn.
+ *   - Key material never appears in logs: ResolvedProviderContext carries
+ *     opaque refs only; free text goes through redactProviderErrorText.
+ */
+export async function resolveOrgProviderForSpawn(opts: {
+  identity: string;
+  requestedModelId?: string;
+  log?: { info: (line: string) => void; warn: (line: string) => void; error: (line: string) => void };
+}): Promise<OrgProviderResolveResult | null> {
+  const log = opts.log ?? {
+    info: (line: string) => console.log(line),
+    warn: (line: string) => console.warn(line),
+    error: (line: string) => console.error(line),
+  };
+  try {
+    const { fetchOrgProviderResolution, redactProviderErrorText } = await import('../auth/org-provider-resolver.js');
+    const result = await fetchOrgProviderResolution({
+      identity: opts.identity,
+      requestedModelId: opts.requestedModelId,
+      providerPreference: 'anthropic',
+      onInvariantViolation: (violation) => {
+        log.error(
+          `[claude-bridge] PROVIDER ISOLATION VIOLATION (HIVE-314) for ${opts.identity}: ` +
+          `${redactProviderErrorText(violation.message)} — refusing org-provider resolution; ` +
+          `falling back to the existing token-source policy. Security-owned follow-up required.`,
+        );
+      },
+    });
+    if (result?.outcome === 'resolved') {
+      const ctx = result.context;
+      const override = ctx.modelId && opts.requestedModelId && ctx.modelId !== opts.requestedModelId
+        ? ` model-override=${ctx.modelId} (requested ${opts.requestedModelId})`
+        : '';
+      log.info(
+        `[claude-bridge] org-provider resolved for ${opts.identity}: org=${ctx.organizationId} ` +
+        `provider=${ctx.cortexProviderId} model=${ctx.modelId}${override} (key-ref opaque, not logged)`,
+      );
+    } else if (result) {
+      log.warn(
+        `[claude-bridge] org-provider resolution unavailable for ${opts.identity}: ` +
+        `reason=${result.reason} — proceeding with the existing token-source policy`,
+      );
+    } // else: no sidecar socket/endpoint (pre-cutover) — silent, expected.
+    return result;
+  } catch (e) {
+    log.warn(
+      `[claude-bridge] org-provider resolution errored (non-fatal, pre-cutover): ` +
+      `${(e as Error).message?.slice(0, 200) ?? 'unknown'} — proceeding with the existing token-source policy`,
+    );
+    return null;
+  }
 }
 
 /**
@@ -327,10 +497,9 @@ export function isHeartbeatTrigger(content: string): boolean {
 
 export const CLAUDE_HEARTBEAT_OBSERVATION_RETRY_TRIGGER =
   '[HEARTBEAT RETRY] The preceding scheduler turn ended before successfully observing Pulse. ' +
-  'Call `mcp__shizuha-pulse__pulse_get_my_alerts` as your FIRST action now, then call `mcp__shizuha-pulse__pulse_get_my_tasks`. This exact ordered native MCP pair is mandatory; ' +
-  'do not infer either inbox from prior conversation, call a status-filtered substitute, or act on remembered work first. ' +
-  'After both unfiltered results: work/forward the highest-priority ready item across alerts and tasks; alerts win ties but never preempt higher-priority task WIP. Continue per the heartbeat protocol, ' +
-  'or produce ZERO output only if both inboxes prove nothing is movable.';
+  'Call `mcp__shizuha-pulse__pulse_get_my_work` as your FIRST action now (alerts + tasks in one snapshot). ' +
+  'You choose what to advance. Do not infer the inbox from prior conversation. ' +
+  'Produce ZERO output only if both inboxes prove nothing is movable.';
 
 function toolResultHasContent(content: unknown): boolean {
   if (typeof content === 'string') return content.trim().length > 0;
@@ -342,6 +511,8 @@ const CLAUDE_HEARTBEAT_ALERT_TOOL =
   'mcp__shizuha-pulse__pulse_get_my_alerts';
 const CLAUDE_HEARTBEAT_TASK_TOOL =
   'mcp__shizuha-pulse__pulse_get_my_tasks';
+const CLAUDE_HEARTBEAT_WORK_TOOL =
+  'mcp__shizuha-pulse__pulse_get_my_work';
 const CLAUDE_HEARTBEAT_GATE_MARKER =
   '.heartbeat-pulse-observation-required';
 const CLAUDE_HEARTBEAT_HOOK_SCRIPT =
@@ -352,9 +523,9 @@ const CLAUDE_HEARTBEAT_HOOK_SCRIPT =
  * not stop resumed sessions from executing a remembered task before observing
  * Pulse. Both the bridge and Claude's own UserPromptSubmit boundary create a
  * marker, so process/injection races cannot leave a heartbeat unarmed. The
- * PreToolUse hook blocks every other tool before execution. The marker is a
- * two-stage state machine: alerts must succeed before tasks; a successful
- * unfiltered task read then removes it.
+ * PreToolUse hook blocks every other tool before execution. Combined
+ * `pulse_get_my_work` completes observation in one call; the older alerts
+ * then tasks primitives remain as a fallback, not a required sequence.
  */
 export function installClaudeHeartbeatObservationHooks(
   settings: Record<string, unknown>,
@@ -368,6 +539,21 @@ const mode = process.argv[2] || '';
 const marker = process.argv[3] || '';
 const alertTool = process.argv[4] || '';
 const taskTool = process.argv[5] || '';
+const workTool = process.argv[6] || '';
+// PLAT-5257: fail-open escape hatch. If the required pulse tool is
+// unavailable (harness MCP client stuck in "connecting" after an auth-broker
+// socket recreation), the PreToolUse gate would otherwise block EVERY tool —
+// including ToolSearch (the reconnect path), Bash (diagnosis), and Connect
+// (escalation) — deadlocking the agent. After ESCAPE_AFTER consecutive blocked
+// tools within one heartbeat turn, allow exactly those escape tools so the
+// seat degrades observably instead of failing silent.
+const ESCAPE_AFTER = 3;
+const ESCAPE_TOOLS = new Set([
+  'ToolSearch',
+  'Bash',
+  'mcp__shizuha-connect__message_user',
+]);
+const escPath = marker ? marker + '.esc' : '';
 let raw = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => { raw += chunk; });
@@ -375,10 +561,23 @@ process.stdin.on('end', () => {
   let event = {};
   try { event = JSON.parse(raw || '{}'); } catch {}
   const toolName = String(event.tool_name || '');
+  const readEsc = () => {
+    if (!escPath || !fs.existsSync(escPath)) return 0;
+    try { return parseInt(fs.readFileSync(escPath, 'utf8').trim() || '0', 10) || 0; } catch { return 0; }
+  };
+  const writeEsc = (n) => {
+    if (!escPath) return;
+    try { fs.writeFileSync(escPath, String(n), { mode: 0o600 }); } catch {}
+  };
+  const clearEsc = () => {
+    if (!escPath) return;
+    try { fs.unlinkSync(escPath); } catch {}
+  };
   if (mode === 'prompt' && marker) {
     const prompt = String(event.prompt || '').trimStart();
     if (/^\\[HEARTBEAT(?: RETRY)?\\]/i.test(prompt)) {
       try { fs.writeFileSync(marker, 'alerts', { mode: 0o600 }); } catch {}
+      clearEsc();
     }
     return;
   }
@@ -386,21 +585,49 @@ process.stdin.on('end', () => {
   if (marker && fs.existsSync(marker)) {
     try { stage = fs.readFileSync(marker, 'utf8').trim(); } catch {}
   }
-  const requiredTool = stage === 'tasks' ? taskTool : alertTool;
-  if (mode === 'pre' && stage && toolName !== requiredTool) {
+  const requiredTool = workTool || (stage === 'tasks' ? taskTool : alertTool);
+  if (mode === 'pre') {
+    if (!stage) {
+      clearEsc();
+      return;
+    }
+    const allowed = new Set();
+    if (workTool) allowed.add(workTool);
+    if (stage === 'tasks') allowed.add(taskTool);
+    else allowed.add(alertTool);
+    if (allowed.has(toolName)) {
+      return;
+    }
+    const failures = readEsc() + 1;
+    writeEsc(failures);
+    if (failures >= ESCAPE_AFTER && ESCAPE_TOOLS.has(toolName)) {
+      process.stderr.write(
+        'Heartbeat observation degraded after ' + failures +
+        ' blocked tools: pulse tool unavailable; allowing ' + toolName +
+        ' for diagnosis/escalation. Observation gate resumes on pulse recovery.\\n'
+      );
+      return;
+    }
     process.stderr.write(
       'Heartbeat inbox observation required: call ' + requiredTool +
-      ' successfully before any other tool. Required order is alerts then tasks; prior conversation is not current state.\\n'
+      ' successfully before any other tool. Combined pulse_get_my_work is enough; prior conversation is not current state.\\n'
     );
     process.exitCode = 2;
     return;
   }
+  if (mode === 'post' && workTool && toolName === workTool) {
+    try { fs.unlinkSync(marker); } catch {}
+    clearEsc();
+    return;
+  }
   if (mode === 'post' && stage === 'alerts' && toolName === alertTool) {
     try { fs.writeFileSync(marker, 'tasks', { mode: 0o600 }); } catch {}
+    clearEsc();
     return;
   }
   if (mode === 'post' && stage === 'tasks' && toolName === taskTool) {
     try { fs.unlinkSync(marker); } catch {}
+    clearEsc();
   }
 });
 `;
@@ -478,6 +705,7 @@ process.stdin.on('end', () => {
       markerPath,
       CLAUDE_HEARTBEAT_ALERT_TOOL,
       CLAUDE_HEARTBEAT_TASK_TOOL,
+      CLAUDE_HEARTBEAT_WORK_TOOL,
     ],
   );
   upsert(
@@ -489,6 +717,19 @@ process.stdin.on('end', () => {
       markerPath,
       CLAUDE_HEARTBEAT_ALERT_TOOL,
       CLAUDE_HEARTBEAT_TASK_TOOL,
+      CLAUDE_HEARTBEAT_WORK_TOOL,
+    ],
+  );
+  upsert(
+    'PostToolUse',
+    CLAUDE_HEARTBEAT_WORK_TOOL,
+    [
+      scriptPath,
+      'post',
+      markerPath,
+      CLAUDE_HEARTBEAT_ALERT_TOOL,
+      CLAUDE_HEARTBEAT_TASK_TOOL,
+      CLAUDE_HEARTBEAT_WORK_TOOL,
     ],
   );
   upsert(
@@ -500,6 +741,7 @@ process.stdin.on('end', () => {
       markerPath,
       CLAUDE_HEARTBEAT_ALERT_TOOL,
       CLAUDE_HEARTBEAT_TASK_TOOL,
+      CLAUDE_HEARTBEAT_WORK_TOOL,
     ],
   );
   upsert(
@@ -511,6 +753,7 @@ process.stdin.on('end', () => {
       markerPath,
       CLAUDE_HEARTBEAT_ALERT_TOOL,
       CLAUDE_HEARTBEAT_TASK_TOOL,
+      CLAUDE_HEARTBEAT_WORK_TOOL,
     ],
   );
   return { markerPath, scriptPath };
@@ -558,6 +801,7 @@ export function shouldDropQueuedMessage(
 export interface ClaudeBridgeQueuedMessage {
   clientId: string;
   content: string;
+  provenanceRetries?: number;
   messageId?: string;
 }
 
@@ -943,6 +1187,128 @@ export function providerUnavailableFromRecentErrors(
   });
 }
 
+function authorityRows(payload: unknown): any[] {
+  if (Array.isArray(payload)) return payload;
+  if (payload && typeof payload === 'object' && Array.isArray((payload as any).results)) {
+    return (payload as any).results;
+  }
+  return payload && typeof payload === 'object' ? [payload] : [];
+}
+
+function activeBlockersFromPulseRow(row: any): Array<{ key: string; status: string; version: string }> {
+  const candidates = [row?.active_blockers, row?.blockers, row?.blocking_issues, row?.issue_links]
+    .find(Array.isArray) ?? [];
+  return candidates
+    .filter((entry: any) => {
+      const relation = String(entry?.link_type ?? entry?.relation ?? entry?.type ?? '').toLowerCase();
+      const status = String(entry?.status ?? entry?.issue?.status ?? '').toLowerCase();
+      const active = !['completed', 'done', 'resolved', 'closed', 'cancelled', 'deferred', 'rejected'].includes(status);
+      return active && (!relation || relation.includes('block'));
+    })
+    .map((entry: any) => ({
+      key: String(entry?.item_key ?? entry?.key ?? entry?.issue?.item_key ?? entry?.issue?.key ?? ''),
+      status: String(entry?.status ?? entry?.issue?.status ?? ''),
+      version: String(entry?.updated_at ?? entry?.version ?? entry?.issue?.updated_at ?? ''),
+    }))
+    .filter((entry: { key: string }) => entry.key)
+    .sort((a: { key: string }, b: { key: string }) => a.key.localeCompare(b.key));
+}
+
+async function fetchJsonWithAuthority(
+  url: string,
+  token: string,
+  authority: string,
+  scheme: 'Bearer' | 'token' = 'Bearer',
+): Promise<any> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetch(url, {
+      headers: { Authorization: `${scheme} ${token}`, Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const err = new Error(`${authority} returned HTTP ${response.status}`) as Error & { httpStatus?: number };
+      err.httpStatus = response.status;
+      throw err;
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function resolveClaudeSessionAuthoritySnapshot(
+  references: ClaudeSessionAuthorityRef[],
+): Promise<ClaudeSessionProvenanceSnapshot> {
+  const authorities: ClaudeSessionAuthorityValue[] = [];
+  for (const ref of references) {
+    if (ref.kind === 'pulse_task') {
+      const base = (process.env['PULSE_INTERNAL_URL'] ?? process.env['SHIZUHA_PULSE_URL']
+        ?? process.env['PULSE_API_URL'] ?? 'http://shizuha-pulse:8002').replace(/\/+$/, '');
+      const token = process.env['PULSE_SERVICE_TOKEN'] ?? process.env['SHIZUHA_AGENT_TOKEN']
+        ?? process.env['AGENT_ACCESS_TOKEN'] ?? '';
+      if (!token) throw new Error('Pulse provenance resolver has no service token');
+      let payload: any;
+      try {
+        payload = await fetchJsonWithAuthority(
+          `${base}/api/items/${encodeURIComponent(ref.taskKey)}/`, token, `Pulse ${ref.taskKey}`,
+        );
+      } catch (directError) {
+        // PLAT-4707 review (jun): the task-key regex matches ubiquitous prose
+        // tokens (SHA-256, UTF-8, ISO-9001), so a definitive not-found on the
+        // canonical key endpoint means the ref was never a durable authority.
+        // Dropping it keeps delivery alive; throwing here would wedge every
+        // message containing such a token (requeue-exhaustion on direct paths,
+        // heartbeat re-arm loops on the scheduler path). Transport/auth errors
+        // (5xx, network, 401/403, timeout) stay fail-loud.
+        if ((directError as Error & { httpStatus?: number }).httpStatus === 404) {
+          console.warn(`[claude-bridge] provenance ref Pulse ${ref.taskKey} not found — dropping ref (not a durable authority)`);
+          continue;
+        }
+        const searchUrl = new URL(`${base}/api/items/`);
+        searchUrl.searchParams.set('search', ref.taskKey);
+        searchUrl.searchParams.set('page_size', '20');
+        payload = await fetchJsonWithAuthority(searchUrl.toString(), token, `Pulse ${ref.taskKey}`)
+          .catch(() => { throw directError; });
+      }
+      const row = authorityRows(payload).find((entry) =>
+        String(entry?.item_key ?? entry?.key ?? '').toUpperCase() === ref.taskKey.toUpperCase());
+      if (!row) {
+        // Search resolved cleanly but no row matches the key — same definitive
+        // not-found class as the direct 404 above: drop, don't wedge.
+        console.warn(`[claude-bridge] provenance ref Pulse ${ref.taskKey} not found — dropping ref (not a durable authority)`);
+        continue;
+      }
+      authorities.push({
+        ref,
+        status: String(row.status?.slug ?? row.status ?? ''),
+        version: String(row.version ?? row.updated_at ?? row.modified_at ?? ''),
+        blockers: activeBlockersFromPulseRow(row),
+      });
+      continue;
+    }
+
+    const token = process.env['FORGEJO_TOKEN'] ?? process.env['ORIGIN_TOKEN'] ?? '';
+    if (!token) throw new Error('Origin provenance resolver has no token');
+    const row = await fetchJsonWithAuthority(
+      `https://origin.shizuha.com/api/v1/repos/${ref.repo}/pulls/${ref.number}`,
+      token,
+      `Origin ${ref.repo}#${ref.number}`,
+      'token',
+    );
+    authorities.push({
+      ref,
+      status: row.merged ? 'merged' : String(row.state ?? ''),
+      version: String(row.updated_at ?? ''),
+      headSha: String(row.head?.sha ?? ''),
+      mergeCommitSha: row.merge_commit_sha ? String(row.merge_commit_sha) : null,
+    });
+  }
+  authorities.sort((a, b) => canonicalJson(a.ref).localeCompare(canonicalJson(b.ref)));
+  return { schemaVersion: 1, authorities };
+}
+
 // ── Bridge ──
 
 export class ClaudeBridge {
@@ -958,6 +1324,7 @@ export class ClaudeBridge {
   private initialized = false;
   private startTime = Date.now();
   private isReplaying = true; // True during startup replay of resumed session
+  private pendingSessionProvenance: Omit<ClaudeSessionProvenanceRecord, 'sessionId'> | null = null;
 
   // Token tracking (accumulated across turns)
   private totalInputTokens = 0;
@@ -1030,6 +1397,10 @@ export class ClaudeBridge {
 
   // The threadId of the current active execution (claude -p is single-threaded)
   private activeThreadId: string | null = null;
+  /** Serializes the async Pulse/Origin provenance gate before a turn acquires
+   * activeThreadId; without it, two simultaneous direct messages can both pass
+   * the otherwise-idle boundary and write to Claude concurrently. */
+  private provenanceDispatchInFlight = false;
   private readonly activityPhase = new ActivityPhaseTracker({
     onChange: () => this.telemetryFlusher?.soon(),
   });
@@ -1366,6 +1737,10 @@ export class ClaudeBridge {
         agentEmail: process.env['AGENT_EMAIL'] || undefined,
         platformUrl: platformBase,
         ignoreEnvToken: force,
+        // PLAT-8236: force must actually mint a new token — without this the
+        // manager served the gateway-rejected token straight from the disk
+        // cache (fresh === token → no effective retry).
+        forceRefresh: force,
       });
       const fresh = await tm.getToken();
       return fresh || '';
@@ -1453,6 +1828,10 @@ export class ClaudeBridge {
         agentEmail: process.env['AGENT_EMAIL'] || undefined,
         platformUrl: platformBase,
         ignoreEnvToken: force,
+        // PLAT-8236: force must actually mint a new token — without this the
+        // manager served the gateway-rejected token straight from the disk
+        // cache (fresh === token → no effective retry).
+        forceRefresh: force,
       });
       const freshToken = await tm.getToken();
       if (!freshToken) {
@@ -1478,7 +1857,8 @@ export class ClaudeBridge {
           entry.headers = { ...entry.headers, Authorization: `Bearer ${freshToken}` };
         }
       }
-      fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2));
+      fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2), { mode: 0o600 });
+      fs.chmodSync(mcpJsonPath, 0o600);
       console.log(`[claude-bridge] MCP tokens refreshed via shizuha-id (file + .mcp.json)`);
     } catch (err) {
       console.error(`[claude-bridge] Token refresh error: ${(err as Error).message}`);
@@ -1825,6 +2205,9 @@ export class ClaudeBridge {
     if (!this.storedSessionId) {
       this.storedSessionId = this.loadStoredSessionId(sessionIdFile);
     }
+    if (this.storedSessionId) {
+      await this.validateRetainedSessionProvenance('restart');
+    }
     // Guard against a degenerate session: resuming a session whose transcript has
     // grown to tens of MB is slow (an 83MB resume hung >110s in testing) and the
     // first replayed turn can blow the account's remaining rate-limit budget.
@@ -1932,6 +2315,19 @@ export class ClaudeBridge {
     // Claude Code can't find its auth tokens.
     const spawnCmd = isRoot ? 'runuser' : claudePath;
     const spawnArgs = isRoot ? ['-p', '-u', 'agent', '--', claudePath, ...args] : args;
+
+    // HIVE-2166 slice 3 (HIVE-314 S3): resolve the agent→org→Cortex provider
+    // context BEFORE the model-token flow. Pre-cutover this is INERT (the
+    // sidecar endpoint does not exist yet → null); post-cutover a resolved
+    // context carries the org-scoped provider/model override and the same-org
+    // isolation invariant is enforced server-side AND re-checked in the client.
+    // Never throws (PLAT-879 discipline); invariant violations are fail-loud.
+    // See resolveOrgProviderForSpawn() for the full contract (exported for tests).
+    const orgProviderResolution = await resolveOrgProviderForSpawn({
+      identity: this.opts.agentUsername || this.opts.agentName || 'agent',
+      requestedModelId: this.opts.model,
+    });
+    void orgProviderResolution; // pre-cutover: telemetry/log only; switching activates with the coordinator endpoint
 
     // HIVE-125: source the Claude model token from the broker UDS at runtime instead
     // of the baked CLAUDE_CODE_OAUTH_TOKEN env. Token bytes are never logged. Because
@@ -2295,6 +2691,10 @@ export class ClaudeBridge {
       const { ConnectClient } = await import('../connect-client/index.js');
       this.connectClient = new ConnectClient({
         onOpen: () => this.emitTelemetry(),
+        // PLAT-8787: re-ack the durably-completed inbound backlog on every
+        // reconnect — a turn-end ack lost to a dying socket otherwise
+        // guarantees a byte-identical replay re-delivery next reconnect.
+        completedInboundMessageIds: () => this.store.completedInboundMessageIds(),
         onMessage: (convId, content, senderId, senderName, messageId) => {
           if (this.runtimeRollDrain.ready) {
             console.log(
@@ -2612,13 +3012,16 @@ export class ClaudeBridge {
       }
     } catch { /* prune is best-effort; never block bridge startup */ }
 
-    fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2));
+    fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpJson, null, 2), { mode: 0o600 });
+    fs.chmodSync(mcpJsonPath, 0o600);
 
     // Also write to Claude Code project dir (Claude reads from ~/.claude/projects/<hash>/.mcp.json)
     const projectDir = path.join(claudeDir, 'projects', `-${path.basename(workDir)}`);
     try {
       fs.mkdirSync(projectDir, { recursive: true });
-      fs.writeFileSync(path.join(projectDir, '.mcp.json'), JSON.stringify(mcpJson, null, 2));
+      const projectMcpJson = path.join(projectDir, '.mcp.json');
+      fs.writeFileSync(projectMcpJson, JSON.stringify(mcpJson, null, 2), { mode: 0o600 });
+      fs.chmodSync(projectMcpJson, 0o600);
     } catch { /* non-fatal */ }
 
     // ── Permissions: write to settings.json in CLAUDE_CONFIG_DIR ──
@@ -2644,6 +3047,7 @@ export class ClaudeBridge {
       'mcp__shizuha-pulse__pulse_complete_task', 'mcp__shizuha-pulse__pulse_assign_task',
       'mcp__shizuha-pulse__pulse_search_tasks', 'mcp__shizuha-pulse__pulse_add_comment',
       'mcp__shizuha-pulse__pulse_get_my_alerts', 'mcp__shizuha-pulse__pulse_get_my_tasks',
+      'mcp__shizuha-pulse__pulse_get_my_work',
       'mcp__shizuha-pulse__pulse_get_statistics',
       'mcp__shizuha-pulse__pulse_list_projects', 'mcp__shizuha-pulse__pulse_get_project',
       'mcp__shizuha-pulse__pulse_list_workflows', 'mcp__shizuha-pulse__pulse_get_available_transitions',
@@ -2852,6 +3256,13 @@ export class ClaudeBridge {
         if (realSessionId) {
           this.claudeSessionId = realSessionId;
           this.saveSessionId(realSessionId);
+          if (this.pendingSessionProvenance) {
+            this.saveSessionProvenance({
+              ...this.pendingSessionProvenance,
+              sessionId: realSessionId,
+            });
+            this.pendingSessionProvenance = null;
+          }
           console.log(`[claude-bridge] Claude session ID: ${realSessionId}`);
         }
         continue;
@@ -3264,6 +3675,38 @@ export class ClaudeBridge {
   }
 
   /** Start a Claude execution — creates thread, acks, and writes to stdin. */
+  private async prepareClaudeExecution(clientId: string, content: string, sourceMessageId?: string): Promise<void> {
+    const invalidated = await this.validateRetainedSessionProvenance('pre-delivery');
+    if (invalidated) await this.restartClaudeAfterStaleProvenance();
+
+    const references = extractClaudeSessionAuthorityRefs(content);
+    if (references.length > 0) {
+      const snapshot = await resolveClaudeSessionAuthoritySnapshot(references);
+      const persistedSessionId = this.claudeSessionId
+        || this.loadStoredSessionId(this.getSessionIdFile())
+        || this.storedSessionId;
+      if (persistedSessionId) {
+        this.saveSessionProvenance({
+          schemaVersion: 1,
+          sessionId: persistedSessionId,
+          capturedAt: new Date().toISOString(),
+          references,
+          snapshot,
+        });
+      } else {
+        this.pendingSessionProvenance = {
+          schemaVersion: 1,
+          capturedAt: new Date().toISOString(),
+          references,
+          snapshot,
+        };
+      }
+    }
+
+    this.startClaudeExecution(clientId, content, sourceMessageId);
+  }
+
+  /** Start only after the asynchronous durable-authority gate has cleared. */
   private startClaudeExecution(clientId: string, content: string, sourceMessageId?: string): void {
     const isConnect = clientId.startsWith('connect:');
     const client = this.clients.get(clientId);
@@ -3318,6 +3761,31 @@ export class ClaudeBridge {
     this.claudeProcess!.stdin!.write(ndjsonMsg + '\n');
   }
 
+  private dispatchClaudeExecution(clientId: string, content: string, sourceMessageId?: string): Promise<void> | void {
+    // Keep the historical synchronous fast path for sessions with no durable
+    // provenance.  Once a sidecar exists (or this turn introduces authority
+    // references), delivery is held behind the authoritative async gate.
+    if (!this.loadSessionProvenance() && extractClaudeSessionAuthorityRefs(content).length === 0) {
+      // Preserve the historical 2-arg call shape when no messageId exists —
+      // master's queue-action tests pin the exact call signature.
+      if (sourceMessageId) this.startClaudeExecution(clientId, content, sourceMessageId);
+      else this.startClaudeExecution(clientId, content);
+      return;
+    }
+    if (this.provenanceDispatchInFlight) {
+      this.enqueueMessage(clientId, content);
+      return;
+    }
+    this.provenanceDispatchInFlight = true;
+    return this.prepareClaudeExecution(clientId, content, sourceMessageId).then(() => {
+      this.provenanceDispatchInFlight = false;
+      if (!this.activeThreadId) this.processQueue();
+    }, (err) => {
+      this.provenanceDispatchInFlight = false;
+      throw err;
+    });
+  }
+
   /** Select a configured Claude OAuth token that has not failed this active turn. */
   private async pickNextClaudeTokenForActiveTurn(): Promise<{ label: string; token: string } | null> {
     try {
@@ -3367,8 +3835,25 @@ export class ClaudeBridge {
     }
     if (!this.currentBrokerModelToken) return;
     try {
-      const { reportBrokerModelTokenStatus } = await import('../auth/broker-token.js');
-      const ok = await reportBrokerModelTokenStatus(this.currentBrokerModelToken, { action: 'deactivate' }, 5000);
+      const { reportBrokerModelTokenStatus, fetchBrokerModelToken } = await import('../auth/broker-token.js');
+      // SCLI-330: the coordinator lease is short-lived (HIVE_COORDINATOR_LEASE_TTL,
+      // default 900s) and the broker's report-status handler 404s EXPIRED leases
+      // (anti-poisoning: only a valid, unexpired lease bound to this broker+entry
+      // may mutate pool state). A mid-session TOKEN_DEAD detection routinely fires
+      // after the lease lapsed, so the deactivate report silently no-ops and the
+      // dead org-disabled credential stays active and keeps being leased fleet-wide.
+      // Re-lease the SAME entry for a fresh lease before reporting so the deactivate
+      // reliably lands (hive marks it auth_failed -> it leaves the pool automatically).
+      // If the coordinator returns a different entry (entry no longer promotable),
+      // fall back to the original lease — best effort, never misreport another entry.
+      let reportTarget = this.currentBrokerModelToken;
+      const fresh = await fetchBrokerModelToken('anthropic', 5000, {
+        preferredEntryId: this.currentBrokerModelToken.entryId,
+      });
+      if (fresh && fresh.entryId === this.currentBrokerModelToken.entryId && fresh.leaseId) {
+        reportTarget = { entryId: fresh.entryId, leaseId: fresh.leaseId };
+      }
+      const ok = await reportBrokerModelTokenStatus(reportTarget, { action: 'deactivate' }, 5000);
       if (ok) {
         console.error(`[claude-bridge] [telemetry] TOKEN_DEAD: broker deactivated "${label ?? 'unknown'}" pool-wide (${String(errorMsg ?? '').slice(0, 120)})`);
       } else {
@@ -3865,8 +4350,23 @@ export class ClaudeBridge {
         : HEARTBEAT_TRIGGER;
       this.heartbeatPending = false;
       this.heartbeatObservationRetryPending = false;
-      this.injectMessage(prompt);
-      console.log(`[claude-bridge] [telemetry] heartbeat at=${new Date().toISOString()}`);
+      if (!this.loadSessionProvenance()) {
+        this.injectMessage(prompt);
+        console.log(`[claude-bridge] [telemetry] heartbeat at=${new Date().toISOString()}`);
+        return;
+      }
+      void this.validateRetainedSessionProvenance('pre-delivery').then(async (invalidated) => {
+        if (invalidated) await this.restartClaudeAfterStaleProvenance();
+        this.injectMessage(prompt);
+        console.log(`[claude-bridge] [telemetry] heartbeat at=${new Date().toISOString()}`);
+      }).catch((err) => {
+        this.heartbeatPending = true;
+        console.error(JSON.stringify({
+          event: 'session_provenance_unverified',
+          boundary: 'heartbeat-delivery',
+          error: (err as Error).message,
+        }));
+      });
       return;
     }
 
@@ -3882,8 +4382,21 @@ export class ClaudeBridge {
       }
     }
 
-    if (next.messageId) this.startClaudeExecution(next.clientId, next.content, next.messageId);
-    else this.startClaudeExecution(next.clientId, next.content);
+    void Promise.resolve(this.dispatchClaudeExecution(next.clientId, next.content, next.messageId)).catch((err) => {
+      const attempts = (next.provenanceRetries ?? 0) + 1;
+      next.provenanceRetries = attempts;
+      this.messageQueue.unshift(next);
+      console.error(JSON.stringify({
+        event: 'session_provenance_unverified',
+        boundary: 'queued-delivery',
+        attempts,
+        error: (err as Error).message,
+      }));
+      if (attempts < 3) {
+        const timer = setTimeout(() => this.processQueue(), attempts * 1_000);
+        if (timer.unref) timer.unref();
+      }
+    });
   }
 
   private broadcastToThread(threadId: string, msg: Record<string, unknown>): void {
@@ -4072,7 +4585,7 @@ export class ClaudeBridge {
         }
 
         // If already executing, queue the message — it'll be processed when the current one completes.
-        if (this.activeThreadId) {
+        if (this.activeThreadId || this.provenanceDispatchInFlight) {
           const result = this.enqueueMessage(clientId, content);
           this.sendWs(client.ws, {
             type: result.queued ? 'message_ack' : 'error',
@@ -4083,7 +4596,23 @@ export class ClaudeBridge {
           break;
         }
 
-        this.startClaudeExecution(clientId, content);
+        void Promise.resolve(this.dispatchClaudeExecution(clientId, content)).catch((err) => {
+          const result = this.enqueueMessage(clientId, content);
+          console.error(JSON.stringify({
+            event: 'session_provenance_unverified',
+            boundary: 'direct-delivery',
+            queued: result.queued,
+            error: (err as Error).message,
+          }));
+          this.sendWs(client.ws, {
+            type: 'message_ack',
+            data: { queued: result.queued, provenance_unverified: true, session_id: this.sessionId },
+          });
+          if (result.queued) {
+            const timer = setTimeout(() => this.processQueue(), 1_000);
+            if (timer.unref) timer.unref();
+          }
+        });
         break;
       }
 
@@ -4134,6 +4663,105 @@ export class ClaudeBridge {
     // Store in workspace dir (persistently mounted) — not home dir (ephemeral in containers)
     const workDir = this.opts.cwd ?? process.cwd();
     return path.join(workDir, '.claude-session-id');
+  }
+
+  private getSessionProvenanceFile(): string {
+    return `${this.getSessionIdFile()}.provenance.json`;
+  }
+
+  private loadSessionProvenance(): ClaudeSessionProvenanceRecord | null {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.getSessionProvenanceFile(), 'utf8')) as ClaudeSessionProvenanceRecord;
+      if (parsed.schemaVersion !== 1 || !parsed.sessionId || !Array.isArray(parsed.references)
+        || parsed.snapshot?.schemaVersion !== 1 || !Array.isArray(parsed.snapshot.authorities)) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  private saveSessionProvenance(record: ClaudeSessionProvenanceRecord): void {
+    const file = this.getSessionProvenanceFile();
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  }
+
+  private invalidateStaleSessionPointer(
+    record: ClaudeSessionProvenanceRecord,
+    decision: ClaudeSessionProvenanceDecision,
+    boundary: 'restart' | 'pre-delivery',
+  ): void {
+    const sessionFile = this.getSessionIdFile();
+    try {
+      if (fs.existsSync(sessionFile)) {
+        fs.renameSync(sessionFile, `${sessionFile}.stale-bak-${Date.now()}`);
+      }
+    } catch (err) {
+      throw new Error(`failed to preserve stale session pointer: ${(err as Error).message}`);
+    }
+    this.storedSessionId = null;
+    this.claudeSessionId = '';
+    this.resumeRetried = false;
+    console.warn(JSON.stringify({
+      event: 'stale_queued_context_invalidated',
+      boundary,
+      session_id: record.sessionId,
+      changed_fields: decision.changedFields,
+      old_digest: decision.oldDigest,
+      current_digest: decision.currentDigest,
+    }));
+  }
+
+  private async validateRetainedSessionProvenance(
+    boundary: 'restart' | 'pre-delivery',
+  ): Promise<boolean> {
+    const storedSessionId = this.storedSessionId
+      || this.loadStoredSessionId(this.getSessionIdFile());
+    if (!storedSessionId) return false;
+    const record = this.loadSessionProvenance();
+    if (!record || record.sessionId !== storedSessionId || record.references.length === 0) return false;
+
+    let current: ClaudeSessionProvenanceSnapshot | null = null;
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        current = await resolveClaudeSessionAuthoritySnapshot(record.references);
+        break;
+      } catch (err) {
+        lastError = err as Error;
+        if (attempt < 2) await sleep((attempt + 1) * 250);
+      }
+    }
+    if (!current) {
+      throw new Error(`durable provenance unavailable after bounded retry: ${lastError?.message ?? 'unknown'}`);
+    }
+    const decision = decideClaudeSessionProvenance(record.snapshot, current);
+    if (decision.action === 'resume') return false;
+    this.invalidateStaleSessionPointer(record, decision, boundary);
+    return true;
+  }
+
+  private async restartClaudeAfterStaleProvenance(): Promise<void> {
+    const oldProc = this.claudeProcess;
+    this.initialized = false;
+    if (oldProc && oldProc.exitCode === null) this.suppressedClaudeExitProc = oldProc;
+    this.claudeProcess = null;
+    if (oldProc && oldProc.exitCode === null) {
+      this.killClaudeTree(oldProc, 'SIGTERM');
+      await Promise.race([
+        new Promise<void>((resolve) => oldProc.once('exit', () => resolve())),
+        sleep(5_000),
+      ]);
+      if (oldProc.exitCode === null && oldProc.pid != null) {
+        try { process.kill(-oldProc.pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+    this.lineBuffer = '';
+    this.accumulatedContent = '';
+    this.pendingTools = [];
+    this.isReplaying = true;
+    await this.spawnClaude();
   }
 
   /** SCLI-61: record a failed live turn; rotate the session when a consecutive

@@ -29,7 +29,7 @@ function record(overrides: Partial<TurnTelemetryRecord>): TurnTelemetryRecord {
 }
 
 function agent(username: string): AgentHealthInfo {
-  return { username, enabled: true, running: true, capacityUnavailable: false };
+  return { username, enabled: true, running: true, capacityUnavailable: false, lifecycleState: 'enabled' };
 }
 
 describe('SCLI-198 agent health exporter efficiency telemetry', () => {
@@ -81,6 +81,48 @@ describe('agent lifecycle snapshot event time', () => {
     expect(samples).toHaveLength(1);
     expect(Number(samples[0]!.split(' ')[1])).toBeGreaterThan(0);
   });
+
+  it('exports hibernated separately from an operator hard stop', () => {
+    const metrics = buildMetrics([
+      { ...agent('sora'), enabled: false, running: false, lifecycleState: 'hibernated' },
+      { ...agent('aoi'), enabled: false, running: false, lifecycleState: 'operator_stopped' },
+    ]);
+    expect(metrics).toContain('shizuha_agent_lifecycle_state{agent="sora",state="hibernated"} 1');
+    expect(metrics).toContain('shizuha_agent_lifecycle_state{agent="aoi",state="operator_stopped"} 1');
+  });
+});
+
+describe('PLS-741/PLS-869 JOIN_PAD self-identification (agent health exporter)', () => {
+  it('marks the four non-measured bridge families as placeholder="1" (JOIN_PAD)', () => {
+    const metrics = buildMetrics([agent('reika')]);
+
+    // JOIN_PAD families must self-identify so no consumer mistakes padding for
+    // measurement (contract rule 2).
+    expect(metrics).toContain('shizuha_agent_bridge_auth_unavailable{agent="reika",placeholder="1"} 0');
+    expect(metrics).toContain('shizuha_agent_consecutive_error_turns{agent="reika",placeholder="1"} 0');
+    expect(metrics).toContain('shizuha_agent_empty_turn_streak{agent="reika",placeholder="1"} 0');
+    expect(metrics).toContain('shizuha_agent_runaway_queue_depth{agent="reika",placeholder="1"} 0');
+
+    // MEASUREMENT bridge families are real samples — no placeholder label.
+    expect(metrics).toContain('shizuha_agent_bridge_degraded{agent="reika"} 0');
+    expect(metrics).toContain('shizuha_agent_bridge_capacity_unavailable{agent="reika"} 0');
+    // And the reverse: no JOIN_PAD label leaks onto measured/lifecycle families.
+    expect(metrics).not.toMatch(/shizuha_agent_bridge_degraded\{[^}]*placeholder=/);
+    expect(metrics).not.toMatch(/shizuha_agent_bridge_capacity_unavailable\{[^}]*placeholder=/);
+    expect(metrics).not.toMatch(/shizuha_agent_process_up\{[^}]*placeholder=/);
+    expect(metrics).not.toMatch(/shizuha_agent_enabled\{[^}]*placeholder=/);
+  });
+
+  it('derives real non-zero MEASUREMENT values from fixture input (not presence-only)', () => {
+    // Phase C: regression must show values are DERIVED — a fixture with
+    // capacityUnavailable=true yields a non-zero sample, not just "series
+    // present at 100%".
+    const metrics = buildMetrics([
+      { username: 'semi', enabled: true, running: true, capacityUnavailable: true },
+    ]);
+    expect(metrics).toContain('shizuha_agent_bridge_capacity_unavailable{agent="semi"} 1');
+    expect(metrics).toContain('shizuha_agent_bridge_degraded{agent="semi"} 1');
+  });
 });
 
 describe('PLAT-3367 exporter startup is single-owner/idempotent', () => {
@@ -101,7 +143,7 @@ describe('PLAT-3367 exporter startup is single-owner/idempotent', () => {
   it('first caller keeps serving scrapes; duplicate caller does not replace it', async () => {
     const { startAgentHealthServer } = await import('../src/metrics/health-server.js');
     const agents: AgentHealthInfo[] = [
-      { username: 'jun', enabled: true, running: true, capacityUnavailable: false },
+      { username: 'jun', enabled: true, running: true, capacityUnavailable: false, lifecycleState: 'enabled' },
     ];
     startAgentHealthServer(() => agents, TEST_PORT);
     // Duplicate registration (the dashboard/manager double-start scenario).

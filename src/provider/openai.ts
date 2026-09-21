@@ -97,7 +97,19 @@ function toOpenAIMessages(
         }
       }
       const textParts = blocks.filter((b) => b.type === 'text');
-      if (textParts.length) {
+      const imageParts = blocks.filter((b) => b.type === 'image');
+      if (imageParts.length) {
+        const content: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+        for (const img of imageParts) {
+          content.push({
+            type: 'image_url',
+            image_url: { url: `data:${img.source.media_type};base64,${img.source.data}` },
+          });
+        }
+        const userText = textParts.map((b) => (b as { text: string }).text).join('\n');
+        if (userText) content.push({ type: 'text', text: userText });
+        result.push({ role: 'user', content: content as any });
+      } else if (textParts.length) {
         result.push({
           role: 'user',
           content: textParts.map((b) => (b as { text: string }).text).join('\n'),

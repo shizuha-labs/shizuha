@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ToolDefinition } from '../../src/tools/types.js';
-import { AgentProcess } from '../../src/gateway/agent-process.js';
+import { AgentProcess, retainDeclaredMcpToolsOnRefresh } from '../../src/gateway/agent-process.js';
 
 vi.mock('../../src/utils/logger.js', () => ({
   logger: {
@@ -97,19 +97,46 @@ describe('resume prompt pin (PLAT-4189)', () => {
     expect(saved).toHaveLength(0); // head unchanged until refresh adopted
   });
 
-  it('adopts the fresh head when the tool NAME set changed (real capability change)', () => {
+  it('pins the persisted head when the tool NAME set shrinks (MCP still connecting)', () => {
+    // agent-kei 2026-09-04: Hive liveness bounce → pulse/wiki/admin 90s
+    // timeout → missing MCP tools looked like a capability change and the
+    // pin adopted a fresh 149k-token head at 0% cache. A shrink is NOT
+    // compaction; keep the previous tools[] until the next compaction.
     const { harness, saved } = makeHarness();
+    const pinnedPrompt = 'old prompt';
+    const pinnedDefs = [tool('read_file'), tool('mcp__shizuha-pulse__pulse_get_my_tasks')];
     harness.store.loadProviderPrefixHead = vi.fn(() => ({
       createdAt: 1,
       model: 'DeepSeek-V4-Flash',
-      systemPrompt: 'old prompt',
-      toolDefs: JSON.stringify([tool('read_file')]),
+      systemPrompt: pinnedPrompt,
+      toolDefs: JSON.stringify(pinnedDefs),
     }));
+    harness.toolDefs = [tool('read_file')];
     const freshPrompt = harness.systemPrompt;
+    const freshDefs = harness.toolDefs;
     runPin(harness);
-    expect(harness.systemPrompt).toBe(freshPrompt);
-    expect(harness.pendingPromptRefresh).toBeNull();
-    expect(saved).toHaveLength(1);
+    expect(harness.systemPrompt).toBe(pinnedPrompt);
+    expect(harness.toolDefs).toEqual(pinnedDefs);
+    expect(harness.pendingPromptRefresh).toEqual({ systemPrompt: freshPrompt, toolDefs: freshDefs });
+    expect(saved).toHaveLength(0);
+  });
+
+  it('pins the persisted head when the tool NAME set grows (ToolSearch/JIT)', () => {
+    const { harness, saved } = makeHarness();
+    const pinnedPrompt = 'old prompt';
+    const pinnedDefs = [tool('read_file')];
+    harness.store.loadProviderPrefixHead = vi.fn(() => ({
+      createdAt: 1,
+      model: 'DeepSeek-V4-Flash',
+      systemPrompt: pinnedPrompt,
+      toolDefs: JSON.stringify(pinnedDefs),
+    }));
+    harness.toolDefs = [tool('read_file'), tool('mcp__shizuha-admin__admin_consume_kubernetes_jit')];
+    runPin(harness);
+    expect(harness.systemPrompt).toBe(pinnedPrompt);
+    expect(harness.toolDefs).toEqual(pinnedDefs);
+    expect(harness.pendingPromptRefresh).not.toBeNull();
+    expect(saved).toHaveLength(0);
   });
 
   it('adopts fresh on model change', () => {
@@ -157,5 +184,30 @@ describe('resume prompt pin (PLAT-4189)', () => {
     runAdopt(harness, 'post_turn_compaction');
     expect(harness.systemPrompt).toBe(before);
     expect(saved).toHaveLength(0);
+  });
+});
+
+describe('retainDeclaredMcpToolsOnRefresh', () => {
+  const defs = [
+    tool('read_file'),
+    tool('mcp__shizuha-pulse__pulse_get_my_tasks'),
+    tool('mcp__shizuha-admin__admin_list_teams'),
+  ];
+
+  it('freezes tools[] on append-only models even when MCP names disappeared', () => {
+    const live = new Set(['read_file', 'mcp__shizuha-pulse__pulse_get_my_tasks']);
+    const result = retainDeclaredMcpToolsOnRefresh(defs, live, true);
+    expect(result.toolDefs).toBe(defs);
+    expect(result.removed).toBe(0);
+  });
+
+  it('drops evicted MCP tools on hosted/compat models', () => {
+    const live = new Set(['read_file', 'mcp__shizuha-pulse__pulse_get_my_tasks']);
+    const result = retainDeclaredMcpToolsOnRefresh(defs, live, false);
+    expect(result.toolDefs.map((d) => d.name)).toEqual([
+      'read_file',
+      'mcp__shizuha-pulse__pulse_get_my_tasks',
+    ]);
+    expect(result.removed).toBe(1);
   });
 });

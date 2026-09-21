@@ -196,6 +196,15 @@ export const loopDetectorSchema = z.object({
   }
 });
 
+export const browserSchema = z.object({
+  defaultMode: z.enum(['fast', 'human']).optional().describe(
+    'Default browser mode when no explicit mode is given and the target is not a sensitive host (default: fast).',
+  ),
+  sensitiveHosts: z.array(z.string()).optional().describe(
+    'Host patterns (glob) that require human mode, e.g. ["x.com", "*.gov.in"]. Defaults to a conservative built-in list (X, government/income-tax/MCA, banking).',
+  ),
+});
+
 export const configSchema = z.object({
   agent: agentSchema.default({}),
   loopDetector: loopDetectorSchema.default({}),
@@ -207,6 +216,7 @@ export const configSchema = z.object({
   sandbox: sandboxSchema.default({}),
   logging: loggingSchema.default({}),
   autoReply: autoReplySchema,
+  browser: browserSchema.default({}),
 });
 
 export type ConfigInput = z.input<typeof configSchema>;

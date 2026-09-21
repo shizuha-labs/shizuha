@@ -20,7 +20,29 @@ describe('local OpenAI-compatible routing (SCLI-593)', () => {
     prevHome = process.env['HOME'];
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'scli-local-ep-'));
     process.env['HOME'] = tmpHome;
-    for (const key of ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CORTEX_API_KEY', 'CORTEX_OAUTH_TOKEN', 'VLLM_BASE_URL']) {
+    // SCLI-372 gate follow-up: scrub EVERY provider-credential env var the
+    // registry reads, not just the OpenAI/Cortex/VLLM ones. This suite's
+    // intent is "nothing else is configured" — a vantage carrying e.g.
+    // GOOGLE_API_KEY (agent seats) registered the google provider and
+    // resolveAutoModel returned 'gemini-2.5-pro', red-lighting the
+    // premerge-full-suite gate on environment mismatch instead of code.
+    for (const key of [
+      'OPENAI_API_KEY', 'OPENAI_BASE_URL',
+      'CORTEX_API_KEY', 'CORTEX_OAUTH_TOKEN', 'CORTEX_BASE_URL',
+      'VLLM_BASE_URL', 'VLLM_API_KEY',
+      'GOOGLE_API_KEY', 'GEMINI_API_KEY',
+      'ANTHROPIC_API_KEY',
+      'OPENROUTER_API_KEY',
+      'GROQ_API_KEY',
+      'TOGETHER_API_KEY',
+      'XAI_API_KEY',
+      'CODEX_API_KEY', 'CODEX_BASE_URL',
+      'GITHUB_COPILOT_TOKEN',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'OLLAMA_BASE_URL',
+      'LLAMACPP_BASE_URL',
+      'LITELLM_PROXY_URL',
+    ]) {
       saved[key] = process.env[key];
       delete process.env[key];
     }

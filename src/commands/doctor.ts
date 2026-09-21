@@ -75,6 +75,48 @@ function checkNodeVersion(): DoctorCheck {
   };
 }
 
+const MAX_CONFIG_BYTES = 4 * 1024 * 1024; // 4 MiB bound on doctor's config reads
+
+// Control characters that must never reach stdout: NUL, ESC, CR, and raw LF
+// from attacker-supplied content (diagnostics are single-line messages).
+const CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\r\n]/g;
+
+/**
+ * Render a terminal-safe single-line diagnostic from a TOML parse failure.
+ *
+ * Never interpolates the parser's raw error message or codeblock: smol-toml
+ * embeds the offending source lines verbatim, which can carry credential-like
+ * values, NUL bytes, or terminal control sequences. Only the file, the safe
+ * numeric line/column from `TomlError`, and a fixed hint are used; everything
+ * is scrubbed of control characters as a final belt-and-braces pass.
+ */
+export function sanitizeTomlError(file: string, err: unknown): string {
+  const scrub = (s: string): string => s.replace(CONTROL_RE, ' ').trim();
+  const raw = err as { line?: unknown; column?: unknown; name?: string };
+  const line = typeof raw?.line === 'number' ? String(raw.line) : 'unknown';
+  const column = typeof raw?.column === 'number' ? String(raw.column) : 'unknown';
+  return scrub(`${file}: invalid TOML (line ${line}, column ${column})`);
+}
+
+/**
+ * Return the first candidate that is a bounded regular file (following
+ * symlinks), or null. FIFOs/sockets/dirs/oversized files are skipped so a
+ * hostile or corrupt config path can never block `doctor`.
+ */
+async function firstReadableConfig(candidates: string[]): Promise<string | null> {
+  for (const file of candidates) {
+    try {
+      const stat = await fsp.stat(file); // follows symlinks
+      if (!stat.isFile()) continue;
+      if (stat.size > MAX_CONFIG_BYTES) continue;
+      return file;
+    } catch {
+      // not found / unreadable — skip
+    }
+  }
+  return null;
+}
+
 async function checkConfigFile(cwd: string): Promise<DoctorCheck> {
   // Check multiple config layer locations
   const home = process.env['HOME'] ?? os.homedir();
@@ -85,17 +127,9 @@ async function checkConfigFile(cwd: string): Promise<DoctorCheck> {
     '/etc/shizuha/config.toml',
   ];
 
-  const found: string[] = [];
-  for (const file of candidates) {
-    try {
-      await fsp.access(file, fs.constants.R_OK);
-      found.push(file);
-    } catch {
-      // not found
-    }
-  }
+  const configFile = await firstReadableConfig(candidates);
 
-  if (found.length === 0) {
+  if (!configFile) {
     return {
       name: 'Config file',
       status: 'warn',
@@ -107,18 +141,18 @@ async function checkConfigFile(cwd: string): Promise<DoctorCheck> {
   // Try parsing the first found config
   try {
     const { parse: parseTOML } = await import('smol-toml');
-    const content = await fsp.readFile(found[0]!, 'utf-8');
+    const content = await fsp.readFile(configFile, 'utf-8');
     parseTOML(content);
     return {
       name: 'Config file',
       status: 'pass',
-      message: `${found.length} config file${found.length > 1 ? 's' : ''} found and valid`,
+      message: 'Config file found and valid',
     };
   } catch (err) {
     return {
       name: 'Config file',
       status: 'fail',
-      message: `Parse error in ${found[0]}: ${(err as Error).message}`,
+      message: sanitizeTomlError(configFile, err),
       fix: 'Check TOML syntax in your config file',
     };
   }
@@ -374,7 +408,7 @@ export async function checkSelectedModelReachability(
     setLogLevel('silent');
     try {
       const { loadConfig } = await import('../config/loader.js');
-      const config = await loadConfig(cwd);
+      const config = await loadConfig(cwd, { resolveMcpAuth: false });
       const { ProviderRegistry } = await import('../provider/registry.js');
       const registry = new ProviderRegistry(config);
 
@@ -524,7 +558,7 @@ function providerListIncludesCortex(cwd: string): Promise<boolean> {
       setLogLevel('silent');
       try {
         const { loadConfig } = await import('../config/loader.js');
-        const config = await loadConfig(cwd);
+        const config = await loadConfig(cwd, { resolveMcpAuth: false });
         const { ProviderRegistry } = await import('../provider/registry.js');
         const registry = new ProviderRegistry(config);
         return registry.list().includes('cortex')
@@ -546,7 +580,7 @@ async function checkProviderConfig(cwd: string): Promise<DoctorCheck> {
     setLogLevel('silent');
 
     const { loadConfig } = await import('../config/loader.js');
-    const config = await loadConfig(cwd);
+    const config = await loadConfig(cwd, { resolveMcpAuth: false });
     const { ProviderRegistry } = await import('../provider/registry.js');
     const registry = new ProviderRegistry(config);
 
@@ -591,24 +625,54 @@ async function checkProviderConfig(cwd: string): Promise<DoctorCheck> {
 async function checkSqlite(): Promise<DoctorCheck> {
   const home = process.env['HOME'] ?? os.homedir();
   const dir = path.join(home, '.config', 'shizuha');
+  const statePath = path.join(dir, 'state.db');
 
   try {
     const Database = (await import('better-sqlite3')).default;
-    // Ensure dir exists
-    fs.mkdirSync(dir, { recursive: true });
-    const testPath = path.join(dir, 'state.db');
-    const db = new Database(testPath);
-    db.pragma('journal_mode = WAL');
-    // Quick sanity check
-    db.exec('SELECT 1');
-    db.close();
+
+    // A diagnostic must not create the state it is inspecting. Exercise the
+    // native SQLite binding in memory, then inspect an existing state database
+    // only after lstat proves the path itself is an owner-controlled regular
+    // file. lstat deliberately does not follow dangling or outside symlinks.
+    const memoryDb = new Database(':memory:');
+    try {
+      memoryDb.exec('SELECT 1');
+    } finally {
+      memoryDb.close();
+    }
+
+    let stateStat: fs.Stats | undefined;
+    try {
+      stateStat = fs.lstatSync(statePath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+
+    if (stateStat && (stateStat.isSymbolicLink() || !stateStat.isFile())) {
+      return {
+        name: 'SQLite state store',
+        status: 'fail',
+        message: `state.db exists but is not a regular file: ${statePath}`,
+        fix: 'Remove the non-regular path and re-run doctor',
+      };
+    }
+
+    if (stateStat) {
+      const stateDb = new Database(statePath, { readonly: true, fileMustExist: true });
+      try {
+        stateDb.exec('SELECT 1');
+      } finally {
+        stateDb.close();
+      }
+    }
+
     return { name: 'SQLite state store', status: 'pass', message: 'OK' };
   } catch (err) {
     return {
       name: 'SQLite state store',
       status: 'fail',
       message: `Cannot open state database: ${(err as Error).message}`,
-      fix: 'Check that better-sqlite3 is installed and ~/.config/shizuha/ is writable',
+      fix: 'Check that better-sqlite3 is installed and ~/.config/shizuha/state.db is a valid regular file',
     };
   }
 }
@@ -716,9 +780,17 @@ async function checkPermissions(): Promise<DoctorCheck> {
   const home = process.env['HOME'] ?? os.homedir();
   const shizuhaDir = path.join(home, '.config', 'shizuha');
 
+  // A fresh HOME is a valid pre-install state. Do not create the directory in
+  // order to diagnose it; only exercise writes when it already exists.
+  if (!fs.existsSync(shizuhaDir)) {
+    return {
+      name: 'Permissions',
+      status: 'pass',
+      message: '~/.config/shizuha/ does not exist yet (nothing to check)',
+    };
+  }
+
   try {
-    fs.mkdirSync(shizuhaDir, { recursive: true });
-    // Try writing a temp file
     const testFile = path.join(shizuhaDir, '.doctor-test');
     fs.writeFileSync(testFile, 'test');
     fs.unlinkSync(testFile);

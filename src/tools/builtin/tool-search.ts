@@ -13,10 +13,12 @@
 import type { ToolHandler, ToolResult, ToolContext, ToolDefinition } from '../types.js';
 import { z } from 'zod';
 import { logger } from '../../utils/logger.js';
+import { ToolSearchState } from '../tool-search.js';
 
 // Registry of deferred tools (set by agent-process at init time)
 let deferredTools = new Map<string, ToolDefinition>();
 let deferredSchemas = new Map<string, Record<string, unknown>>(); // name → full JSON Schema
+const searchState = new ToolSearchState();
 
 // Callback to dynamically add resolved tools to the active tool definitions
 // (so the LLM can call them on subsequent turns)
@@ -32,6 +34,12 @@ export function setDeferredTools(
 ): void {
   deferredTools = tools;
   deferredSchemas = schemas;
+  searchState.setCatalog([...tools.values()].map(tool => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: (schemas.get(tool.name)?.inputSchema ?? tool.inputSchema) as Record<string, unknown>,
+    serverName: tool.name.split('__')[1] ?? '',
+  })), []);
 }
 
 export function getDeferredToolNames(): string[] {
@@ -106,14 +114,17 @@ const executeToolSearch = async (
   input: Record<string, unknown>,
   _context: ToolContext,
 ): Promise<ToolResult> => {
-  const query = (input.query as string || '').trim();
-  const maxResults = (input.max_results as number) || 3;
-
-  if (!query) {
+  if (typeof input?.query !== 'string' || !input.query.trim()) {
     return {
       toolUseId: '',
-      content: `No query provided. Available deferred tools (${deferredTools.size}):\n${[...deferredTools.keys()].join('\n')}`,
+      content: 'ToolSearch requires a non-empty string named "query". Use {"query":"pulse tasks"} or {"query":"select:mcp__server__tool"}. Fields named "queries" or "mode" do not replace "query".',
+      isError: true,
     };
+  }
+  const query = input.query.trim();
+  const maxResults = input.max_results ?? 3;
+  if (typeof maxResults !== 'number' || !Number.isInteger(maxResults) || maxResults < 1) {
+    return { toolUseId: '', content: 'ToolSearch "max_results" must be a positive integer.', isError: true };
   }
 
   // Direct selection: "select:tool_name" or "select:tool1,tool2"
@@ -151,33 +162,7 @@ const executeToolSearch = async (
     return { toolUseId: '', content };
   }
 
-  // Keyword search — match against tool names and descriptions
-  const queryLower = query.toLowerCase();
-  const scored: Array<{ name: string; score: number; description: string }> = [];
-
-  for (const [name, def] of deferredTools) {
-    const desc = def.description || '';
-    const nameLower = name.toLowerCase();
-    const descLower = desc.toLowerCase();
-
-    let score = 0;
-    // Exact name match
-    if (nameLower === queryLower) score += 100;
-    // Name contains query
-    if (nameLower.includes(queryLower)) score += 50;
-    // Query words in name
-    for (const word of queryLower.split(/\s+/)) {
-      if (nameLower.includes(word)) score += 20;
-      if (descLower.includes(word)) score += 10;
-    }
-
-    if (score > 0) {
-      scored.push({ name, score, description: desc.slice(0, 100) });
-    }
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-  const top = scored.slice(0, maxResults);
+  const top = searchState.search(query, maxResults);
 
   if (top.length === 0) {
     return {
@@ -186,13 +171,15 @@ const executeToolSearch = async (
     };
   }
 
-  const resultLines = top.map((t, i) =>
-    `${i + 1}. **${t.name}** — ${t.description || '(no description)'}`,
-  );
+  const resultLines = top.map(tool => {
+    const definition = deferredTools.get(tool.name);
+    if (definition && onToolResolved) onToolResolved(definition);
+    return JSON.stringify({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema });
+  });
 
   return {
     toolUseId: '',
-    content: `Found ${top.length} tool(s) for "${query}":\n\n${resultLines.join('\n')}\n\nUse "select:name1,name2,..." to load schemas (e.g. "select:${top.map(t => t.name).slice(0, 3).join(',')}"). Selected tools are ACTIVE immediately — call them directly with the returned schema.`,
+    content: `Found ${top.length} tool(s). These tools are ACTIVE immediately; call them directly by their exact names using the schemas below. No second ToolSearch selection is needed.\n\n${resultLines.join('\n\n')}`,
   };
 };
 
@@ -209,8 +196,8 @@ export const toolSearchTool: ToolHandler = {
     'returned in the result. Batch related selections into one call when convenient, and ' +
     're-select any time you need a schema again (selection is cheap).',
   parameters: z.object({
-    query: z.string().describe('Query to find deferred tools. Use "select:<tool_name>" for direct selection, or keywords to search.'),
-    max_results: z.number().optional().default(3).describe('Maximum number of results to return (default: 3)'),
+    query: z.string().min(1).describe('Query to find deferred tools. Use "select:<tool_name>" for direct selection, or keywords to search.'),
+    max_results: z.number().int().positive().optional().default(3).describe('Maximum number of results to return (default: 3)'),
   }),
   readOnly: true,
   riskLevel: 'low',

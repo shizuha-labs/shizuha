@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Box, Text, useInput } from 'ink';
 import type { ModelInfo } from '../state/types.js';
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
+import { filterModels } from '../model-search.js';
 
 interface ModelPickerProps {
   models: ModelInfo[];
@@ -30,6 +31,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
   const [selected, setSelected] = useState(-1); // -1 = needs init from pickerRows
   const selectedInitialized = useRef(false);
   const [showHidden, setShowHidden] = useState(false);
+  const [filterQuery, setFilterQuery] = useState('');
   const [mode, setMode] = useState<'browse' | 'auth' | 'device-auth' | 'effort'>('browse');
   const [authToken, setAuthToken] = useState('');
   const [authTarget, setAuthTarget] = useState<{ provider: string; slug: string } | null>(null);
@@ -53,7 +55,8 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
 
   // Build the flat row list with group headers + models
   const pickerRows = useMemo(() => {
-    const filtered = showHidden ? models : models.filter((m) => m.visibility === 'list');
+    const visible = showHidden ? models : models.filter((m) => m.visibility === 'list');
+    const filtered = filterModels(visible, filterQuery);
 
     // Group models by their group label, preserving order
     const groupOrder: string[] = [];
@@ -80,7 +83,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     const rows: PickerRow[] = [];
     for (const group of groupOrder) {
       const list = groupMap.get(group)!;
-      const expanded = expandedGroups.has(group);
+      const expanded = filterQuery.trim() ? true : expandedGroups.has(group);
       const available = list.some((m) => providerAvailable(m.provider));
       rows.push({ type: 'group', group, expanded, available });
       if (expanded) {
@@ -90,7 +93,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
       }
     }
     return rows;
-  }, [models, currentModel, showHidden, expandedGroups, availableProviders]);
+  }, [models, currentModel, showHidden, expandedGroups, availableProviders, filterQuery]);
 
   // Initialize cursor to the current model's row
   useEffect(() => {
@@ -243,6 +246,18 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
       setSelected((prev) => Math.max(0, prev - 1));
     } else if (key.downArrow) {
       setSelected((prev) => Math.min(pickerRows.length - 1, prev + 1));
+    } else if (key.backspace || key.delete) {
+      setFilterQuery((prev) => prev.slice(0, -1));
+      setSelected(0);
+    } else if (key.ctrl && input === 'u') {
+      setFilterQuery('');
+      setSelected(0);
+    } else if (key.ctrl && (input === 'h' || input === 'H')) {
+      setShowHidden((prev) => !prev);
+      setSelected(0);
+    } else if (key.ctrl && input === 'r') {
+      // History search lives on the composer (SCLI-449). Do not steal Ctrl+R.
+      return;
     } else if (key.return) {
       const row = pickerRows[selected];
       if (!row) return;
@@ -276,9 +291,14 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
         }
       }
     } else if (key.escape) {
+      if (filterQuery) {
+        setFilterQuery('');
+        setSelected(0);
+        return;
+      }
       onCancel();
-    } else if (input === 'h' || input === 'H') {
-      setShowHidden((prev) => !prev);
+    } else if (input && !key.ctrl && !key.meta && !key.upArrow && !key.downArrow) {
+      setFilterQuery((prev) => prev + input);
       setSelected(0);
     }
   }, { isActive: mode === 'browse' });
@@ -390,7 +410,11 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
     <Box flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1} marginY={1}>
       <Text bold color="cyan">{'\u2630'} Model Picker</Text>
       <Text dimColor>
-        {'\u2191\u2193'} navigate, Enter to select/expand, Esc to cancel, H to {showHidden ? 'hide' : 'show'} hidden
+        Type to search provider/model · {'\u2191\u2193'} · Enter · Esc
+        {showHidden ? ' · Ctrl+H hide extra' : ' · Ctrl+H show extra'}
+      </Text>
+      <Text color={filterQuery ? 'cyan' : undefined} dimColor={!filterQuery}>
+        Filter: {filterQuery || '(type a slug, e.g. cortex/gpt or groq/llama)'}
       </Text>
       <Box marginTop={1} flexDirection="column">
         {showUpArrow && (
@@ -448,7 +472,7 @@ export const ModelPicker: React.FC<ModelPickerProps> = ({
         )}
       </Box>
       {pickerRows.length === 0 && (
-        <Text dimColor>  No models available</Text>
+        <Text dimColor>  {filterQuery ? 'No models match that search' : 'No models available'}</Text>
       )}
       {total > maxVisible && (
         <Text dimColor>  {selected + 1}/{total}</Text>

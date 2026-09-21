@@ -25,7 +25,7 @@ describe('exec/android/server share the autonomous max_tokens continue helper', 
     for (const rel of files) {
       const src = readSrc(rel);
       expect(src, rel).toContain('shouldContinueAutonomousMaxTokens');
-      expect(src, rel).toContain('AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT');
+      expect(src, rel).not.toContain('Continue. Use your tools to implement the solution.');
     }
   });
 

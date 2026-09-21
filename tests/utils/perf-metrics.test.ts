@@ -58,6 +58,23 @@ describe('PerfTimer (SCLI-21)', () => {
     expect(m2.cacheHitRate).toBeNull();
     expect('cacheReadTokens' in m2).toBe(false);
   });
+
+  it('does not double-count OpenAI/Cortex inputTokens that already include cache reads', () => {
+    // Live DeepSeek: prompt 330614, cached 329216 → 99.6% hit. The old
+    // denominator (read + input) painted "cache 50%" on the TTFT warn line.
+    const t = new PerfTimer(0);
+    t.markFirstChunk(100);
+    const m = t.finish({
+      provider: 'cortex',
+      model: 'DeepSeek-V4-Flash',
+      inputTokens: 330_614,
+      outputTokens: 126,
+      cacheReadTokens: 329_216,
+      cacheCreationTokens: 0,
+    }, 1000);
+    expect(m.cacheHitRate).toBeCloseTo(329_216 / 330_614, 3);
+    expect(m.cacheHitRate).toBeGreaterThan(0.99);
+  });
 });
 
 describe('formatPerfStatus', () => {

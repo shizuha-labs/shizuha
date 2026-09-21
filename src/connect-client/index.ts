@@ -298,6 +298,16 @@ export function parseConnectInboundMessageEvent(
 export interface ConnectClientConfig {
   /** Called once the websocket is open and ready for sends. */
   onOpen?: () => void;
+  /**
+   * PLAT-8787: returns the durably-completed inbound message ids whose
+   * processing ack may not have reached the server (the ack is sent once at
+   * turn end; a send failure there — socket dying mid-reconnect-window —
+   * leaves the server row unacked and guarantees a byte-identical re-delivery
+   * on the next reconnect). The client re-acks this backlog after every
+   * reconnect handshake; the server-side ack update is idempotent
+   * (processed_at__isnull filter), so re-acks are cheap no-ops.
+   */
+  completedInboundMessageIds?: () => string[];
   /** Called when a human sends a message in one of the agent's conversations */
   onMessage?: (conversationId: string, content: string, senderId: string, senderName: string, messageId: string, conversationType: 'direct' | 'group' | 'unknown', replyObligation: Exclude<ConnectReplyObligation, 'none'>) => void;
   /** Called when a new conversation is created with this agent */
@@ -320,6 +330,7 @@ export class ConnectClient {
   private reconnectAttempt = 0;
   private authRetryAttempt = 0;
   private running = false;
+  private lifecycleGeneration = 0;
   private forceTokenRefresh = false;
   // SCLI-201: the id-login fallback must back off on 429 (honor Retry-After) so
   // it never self-inflicts the id rate-limit. `authRateLimitedUntil` gates the
@@ -368,16 +379,20 @@ export class ConnectClient {
    * Self-authenticates if no token provided, then connects.
    */
   async start(): Promise<void> {
+    if (this.running) return;
     this.running = true;
+    const generation = ++this.lifecycleGeneration;
 
     if (!this.wsUrl) {
+      this.running = false;
       logger.info('[ConnectClient] No platform URL — Connect disabled');
       return;
     }
 
     if (!this.token) {
-      await this.selfAuthenticate();
+      await this.selfAuthenticate(generation);
     }
+    if (!this.running || generation !== this.lifecycleGeneration) return;
 
     if (!this.token) {
       // Broker present but /token not ready yet (boot race — the sidecar mints
@@ -397,6 +412,7 @@ export class ConnectClient {
         this.scheduleAuthRetry();
         return;
       }
+      this.running = false;
       logger.warn('[ConnectClient] No token after auth — Connect disabled');
       return;
     }
@@ -407,9 +423,13 @@ export class ConnectClient {
   /** Stop the client gracefully */
   stop(): void {
     this.running = false;
+    this.lifecycleGeneration++;
     if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-    if (this.ws) { this.ws.close(1000, 'Agent shutting down'); this.ws = null; }
+    const socket = this.ws;
+    this.ws = null;
+    this.connectedAt = 0;
+    socket?.close(1000, 'Agent shutting down');
   }
 
   // ── Sending ──
@@ -495,6 +515,8 @@ export class ConnectClient {
     // alive (PLAT-175 Codex P2). Covers all connect() callers in one place.
     if (!this.running) return;
     if (!this.token || !this.wsUrl) return;
+    if (this.ws) return;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
 
     // Advertise the processing-ack contract in the opening handshake so the
     // server enables it before connect-time missed-message replay. The
@@ -504,18 +526,43 @@ export class ConnectClient {
     const url = connectSocketUrl(this.wsUrl, this.token);
     logger.info({ url: this.wsUrl }, '[ConnectClient] Connecting');
 
-    this.ws = new WebSocket(url);
+    const generation = this.lifecycleGeneration;
+    const socket = new WebSocket(url);
+    this.ws = socket;
+    const ownsSocket = () => this.running
+      && this.lifecycleGeneration === generation
+      && this.ws === socket;
 
-    this.ws.on('open', () => {
+    socket.on('open', () => {
+      if (!ownsSocket()) return;
       logger.info('[ConnectClient] Connected to Connect');
       this.connectedAt = Date.now();
       this.missedReplayAccepted = 0;
       // Transport delivery is not processing completion. Opt into the durable
       // sent-but-unprocessed replay contract before any new work is accepted.
       try {
-        this.ws?.send(JSON.stringify({ type: 'agent.processing_ack_capability', version: 1 }));
+        socket.send(JSON.stringify({ type: 'agent.processing_ack_capability', version: 1 }));
       } catch { /* reconnect replay remains fail-safe */ }
+      // PLAT-8787: re-ack the durably-completed backlog. The turn-end ack is
+      // sent exactly once; when that send fails (socket dying inside the
+      // reconnect window) the server row stays unacked and the next
+      // reconnect replays the message byte-identically — duplicate work
+      // triggers off already-answered messages. The server's ack update is
+      // idempotent, so blanket re-acks here are cheap no-ops for the ones
+      // that landed.
+      try {
+        const backlog = this.config.completedInboundMessageIds?.() ?? [];
+        for (const messageId of backlog.slice(-200)) {
+          try {
+            socket.send(JSON.stringify({ type: 'agent.message_processed', message_id: messageId }));
+          } catch { /* the reconnect replay contract re-delivers if still unacked */ }
+        }
+        if (backlog.length > 0) {
+          logger.info({ reacked: Math.min(backlog.length, 200), total: backlog.length }, '[ConnectClient] Re-acked completed inbound backlog');
+        }
+      } catch { /* best-effort: replay contract remains the safety net */ }
       try { this.config.onOpen?.(); } catch { /* best-effort hook */ }
+      if (!ownsSocket()) return;
       // NB: do NOT reset reconnectAttempt here. A stale-token connection opens
       // then is immediately closed (1011) by the server; resetting on `open`
       // would pin the counter at 0 forever and the re-auth path (attempt > 3)
@@ -523,22 +570,26 @@ export class ConnectClient {
       // connection proved stable (survived STABLE_CONNECTION_MS).
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.pingTimer = setInterval(() => {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ type: 'ping' }));
+        if (ownsSocket() && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'ping' }));
         }
       }, PING_INTERVAL_MS);
     });
 
-    this.ws.on('message', (data: Buffer) => {
+    socket.on('message', (data: Buffer) => {
+      if (!ownsSocket()) return;
       try {
         const msg = JSON.parse(data.toString()) as Record<string, unknown>;
         this.handleMessage(msg);
       } catch { /* ignore malformed JSON */ }
     });
 
-    this.ws.on('close', (code: number) => this.handleSocketClose(code));
+    socket.on('close', (code: number) => {
+      if (ownsSocket()) this.handleSocketClose(code);
+    });
 
-    this.ws.on('error', (err: Error) => {
+    socket.on('error', (err: Error) => {
+      if (!ownsSocket()) return;
       if (/Unexpected server response: (401|403|502)/.test(err.message)) {
         this.forceTokenRefresh = true;
         this.token = '';
@@ -553,7 +604,8 @@ export class ConnectClient {
   // and recovers on a broker re-mint/restart (PLAT-169 follow-up). Reuses
   // reconnectTimer (no WS is active during this phase) so stop() cancels it.
   private scheduleAuthRetry(): void {
-    if (!this.running) return;
+    if (!this.running || this.reconnectTimer !== null || this.ws) return;
+    const generation = this.lifecycleGeneration;
     const backoff = Math.min(RECONNECT_BASE_MS * Math.pow(2, this.authRetryAttempt), RECONNECT_MAX_MS);
     // SCLI-201: never retry the id login before the 429 rate-limit window clears,
     // even if that is longer than the normal backoff cap (honor Retry-After).
@@ -562,9 +614,11 @@ export class ConnectClient {
     const jitter = delay * (0.75 + Math.random() * 0.5);
     this.authRetryAttempt++;
     this.reconnectTimer = setTimeout(() => {
+      if (!this.running || generation !== this.lifecycleGeneration) return;
       this.reconnectTimer = null;
-      this.selfAuthenticate()
+      this.selfAuthenticate(generation)
         .then(() => {
+          if (!this.running || generation !== this.lifecycleGeneration) return;
           if (this.token) {
             this.authRetryAttempt = 0;
             this.connect();
@@ -572,7 +626,9 @@ export class ConnectClient {
             this.scheduleAuthRetry();
           }
         })
-        .catch(() => this.scheduleAuthRetry());
+        .catch(() => {
+          if (generation === this.lifecycleGeneration) this.scheduleAuthRetry();
+        });
     }, jitter);
   }
 
@@ -606,27 +662,32 @@ export class ConnectClient {
   }
 
   private scheduleReconnect(): void {
-    if (!this.running) return;
+    if (!this.running || this.reconnectTimer !== null || this.ws) return;
+    const generation = this.lifecycleGeneration;
     const maxDelay = this.forceTokenRefresh ? AUTH_RECONNECT_MAX_MS : RECONNECT_MAX_MS;
     const delay = Math.min(RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempt), maxDelay);
     const jitter = delay * (0.75 + Math.random() * 0.5);
     this.reconnectAttempt++;
     this.reconnectTimer = setTimeout(() => {
+      if (!this.running || generation !== this.lifecycleGeneration) return;
       this.reconnectTimer = null;
       // Re-authenticate if token might have expired, or if the previous WS
       // handshake looked auth-like. Nginx reports early upstream auth closes as
       // 502, so treat that like 401/403 and force a fresh token instead of
       // retrying a daemon-provisioned but stale/revoked AGENT_ACCESS_TOKEN.
       if (this.forceTokenRefresh || this.reconnectAttempt > 3) {
-        this.selfAuthenticate()
+        this.selfAuthenticate(generation)
           .then(() => {
+            if (!this.running || generation !== this.lifecycleGeneration) return;
             if (this.token) {
               this.connect();
             } else {
               this.scheduleReconnect();
             }
           })
-          .catch(() => this.scheduleReconnect());
+          .catch(() => {
+            if (generation === this.lifecycleGeneration) this.scheduleReconnect();
+          });
       } else {
         this.connect();
       }
@@ -692,9 +753,10 @@ export class ConnectClient {
           }
         }
 
-        // CON-226 is deliberately Direct-only. Group admission remains owned
-        // by CON-224/225; missing provenance fails open to one optional turn.
-        const suppressionReason = parsed.conversationType === 'direct' && parsed.senderSameOrg === true
+        // Suppression is content-based for both authenticated Connect channel
+        // types. Missing or cross-org provenance remains fail-open so an
+        // untrusted sender cannot silence an otherwise actionable turn.
+        const suppressionReason = parsed.conversationType !== 'unknown' && parsed.senderSameOrg === true
           ? classifyConnectTurnSuppression(parsed.content)
           : null;
         if (suppressionReason) {
@@ -782,7 +844,7 @@ export class ConnectClient {
    * JWT for agent users — the single source of truth for agent identity.
    * No local minting fallback (was a security risk and is now gone).
    */
-  private async selfAuthenticate(): Promise<void> {
+  private async selfAuthenticate(generation = this.lifecycleGeneration): Promise<void> {
     const envAccessToken = process.env['AGENT_ACCESS_TOKEN'];
     if (envAccessToken && !this.forceTokenRefresh) {
       if (!isJwtExpired(envAccessToken)) {
@@ -806,6 +868,7 @@ export class ConnectClient {
     // start()/reconnect retry loop re-runs this until the broker is ready.
     if (brokerExpected()) {
       const bt = await fetchBrokerToken();
+      if (generation !== this.lifecycleGeneration) return;
       if (bt?.accessToken) {
         this.token = bt.accessToken;
         this.forceTokenRefresh = false;
@@ -859,6 +922,7 @@ export class ConnectClient {
       });
       try {
         const resp = await doLogin();
+        if (generation !== this.lifecycleGeneration) return;
         // SECURITY: no admin-token self-heal. Agents never hold
         // DAEMON_ADMIN_TOKEN (privilege-escalation risk). The daemon provisions
         // the account password reliably at spawn; drift recovery is owner-scoped.
@@ -895,6 +959,7 @@ export class ConnectClient {
             access?: string;
             user?: { id?: number };
           };
+          if (generation !== this.lifecycleGeneration) return;
           const token = data.tokens?.access ?? data.access;
           if (token) {
             this.token = token;
@@ -915,6 +980,7 @@ export class ConnectClient {
           }
         }
       } catch (err) {
+        if (generation !== this.lifecycleGeneration) return;
         if (this.authFailureStreak === 0) {
           logger.warn({ endpoint, err: (err as Error).message }, '[ConnectClient] shizuha-id login error');
         }

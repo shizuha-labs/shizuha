@@ -7,6 +7,7 @@ import { toggleStatusItem, getStatusItems, getAllStatusItems, type StatusItem } 
 import { computeCost, formatCost } from '../utils/pricing.js';
 import { getContextWindow, contextUsagePercent } from '../utils/contextWindow.js';
 import { writeClipboardText } from '../utils/clipboard.js';
+import { loadSettings, saveSettings } from '../utils/settings.js';
 import { readCredentials, addAnthropicToken, setOpenAIKey, setGoogleKey, setCortexApiKey, removeProvider, credentialsPath } from '../../config/credentials.js';
 import type { BackgroundTaskRegistry } from '../../tasks/registry.js';
 import type { TaskNotifyPolicy } from '../../tasks/types.js';
@@ -42,6 +43,14 @@ interface SlashCommandContext {
   renameSession?: (name: string) => boolean;
   forkSession?: () => string | null;
   listMCPTools?: () => Promise<Array<{ name: string; description: string }>>;
+  listMcpServers?: () => Array<{
+    name: string;
+    disabled: boolean;
+    connected: boolean;
+    tools: number;
+    error?: string;
+  }>;
+  setMcpServerEnabled?: (name: string, enabled: boolean) => Promise<{ ok: boolean; message: string }>;
   getLastAssistantMessage?: () => string | null;
   setThinking?: (level: string) => void;
   setEffort?: (level: string) => void;
@@ -62,6 +71,8 @@ interface SlashCommandContext {
     refreshTokenExpiresAt?: string;
   }>;
   verifyShizuhaIdentity?: () => Promise<{ username?: string }>;
+  /** SCLI-479: enable/disable SGR mouse capture at runtime (persisted). */
+  setMouseReporting?: (enabled: boolean) => void;
 }
 
 interface SlashCommandResult {
@@ -83,12 +94,13 @@ const HELP_COMPACT_TEXT = `Slash Commands (grouped):
   Model:     /model [name], /mode <plan|supervised|autonomous>
   Settings:  /config ..., /settings ... (alias), /statusline [item]
   Reasoning: /think <off|on>, /effort <low|medium|high|xhigh>, /fast
+  Mouse:     /mouse [on|off]  (hand wheel to tmux scrollback when off)
   Context:   /compact [instr], /context, /cost
   Code:      /diff, /review, /status, /copy
-  Tools:     /mcp, /memory, /paste-image [prompt]
+  Tools:     /mcp (toggle servers), /mcp tools, /memory, /paste-image [prompt]
   Background:/watch <task|description> [--policy done_only|state_changes|silent]
   Utility:   /verbose, /feedback <text>, /doctor, /init, /exit
-  Auth:      /login <username> <password>, /logout, /auth status [live]
+  Auth:      /login <username> <password>, /logout, /auth status [live], /usage
   More:      /help all`;
 
 const HELP_FULL_TEXT = `Slash Commands:
@@ -104,6 +116,8 @@ const HELP_FULL_TEXT = `Slash Commands:
   /think <off|on>           Set Claude thinking
   /effort <level>           low | medium | high | xhigh
   /fast                     Toggle fast mode (1.5x speed, 2x credits)
+  /mouse [on|off]           Toggle mouse capture (off hands the wheel to
+                            tmux/terminal scrollback; persisted across restarts)
 
   [Settings]
   /config [subcommand]      Config umbrella (same as /settings)
@@ -119,7 +133,9 @@ const HELP_FULL_TEXT = `Slash Commands:
   /copy                     Copy last response to clipboard
 
   [Tools]
-  /mcp                      List MCP servers and tools
+  /mcp                      Open MCP server toggle (persisted)
+  /mcp tools                List connected MCP tools
+  /mcp <server> on|off      Enable or disable one MCP server (persisted)
   /memory                   View memory file
   /paste-image [prompt]     Paste image from clipboard and submit
   /watch <task|description> [--policy <policy>]
@@ -136,12 +152,18 @@ const HELP_FULL_TEXT = `Slash Commands:
   [Shizuha Auth]
   /login <username> <password>  Login to Shizuha ID and refresh MCP auth
   /logout                        Remove local Shizuha auth and refresh MCP auth
+  /usage                         Remaining weekly Cortex / OpenCode Zen tokens
   /auth status [live]            Show current auth status (optional live verification)
   /auth verify                   Alias for /auth status live
 
   /help                     Show compact help
   /help all                 Show full help
-  /exit                     Exit`;
+  /exit                     Exit
+
+Keyboard:
+  Enter submit · Ctrl+J newline · Tab complete · Up/Down history · Ctrl+R search
+  Ctrl+C interrupt/quit · Ctrl+Z suspend (fg resumes) · Ctrl+Y undo edit
+  Ctrl+P pager · Ctrl+X editor · Ctrl+S stash · Esc clear/back`;
 
 const CONFIG_HELP_TEXT = `Config shortcuts:
   /config show              Show current settings summary
@@ -153,6 +175,8 @@ const CONFIG_HELP_TEXT = `Config shortcuts:
   /config think <off|on>    Set thinking level
   /config effort <level>    Set reasoning effort
   /config statusline [item] Configure status bar items
+  /config mcp               Open MCP server toggle
+  /config mcp <srv> on|off  Enable or disable one MCP server (persisted)
   /settings ...             Alias for /config ...`;
 
 function formatExpiry(iso: string | undefined): string {
@@ -200,6 +224,12 @@ export async function handleSlashCommandAsync(input: string, ctx: SlashCommandCo
     } catch (err) {
       return { handled: true, message: `Login failed: ${(err as Error).message}` };
     }
+  }
+
+  if (cmd === '/usage') {
+    const { fetchCortexUsage, renderCortexUsage } = await import('../../provider/cortex-usage.js');
+    const view = await fetchCortexUsage();
+    return { handled: true, message: renderCortexUsage(view) };
   }
 
   if (cmd === '/logout') {
@@ -301,6 +331,16 @@ export async function handleSlashCommandAsync(input: string, ctx: SlashCommandCo
     const { runDoctor, formatDoctorChecksPlain } = await import('../../commands/doctor.js');
     const doctorChecks = await runDoctor(docCwd, { selectedModel });
     return { handled: true, message: formatDoctorChecksPlain(doctorChecks) };
+  }
+
+  if (cmd === '/mcp') {
+    const toggle = arg.trim().match(/^(\S+)\s+(on|off|enable|disable)$/i);
+    if (toggle && ctx.setMcpServerEnabled) {
+      const name = toggle[1]!;
+      const enabled = /^(on|enable)$/i.test(toggle[2]!);
+      const result = await ctx.setMcpServerEnabled(name, enabled);
+      return { handled: true, message: result.message };
+    }
   }
 
   return handleSlashCommand(input, ctx);
@@ -440,6 +480,24 @@ export function handleSlashCommand(input: string, ctx: SlashCommandContext): Sla
       const result = ctx.toggleFastMode();
       const state = result.enabled ? 'on (1.5x speed, 2x credits)' : 'off';
       return { handled: true, message: `Fast mode: ${state}` };
+    }
+
+    // SCLI-479: sticky mouse-reporting toggle. When OFF, the TUI stops capturing
+    // the mouse so the wheel scrolls tmux/terminal scrollback natively (no
+    // Ctrl-B). The choice is persisted in ~/.shizuha/settings.json.
+    case '/mouse': {
+      const current = loadSettings().mouseReporting !== false; // default on
+      const enabled = arg.trim().toLowerCase() === 'on' ? true
+        : arg.trim().toLowerCase() === 'off' ? false
+        : !current;
+      saveSettings({ mouseReporting: enabled });
+      if (ctx.setMouseReporting) ctx.setMouseReporting(enabled);
+      return {
+        handled: true,
+        message: enabled
+          ? 'Mouse reporting: on (wheel scrolls the TUI viewport). Use /mouse off to hand the wheel to tmux/terminal scrollback.'
+          : 'Mouse reporting: off (wheel now scrolls tmux/terminal scrollback; no Ctrl-B needed). Use /mouse on to restore TUI viewport scrolling.',
+      };
     }
 
     case '/config':
@@ -585,28 +643,24 @@ export function handleSlashCommand(input: string, ctx: SlashCommandContext): Sla
     }
 
     case '/mcp': {
-      if (ctx.listMCPTools) {
-        // Async — fire and forget, show via pager if available
+      const mcpArg = arg.trim();
+      if (mcpArg.toLowerCase() === 'tools' && ctx.listMCPTools) {
         ctx.listMCPTools().then((tools) => {
           if (tools.length === 0) {
-            if (ctx.showInPager) {
-              ctx.showInPager('MCP Tools: none connected\n\nTo add MCP servers, create a .mcp.json in your project root\nor add [[mcp.servers]] to .shizuha/config.toml');
-            }
+            ctx.showInPager?.(
+              'MCP Tools: none connected\n\nTo add MCP servers, create a .mcp.json in your project root\nor add [[mcp.servers]] to .shizuha/config.toml',
+            );
             return;
           }
           const listing = tools.map((t) => `  ${t.name} — ${t.description}`).join('\n');
-          const content = `MCP Tools (${tools.length}):\n${listing}`;
-          if (ctx.showInPager) {
-            ctx.showInPager(content);
-          }
+          ctx.showInPager?.(`MCP Tools (${tools.length}):\n${listing}`);
         }).catch((err) => {
-          if (ctx.showInPager) {
-            ctx.showInPager(`MCP error: ${(err as Error).message ?? 'unknown error'}`);
-          }
+          ctx.showInPager?.(`MCP error: ${(err as Error).message ?? 'unknown error'}`);
         });
         return { handled: true, message: 'Loading MCP tools...' };
       }
-      return { handled: true, message: 'No MCP servers configured' };
+      ctx.setScreen('mcp');
+      return { handled: true };
     }
 
     case '/statusline': {
@@ -776,6 +830,8 @@ function handleConfigCommand(arg: string, ctx: SlashCommandContext): SlashComman
       return handleSlashCommand(`/effort ${rest}`.trim(), ctx);
     case 'statusline':
       return handleSlashCommand(`/statusline ${rest}`.trim(), ctx);
+    case 'mcp':
+      return handleSlashCommand(rest ? `/mcp ${rest}` : '/mcp', ctx);
     case 'auth':
       return handleAuthCommand(rest, ctx);
     case 'help':

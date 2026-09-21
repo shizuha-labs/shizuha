@@ -100,6 +100,27 @@ describe('messagesToChat', () => {
     expect(blocks[0]!.type).toBe('tool_result');
     expect(blocks[0]!.toolUseId).toBe('tc1');
   });
+
+  it('preserves TUI-pasted image blocks instead of coercing them to tool_result', () => {
+    const msgs: Message[] = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', data: 'abc', media_type: 'image/png' },
+          },
+          { type: 'text', text: 'describe this' },
+        ],
+      },
+    ];
+    const chat = messagesToChat(msgs);
+    const blocks = chat[0]!.content as Array<{ type: string; source?: { data: string }; text?: string }>;
+    expect(blocks[0]!.type).toBe('image');
+    expect(blocks[0]!.source?.data).toBe('abc');
+    expect(blocks[1]!.type).toBe('text');
+    expect(blocks[1]!.text).toBe('describe this');
+  });
 });
 
 // ── Text-only responses ──
@@ -387,6 +408,7 @@ describe('executeTurn — tool calls', () => {
   });
 
   it('returns error for unknown tool', async () => {
+    registry.register(makeDummyTool('known_tool', 'unused'));
     provider.queueResponse(
       ResponseBuilder.withToolCalls('', [{ id: 'tc1', name: 'nonexistent', input: {} }]),
     );

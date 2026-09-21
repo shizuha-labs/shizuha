@@ -13,9 +13,16 @@ import { flattenTranscript } from './TranscriptPager.js';
 
 export interface ConversationViewportHandle {
   scrollBy: (rows: number) => void;
+  /** PLAT-7382: model-only scroll — no render; the terminal-native scroll
+   *  region sequence is the visual. Keeps the model consistent for the next
+   *  natural repaint without a full-viewport-block rewrite. */
+  scrollBySilent: (rows: number) => void;
   pageBy: (pages: number) => void;
   scrollToTop: () => void;
   scrollToBottom: () => void;
+  /** PLAT-7382: the viewport's absolute 1-indexed screen rows for the
+   *  DECSTBM region (top = aboveChromeRows + 1, bottom = above + height). */
+  getGeometry: () => { top: number; bottom: number } | null;
   remeasure: () => void;
 }
 
@@ -24,6 +31,10 @@ interface ConversationViewportProps {
   liveEntry?: TranscriptEntry | null;
   columns: number;
   rows: number;
+  /** PLAT-7382: measured height of the chrome rendered above this viewport
+   *  (error/status/header/welcome-art). The App measures it; the viewport
+   *  combines it with its own measured height for the absolute region. */
+  aboveChromeRows?: number;
 }
 
 export function resolveViewportTop(
@@ -34,6 +45,33 @@ export function resolveViewportTop(
   const maxTop = Math.max(0, totalLines - Math.max(1, rows));
   if (requestedTop === null) return maxTop;
   return Math.min(maxTop, Math.max(0, requestedTop));
+}
+
+/**
+ * Rows the conversation viewport may occupy. Passing the full terminal
+ * height here makes Yoga clip the newest lines under the composer — the
+ * live "scroll down and the answer is gone" failure.
+ */
+export function remainingViewportRows(
+  terminalRows: number,
+  aboveChromeRows: number,
+  belowChromeRows: number,
+): number {
+  return Math.max(
+    1,
+    Math.floor(terminalRows) - Math.max(0, aboveChromeRows) - Math.max(0, belowChromeRows),
+  );
+}
+
+/** Wheel/Pg delta that actually moves, or 0 at either edge (no overscroll). */
+export function clampedScrollDelta(
+  currentTop: number | null,
+  maxTop: number,
+  delta: number,
+): number {
+  const cur = currentTop ?? maxTop;
+  const next = Math.min(maxTop, Math.max(0, cur + delta));
+  return next - cur;
 }
 
 function sliceLineSources(
@@ -65,16 +103,25 @@ export const ConversationViewport = forwardRef<ConversationViewportHandle, Conve
   liveEntry,
   columns,
   rows,
+  aboveChromeRows = 0,
 }, ref) => {
   const width = Math.max(20, columns - 2);
+  // `rows` is the remaining viewport, not the full terminal. An oversized
+  // explicit height lets Yoga paint newest transcript lines under the composer.
   const preferredHeight = Math.max(1, rows);
   const containerRef = useRef<DOMElement>(null);
   const [height, setHeight] = useState(preferredHeight);
+  useEffect(() => {
+    setHeight((previous) => previous === preferredHeight ? previous : preferredHeight);
+  }, [preferredHeight]);
   const syncMeasuredHeight = useCallback(() => {
     if (!containerRef.current) return;
     const measured = Math.max(1, Math.floor(measureElement(containerRef.current).height));
-    setHeight((previous) => previous === measured ? previous : measured);
-  }, []);
+    // Cap at remaining rows (never over-slice). Ignore a 1-row collapse before
+    // Yoga has allocated the flex child.
+    const next = measured >= 2 && measured <= preferredHeight ? measured : preferredHeight;
+    setHeight((previous) => previous === next ? previous : next);
+  }, [preferredHeight]);
 
   // The composer/status/progress chrome has variable height. Yoga allocates
   // this flex child the exact remaining terminal rows; use that measured value
@@ -100,40 +147,70 @@ export const ConversationViewport = forwardRef<ConversationViewportHandle, Conve
   maxTopRef.current = maxTop;
   heightRef.current = height;
 
-  // null is a sticky bottom anchor: streaming output advances beneath it. A
-  // numeric top remains stable while the user reads older content.
-  const [requestedTop, setRequestedTop] = useState<number | null>(null);
+  // PLAT-7382: the ref is the AUTHORITATIVE scroll model; the tick state is
+  // only the render trigger for the programmatic (keyboard) paths. The wheel
+  // path (scrollBySilent) updates the ref alone — no render — because the
+  // terminal-native scroll-region sequence is the visual; a state-driven
+  // repaint would rewrite the viewport block the terminal just scrolled.
+  const requestedTopRef = useRef<number | null>(null);
+  const [, setRenderTick] = useState(0);
+  const requestRender = useCallback(() => setRenderTick((t) => t + 1), []);
+  const aboveChromeRowsRef = useRef(aboveChromeRows);
+  aboveChromeRowsRef.current = aboveChromeRows;
+
+  const clampRequested = useCallback((next: number): number | null => {
+    const clamped = Math.min(maxTopRef.current, Math.max(0, next));
+    return clamped >= maxTopRef.current ? null : clamped;
+  }, []);
 
   useImperativeHandle(ref, () => ({
     scrollBy: (delta: number) => {
-      setRequestedTop((previous) => {
-        const current = previous ?? maxTopRef.current;
-        const next = Math.min(maxTopRef.current, Math.max(0, current + delta));
-        return next >= maxTopRef.current ? null : next;
-      });
+      const applied = clampedScrollDelta(requestedTopRef.current, maxTopRef.current, delta);
+      if (applied === 0) return;
+      const current = requestedTopRef.current ?? maxTopRef.current;
+      requestedTopRef.current = clampRequested(current + applied);
+      requestRender();
+    },
+    scrollBySilent: (delta: number) => {
+      // Same as scrollBy: a silent model-only shift left the terminal showing
+      // blank cells (PLAT-7382). Always repaint so newly revealed rows exist.
+      const applied = clampedScrollDelta(requestedTopRef.current, maxTopRef.current, delta);
+      if (applied === 0) return;
+      const current = requestedTopRef.current ?? maxTopRef.current;
+      requestedTopRef.current = clampRequested(current + applied);
+      requestRender();
     },
     pageBy: (pages: number) => {
-      setRequestedTop((previous) => {
-        const current = previous ?? maxTopRef.current;
-        const next = Math.min(
-          maxTopRef.current,
-          Math.max(0, current + pages * Math.max(1, heightRef.current - 2)),
-        );
-        return next >= maxTopRef.current ? null : next;
-      });
+      const current = requestedTopRef.current ?? maxTopRef.current;
+      requestedTopRef.current = clampRequested(
+        current + pages * Math.max(1, heightRef.current - 2),
+      );
+      requestRender();
     },
-    scrollToTop: () => setRequestedTop(0),
-    scrollToBottom: () => setRequestedTop(null),
+    scrollToTop: () => {
+      requestedTopRef.current = 0;
+      requestRender();
+    },
+    scrollToBottom: () => {
+      requestedTopRef.current = null;
+      requestRender();
+    },
+    getGeometry: () => {
+      if (heightRef.current < 1) return null;
+      const top = aboveChromeRowsRef.current + 1;
+      return { top, bottom: aboveChromeRowsRef.current + heightRef.current };
+    },
     remeasure: syncMeasuredHeight,
-  }), [syncMeasuredHeight]);
+  }), [syncMeasuredHeight, requestRender, clampRequested]);
 
   // Reflow changes line identities. Following the bottom is the only stable,
   // unsurprising position after a terminal-width change.
   useEffect(() => {
-    setRequestedTop(null);
-  }, [width]);
+    requestedTopRef.current = null;
+    requestRender();
+  }, [width, requestRender]);
 
-  const top = resolveViewportTop(totalLines, height, requestedTop);
+  const top = resolveViewportTop(totalLines, height, requestedTopRef.current);
   const visible = sliceLineSources(completedLines, liveLines, top, top + height);
   const topPadding = Math.max(0, height - visible.length);
   const frame = `${'\n'.repeat(topPadding)}${visible.join('\n')}`;

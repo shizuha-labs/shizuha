@@ -5,15 +5,10 @@
  * (serialize.ts + thinking_mode.mdx), MIT. Not a Cordis adapter drop-in —
  * SCLI keeps VLlmProvider (DSML hold, Cortex affinity, GLM/Qwen).
  *
- * Reasoning passback (guides/thinking_mode § Tool Calls):
- *   - Tool-call assistant turns: reasoning_content MUST be replayed.
- *   - Tool-call-free turns: drop it. Hosted API ignores it; self-hosted
- *     templates may *render* it and contaminate long sessions ("Let me…").
- *
- * KV: omitting CoT on a finished non-tool turn only breaks prefix match
- * from that last assistant generation; earlier turns still hit if they
- * were also sent without CoT. Tool-round trips keep CoT so the in-flight
- * thought + cache stay aligned (and hosted DeepSeek 400s without it).
+ * https://api-docs.deepseek.com/guides/thinking_mode/ requires every prior
+ * assistant reasoning_content when the request carries tools, including
+ * turns without tool calls. VLlmProvider resolves that request-level policy
+ * before this helper; tool-call-turns remains its tool-free fallback.
  */
 
 export type DeepSeekReasoningPassback = 'always' | 'tool-call-turns';

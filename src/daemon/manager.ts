@@ -66,6 +66,9 @@ import {
 import { runtimeLaneHealthFromProbe } from './runtime-lane-health.js';
 import { launchConcurrentlyWithIoYield } from './startup-scheduler.js';
 import { launchBareMetalChild } from './bare-metal-workspace.js';
+// PLAT-7787: static ESM import — `require('./agent-accounts.js')` throws ERR_REQUIRE_ESM
+// in this ESM module (review finding on shizuha-beta#349).
+import { consumeEnsureAgentAccountDiag } from './agent-accounts.js';
 import { type AgentIdentity, validateAgentIdentity } from './agent-identity.js';
 import * as dns from 'node:dns';
 import * as os from 'node:os';
@@ -82,6 +85,7 @@ import { agentEffectiveCapabilityEnv, applyEffectiveCapabilitiesToAgent, summari
 import { loadOrCreateAgentKeypair } from '../crypto/identity.js';
 import { listSkillNames, readSkillByName } from '../skills/frontmatter.js';
 import { skillMatchesAudience } from '../skills/registry.js';
+import { buildSkillStalenessNoticeForTurn } from './skill-staleness-runtime.js';
 import { setupPeriodicRunReviewer } from '../telemetry/run-reviewer.js';
 import { startAgentHealthServer } from '../metrics/health-server.js';
 import {
@@ -103,7 +107,7 @@ import {
   recordK8sGithubAuthProbe,
   recordK8sGithubAuthAndonSendFailure,
   recordRuntimeSsotRefresh,
-} from '../metrics/registry.js';
+} from '../metrics/daemon.js';
 import { PlatformClient } from './platform-client.js';
 import { startDashboard, startDashboardTcpProxy } from './dashboard.js';
 import {
@@ -125,6 +129,7 @@ import {
   isDaemonRunning,
   isShizuhaDaemonProcess,
   readEnabledAgents,
+  readAgentLifecycleStates,
   writeEnabledAgents,
   readDisabledAgents,
   writeDisabledAgents,
@@ -136,6 +141,8 @@ import {
   updateAgentConfig,
   computeRuntimeReconcilePlan,
   acquirePidLock,
+  readPidLock,
+  releasePidLock,
   getFailoverChain,
 } from './state.js';
 import {
@@ -1428,6 +1435,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     libgbm1 libnss3 libatk-bridge2.0-0 libdrm2 libxcomposite1 \\
     libxdamage1 libxrandr2 libcups2 libasound2t64 libpangocairo-1.0-0 \\
     libgtk-3-0 libxshmfence1 xvfb openbox fontconfig \\
+    scrot imagemagick x11-apps \\
   && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \\
        wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb \\
        && (dpkg -i /tmp/chrome.deb 2>/dev/null || apt-get install -f -y --no-install-recommends); \\
@@ -3313,7 +3321,7 @@ async function refreshEffectiveCapabilitiesForAgentResult(
   } catch (err) {
     console.warn(
       `[daemon] ${agent.name}: Hive effective capabilities refresh failed (${reason}): ` +
-      `${(err as Error).message}; keeping legacy/last-valid runtime config ` +
+      `${(err as Error).message}; signed runtime projection will fence at its lease/TTL ` +
       `(refresh_concurrency=${EFFECTIVE_CAPABILITY_REFRESH_CONCURRENCY}, queued=${effectiveCapabilityRefreshWaiters.length})`,
     );
     return { changed: false, dependencyFailed: true };
@@ -3565,6 +3573,17 @@ function daemonLogPath(): string {
 /** Directory for per-agent claude-bridge persistent logs (mounted into containers). */
 function bridgeLogDir(): string {
   return path.join(process.env['HOME'] ?? '~', '.shizuha', 'bridge-logs');
+}
+
+/**
+ * PLAT-8958: per-agent persistent structured-log dir, bind-mounted at the
+ * agent's default log path (~/.config/shizuha/logs/) so the SCLI-410
+ * file-only log survives `--rm` container removal and seat restarts — the
+ * same durability the bridge-log mount gives bridge stdout/stderr. Growth is
+ * bounded by the logger's own RotatingFileStream (5MiB x 5 default).
+ */
+function agentLogDir(username: string): string {
+  return path.join(process.env['HOME'] ?? '~', '.shizuha', 'agent-logs', username);
 }
 
 export function resolveDashboardHost(): string {
@@ -4177,6 +4196,7 @@ async function runDaemon(
     },
     getAgentLastActivity,
     probeAppliedRuntimeLaneHealth,
+    readAgentLifecycleStates,
   );
   daemonLinkClient.start();
 
@@ -4347,6 +4367,7 @@ async function runDaemon(
   // 1 gather cycle without a daemon restart.
   startAgentHealthServer(() => {
     const enabledIds = readEnabledAgents();
+    const lifecycleStates = readAgentLifecycleStates();
     return readAgents().map((a) => {
       const proc = childProcesses.get(a.id);
       return {
@@ -4354,6 +4375,8 @@ async function runDaemon(
         enabled: enabledIds.has(a.id),
         running: !!proc && !proc.killed && proc.exitCode === null,
         capacityUnavailable: tokenPoolBackoffSet.has(a.id),
+        lifecycleState: lifecycleStates.get(a.id)
+          ?? (enabledIds.has(a.id) ? 'enabled' : 'operator_stopped'),
       };
     });
   });
@@ -4910,6 +4933,22 @@ export async function runtimeRollBusyGate(
       detail,
     };
   }
+}
+
+/** Hive-active k8s seats must be rollable even when absent from the host
+ * enabled-agents.json (that file only lists the historical local-daemon
+ * cohort). The explicit disabled set remains the kill-switch. */
+export function harnessRollEnabledSet(
+  fileEnabled: Iterable<string>,
+  fileDisabled: Iterable<string>,
+  desiredAgents: Array<{ id: string; status?: string }>,
+): Set<string> {
+  const enabled = new Set(fileEnabled);
+  for (const agent of desiredAgents) {
+    if (agent.status === 'active') enabled.add(agent.id);
+  }
+  for (const agentId of fileDisabled) enabled.delete(agentId);
+  return enabled;
 }
 
 /** Classify a drifted Deployment without weakening the operator kill-switch.
@@ -5524,16 +5563,11 @@ async function reconcileRuntimeLifecycle(): Promise<void> {
   // agents the reconcile actually keeps a Deployment running for (enabled +
   // status==='active'), instead of paging deployment_unready for
   // eligible-but-disabled/paused agents that legitimately have no Deployment.
-  const enabledSet = readEnabledAgents();
-  // SCLI-110 kill-switch, k8s plane (2026-07-11): the disabled set is
-  // AUTHORITATIVE here too. The local-process path already refuses to start a
-  // disabled agent (startAgentProcess guard), but this reconcile's toStartK8s
-  // only consulted enabled-agents.json — an id present in BOTH files (e.g. a
-  // hand-edited kill-switch, or a Hive sync/credential-migration flipping
-  // status back to 'active') re-spawned explicitly-stopped agents' Deployments
-  // on daemon boot. That silently revived the whole disabled claude cohort on
-  // 2026-07-10 after a daemon restart, burning paused-account quota.
-  for (const disabledId of readDisabledAgents()) enabledSet.delete(disabledId);
+  const enabledSet = harnessRollEnabledSet(
+    readEnabledAgents(),
+    readDisabledAgents(),
+    desiredAgents,
+  );
   // Credential/image recovery is an ENFORCE action and must run before the
   // diagnostic GitHub probe below. That probe shells into multiple agents and
   // can spend minutes in external TLS timeouts; putting it first starved broker
@@ -5927,7 +5961,10 @@ export async function enableAndStartAgent(
  * Disable and stop a single agent's runtime.
  * Kills the gateway subprocess.
  */
-export function disableAndStopAgent(agentId: string): { ok: boolean; error?: string } {
+export function disableAndStopAgent(
+  agentId: string,
+  opts: { lifecycleState?: 'hibernated' | 'operator_stopped' } = {},
+): { ok: boolean; error?: string } {
   if (!inMemoryState) {
     return { ok: false, error: 'Daemon not initialized' };
   }
@@ -5946,7 +5983,10 @@ export function disableAndStopAgent(agentId: string): { ok: boolean; error?: str
   // routes MCP/CLI/dashboard stop through the AgentStateStore first, then mirrors
   // the legacy enabled/disabled JSON files. If the authoritative store is
   // unavailable, fail before mutating runtime memory or stopping the process.
-  const desiredState = setAgentDesiredRuntimeState(agentId, false, { actor: 'disableAndStopAgent' });
+  const desiredState = setAgentDesiredRuntimeState(agentId, false, {
+    actor: 'disableAndStopAgent',
+    lifecycleState: opts.lifecycleState ?? 'operator_stopped',
+  });
   if (!desiredState.ok) return desiredState;
 
   revokeAgentGatewayTokens(agentId);
@@ -6000,6 +6040,7 @@ export function disableAndStopAgent(agentId: string): { ok: boolean; error?: str
 export function resolveK8sSpawnPassword(
   agent: AgentInfo,
   launchCredentialEnv: Record<string, string>,
+  hostCredentialReader: (key: string) => string | undefined = readAgentCredential,
 ): string {
   for (const candidate of [
     launchCredentialEnv['AGENT_PASSWORD'],
@@ -6009,7 +6050,7 @@ export function resolveK8sSpawnPassword(
     // skipping the chain baked AGENT_PASSWORD='' into 6 agents' secrets and
     // left their brokers permanently unready (2026-07-10).
     resolveAgentPassword(agent),
-    readAgentCredential('AGENT_PASSWORD'),
+    hostCredentialReader('AGENT_PASSWORD'),
   ]) {
     if (isUsableAgentPassword(candidate)) return candidate;
   }
@@ -6360,7 +6401,7 @@ function startSkillSyncLoop(): void {
  */
 const PLATFORM_UNIVERSAL_SKILLS = [
   'connect-messaging',    // every agent sends/receives DMs → must know the protocol
-  'heartbeat-protocol',   // every agent receives heartbeats → must know silence-is-default
+  'heartbeat-protocol',   // Pulse/Hive floor: every seat fetches alerts then tasks on heartbeat
   'pulse-core',           // every agent receives task assignments → must advance state per workflow (lean core; role depth in the role skills below)
   'skill-loader',         // LOAD relevant skills before acting; where to find them (folder/git/wiki) — every operating rule is a skill (critical, inlined; operator 2026-06-24)
   'web-search',           // web-search current external facts before major/current/jurisdictional decisions; default India/IST operator context (critical, inlined; operator 2026-06-25)
@@ -6873,6 +6914,20 @@ async function startAgentProcess(
       }
     }
 
+    // PLAT-5046: report-only skill-staleness notice (fail-open, never gates or
+    // interrupts). Appended to the bridge identity prompt only when the agent
+    // is actually behind; an up-to-date agent gets no extra text on the common
+    // path. Any read/fetch failure yields null via the reader, so spawn is
+    // never blocked by staleness detection.
+    try {
+      const stalenessNotice = await buildSkillStalenessNoticeForTurn();
+      if (stalenessNotice) {
+        bridgeCustomPrompt = (bridgeCustomPrompt ?? '') + '\n\n' + stalenessNotice;
+      }
+    } catch (err) {
+      console.warn(`[daemon] ${agent.name}: skill-staleness notice skipped: ${(err as Error).message}`);
+    }
+
     const bridgeIdentityPrompt = buildBridgeIdentityPrompt(agent, bridgeCustomPrompt);
     k8sContextPrompt = bridgeIdentityPrompt;
     console.log(
@@ -6907,7 +6962,17 @@ async function startAgentProcess(
     // still skipped here — they remain discoverable via native SCLI skill tools.
     const base = !hasLocalClaudeMd ? (agent.contextPrompt ?? '') : '';
     const criticalSkillContent = loadStarredSkills(agent, { criticalOnly: true });
-    const combined = [base, criticalSkillContent].filter(Boolean).join('\n\n');
+    let combined = [base, criticalSkillContent].filter(Boolean).join('\n\n');
+    // PLAT-5046: report-only skill-staleness notice, same fail-open discipline
+    // as the bridge path — only added when the agent is actually behind.
+    try {
+      const stalenessNotice = await buildSkillStalenessNoticeForTurn();
+      if (stalenessNotice) {
+        combined = combined ? `${combined}\n\n${stalenessNotice}` : stalenessNotice;
+      }
+    } catch (err) {
+      console.warn(`[daemon] ${agent.name}: skill-staleness notice skipped: ${(err as Error).message}`);
+    }
     if (combined) {
       if (criticalSkillContent) {
         console.log(`[daemon] ${agent.name}: inlined critical starred skills into gateway context prompt`);
@@ -7061,18 +7126,29 @@ async function startAgentProcess(
         }
         if (attempt < 5) {
           const delay = Math.min(2000 * attempt, 10000);
-          console.warn(`[daemon] ${agent.name}: account provisioning attempt ${attempt} failed (shizuha-id unreachable?) — retry in ${delay}ms`);
+          const diag = consumeEnsureAgentAccountDiag();
+          console.warn(
+            `[daemon] ${agent.name}: account provisioning attempt ${attempt} failed` +
+              (diag
+                ? ` phase=${diag.phase} kind=${diag.kind || ''} reason=${diag.reason || ''} status=${diag.status ?? ''}`
+                : ' (no diag; ensureAgentAccount returned null)') +
+              ` — retry in ${delay}ms`,
+          );
           await new Promise((r) => setTimeout(r, delay));
         }
       }
       if (!agentAccount) {
-        console.error(`[daemon] ${agent.name}: ERROR account provisioning failed after retries — agent starts WITHOUT platform identity (deliberate: it can still work and even fix shizuha-id); periodic reconcile will repair the account so the runtime's on-demand login recovers without a restart.`);
+        const finalDiag = consumeEnsureAgentAccountDiag();
+        const diagSuffix = finalDiag
+          ? ` phase=${finalDiag.phase} kind=${finalDiag.kind || ''} reason=${finalDiag.reason || ''} status=${finalDiag.status ?? ''}`
+          : '';
+        console.error(`[daemon] ${agent.name}: ERROR account provisioning failed after retries${diagSuffix} — agent starts WITHOUT platform identity (deliberate: it can still work and even fix shizuha-id); periodic reconcile will repair the account so the runtime's on-demand login recovers without a restart.`);
         notePendingAccountReconcile(agent);
         void sendAgentAccountReconcileFailureAndon({
           agent,
           platformUrl,
           reason: 'account_provisioning_failed_after_retries',
-          detail: 'ensureAgentAccount returned null after bounded startup retries; AGENT_ACCESS_TOKEN/AGENT_USER_ID will not be injected.',
+          detail: `ensureAgentAccount returned null after bounded startup retries; AGENT_ACCESS_TOKEN/AGENT_USER_ID will not be injected.${diagSuffix}`,
         }).then((sendResult) => {
           if (sendResult.sent || sendResult.rateLimited) return;
           console.error(`[daemon] ${agent.name}: account reconcile ANDON DM failed: ${sendResult.error || 'unknown error'}`);
@@ -7575,6 +7651,10 @@ async function startAgentProcess(
       // survive --rm container removal. Created eagerly so Docker binds the dir
       // with correct host ownership (not root-owned Docker tmpfs).
       '-v', `${bridgeLogDir()}:/var/log/shizuha/bridges`,
+      // PLAT-8958: persistent structured-log dir at the agent's default log
+      // path (~/.config/shizuha/logs/) so the SCLI-410 file-only log survives
+      // --rm removal — post-incident review keeps the failure window.
+      '-v', `${agentLogDir(agent.username)}:/home/agent/.config/shizuha/logs`,
       // Codex home: coordinator mode is fully per-agent and contains only the
       // access-only broker cache. Standalone mode retains the legacy shared login
       // directory while keeping identity/transcript state per-agent.
@@ -7905,6 +7985,12 @@ async function startAgentProcess(
     // as daemon-user-owned (not root-owned via Docker tmpfs creation).
     try {
       fs.mkdirSync(bridgeLogDir(), { recursive: true, mode: 0o700 });
+    } catch { /* ignore — worst case the dir is created by Docker as root */ }
+
+    // PLAT-8958: same eager-creation contract for the per-agent structured-log
+    // dir — Docker must bind a daemon-user-owned dir, not create it as root.
+    try {
+      fs.mkdirSync(agentLogDir(agent.username), { recursive: true, mode: 0o700 });
     } catch { /* ignore — worst case the dir is created by Docker as root */ }
 
     // ── Per-agent extra volume mounts (from agent config) ──
@@ -8452,40 +8538,125 @@ function stopAllAgents(): void {
 /**
  * Stop the daemon and all agents.
  * Checks both the PID lock file and daemon.json state to find running daemons.
+ *
+ * SCLI-587: the old implementation sent SIGTERM and immediately cleared durable
+ * state + released the PID lock without verifying the daemon actually exited —
+ * so `shizuha down` could report success while the daemon (and its in-flight
+ * Docker builds) kept running. This version:
+ *   1. SIGTERMs the daemon's process group (the detached daemon is the group
+ *      leader, so owned children — including Docker builds — get the signal too).
+ *   2. Waits boundedly for the daemon to exit.
+ *   3. Escalates to SIGKILL if it ignored SIGTERM (e.g. wedged mid-build).
+ *   4. Only clears durable state + releases the PID lock AFTER the daemon has
+ *      exited (or after escalation), so a still-alive daemon keeps its lock and
+ *      the user can recover via `status` / `down` again.
  */
-export function stopDaemon(): boolean {
-  const { readPidLock, releasePidLock } = require('./state.js') as typeof import('./state.js');
-  let killed = false;
+export interface StopDaemonResult {
+  /** True when every targeted daemon exited (or none was running). */
+  stopped: boolean;
+  /** True when a daemon ignored SIGTERM and had to be SIGKILLed. */
+  escalated: boolean;
+  /** Daemon PIDs still alive after SIGTERM + SIGKILL escalation. */
+  remainingPids: number[];
+}
+
+const stopTimings = { graceMs: 10_000, killWaitMs: 2_000, pollMs: 200 };
+
+/** Test hook: shorten the bounded stop waits so the escalation path is fast. */
+export function __setStopDaemonTimingsForTest(
+  t: Partial<typeof stopTimings>,
+): void {
+  Object.assign(stopTimings, t);
+}
+
+function stopSleepSync(ms: number): void {
+  try {
+    const sab = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(sab, 0, 0, ms);
+  } catch {
+    // SharedArrayBuffer unavailable — fall back to a busy wait.
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) { /* spin */ }
+  }
+}
+
+export function stopDaemon(): StopDaemonResult {
+  const pids = new Set<number>();
 
   // Check PID lock file (authoritative — written by acquirePidLock)
   const lockPid = readPidLock();
   if (lockPid && isShizuhaDaemonProcess(lockPid)) {
-    try {
-      process.kill(lockPid, 'SIGTERM');
-      console.log(`Sent shutdown signal to daemon (PID ${lockPid} from lock file).`);
-      killed = true;
-    } catch { /* not running */ }
+    pids.add(lockPid);
   }
 
   // Also check daemon.json state (may have a different PID)
   const state = readDaemonState();
-  if (state && state.pid !== lockPid) {
-    if (isShizuhaDaemonProcess(state.pid)) {
+  if (state && state.pid && state.pid !== lockPid && isShizuhaDaemonProcess(state.pid)) {
+    pids.add(state.pid);
+  }
+
+  if (pids.size === 0) {
+    console.log('No daemon is running.');
+    clearDaemonState();
+    releasePidLock();
+    return { stopped: true, escalated: false, remainingPids: [] };
+  }
+
+  // SIGTERM the daemon's process group so owned children (Docker builds, agent
+  // processes) receive the shutdown signal too — not just the daemon PID.
+  for (const pid of pids) {
+    try {
+      process.kill(-pid, 'SIGTERM');
+      console.log(`Sent shutdown signal to daemon process group (PGID ${pid}).`);
+    } catch {
       try {
-        process.kill(state.pid, 'SIGTERM');
-        console.log(`Sent shutdown signal to daemon (PID ${state.pid} from state).`);
-        killed = true;
+        process.kill(pid, 'SIGTERM');
+        console.log(`Sent shutdown signal to daemon (PID ${pid}).`);
       } catch { /* not running */ }
     }
   }
 
-  if (!killed) {
-    console.log('No daemon is running.');
+  // Wait boundedly for the daemon(s) to exit before touching durable state.
+  const remaining = new Set(pids);
+  const deadline = Date.now() + stopTimings.graceMs;
+  while (Date.now() < deadline && remaining.size > 0) {
+    for (const pid of [...remaining]) {
+      if (!isShizuhaDaemonProcess(pid)) remaining.delete(pid);
+    }
+    if (remaining.size > 0) stopSleepSync(stopTimings.pollMs);
   }
 
-  clearDaemonState();
-  releasePidLock();
-  return killed;
+  // Escalate to SIGKILL for anything still alive (SIGTERM ignored — e.g. a
+  // daemon wedged mid Docker build).
+  const escalated = remaining.size > 0;
+  for (const pid of remaining) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+      console.log(`Daemon process group ${pid} ignored SIGTERM — sent SIGKILL.`);
+    } catch {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch { /* gone */ }
+    }
+  }
+
+  const killDeadline = Date.now() + stopTimings.killWaitMs;
+  while (Date.now() < killDeadline && remaining.size > 0) {
+    for (const pid of [...remaining]) {
+      if (!isShizuhaDaemonProcess(pid)) remaining.delete(pid);
+    }
+    if (remaining.size > 0) stopSleepSync(100);
+  }
+
+  // Only clear durable state + release the PID lock AFTER the daemon has
+  // exited (or after escalation). A still-alive PID keeps its lock so the user
+  // can recover via `status` / `down` again.
+  if (remaining.size === 0) {
+    clearDaemonState();
+    releasePidLock();
+  }
+
+  return { stopped: remaining.size === 0, escalated, remainingPids: [...remaining] };
 }
 
 /**
@@ -8530,7 +8701,32 @@ export async function showStatus(
       }
     }
   } else {
-    console.log('Daemon: not running');
+    // SCLI-406: inside a k3s/rt-fleet managed agent there is deliberately no
+    // loopback daemon state — the runtime is externally managed. Do NOT collapse
+    // that into a bare "Daemon: not running" false-negative. Render both truths:
+    // local loopback daemon absent + current fleet runtime live/managed.
+    const fleetId =
+      process.env['SHIZUHA_FLEET_ID'] ||
+      process.env['FLEET_ID'] ||
+      process.env['SHIZUHA_DAEMON_ID'] ||
+      process.env['FLEET_DAEMON_ID'] ||
+      '';
+    const fleetManaged =
+      !!(
+        process.env['SHIZUHA_FLEET_ID'] ||
+        process.env['FLEET_ID'] ||
+        process.env['SHIZUHA_DAEMON_LINK_URL'] ||
+        process.env['FLEET_DAEMON_LINK_URL']
+      );
+    console.log('Daemon: not running (loopback)');
+    if (fleetManaged) {
+      console.log(
+        `Fleet runtime: live (managed by k3s/rt-fleet)${fleetId ? ` — fleet ${fleetId}` : ''}`,
+      );
+      console.log('  This agent runtime is externally managed; the loopback daemon is not used.');
+    } else {
+      console.log('  No loopback daemon state found; no fleet runtime detected.');
+    }
   }
 
   // If we have platform access, also show connected runners

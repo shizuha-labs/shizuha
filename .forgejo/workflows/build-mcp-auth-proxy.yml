@@ -16,6 +16,10 @@ jobs:
     runs-on: deploy-lane
     steps:
       - name: Configure cluster access
+        env:
+          # Bound through env rather than interpolated into the shell body
+          # (semgrep run-shell-injection / CWE-78, PLAT-4734).
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
           set -euo pipefail
           KUBECTL_ARCH="$(uname -m)"
@@ -28,13 +32,16 @@ jobs:
             "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
           install -m 0755 kubectl /usr/local/bin/kubectl
           mkdir -p "$HOME/.kube"
-          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
 
       - name: Test, build, publish, and verify both architectures
+        env:
+          # Bound through env rather than interpolated into the shell body
+          # (semgrep run-shell-injection / CWE-78, PLAT-4734).
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          SOURCE_SHA='${{ github.sha }}'
           SHORT="$(printf '%s' "$SOURCE_SHA" | cut -c1-12)"
           TAG="src-${SHORT}"
           REG="registry.registry.svc.cluster.local:5000"

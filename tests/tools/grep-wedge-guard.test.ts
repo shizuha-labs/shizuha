@@ -6,7 +6,7 @@
  *  (b) nothing in the agent loop could unwedge a tool that ignores
  *      ToolContext.abortSignal.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { classifyExecError, grepTool } from '../../src/tools/builtin/grep.js';
 import { globTool } from '../../src/tools/builtin/glob.js';
 import { runToolGuarded } from '../../src/agent/turn.js';
@@ -89,22 +89,40 @@ describe('runToolGuarded — the agent loop can always recover', () => {
   });
 
   it('progress output resets the silent watchdog', async () => {
-    const handler = fakeHandler({
-      silentTimeoutMs: 80,
-      execute: (_input, ctx2) =>
-        new Promise<ToolResult>((resolve) => {
-          // Emit progress every 40ms, resolve at 250ms — total time exceeds the
-          // 80ms watchdog, but no silent gap does.
-          const iv = setInterval(() => ctx2.onProgress?.('tick'), 40);
-          setTimeout(() => {
-            clearInterval(iv);
-            resolve({ toolUseId: '', content: 'done' });
-          }, 250);
-        }),
-    });
-    const result = await runToolGuarded(handler, tc, baseCtx);
-    expect(result.isError).toBeFalsy();
-    expect(result.content).toBe('done');
+    // SCLI-639: this test used real 40ms/80ms/250ms delays, which let event-loop
+    // jitter under full-suite load (SHIZUHA_CI_MAX_WORKERS=2) delay a progress
+    // tick past the 80ms watchdog and spuriously abandon the tool. Drive the
+    // watchdog with fake timers so the assertion is deterministic under load.
+    vi.useFakeTimers();
+    try {
+      const handler = fakeHandler({
+        silentTimeoutMs: 80,
+        execute: (_input, ctx2) =>
+          new Promise<ToolResult>((resolve) => {
+            // Emit progress every 40ms, resolve at 250ms — total time exceeds the
+            // 80ms watchdog, but no silent gap does.
+            const iv = setInterval(() => ctx2.onProgress?.('tick'), 40);
+            setTimeout(() => {
+              clearInterval(iv);
+              resolve({ toolUseId: '', content: 'done' });
+            }, 250);
+          }),
+      });
+      const pending = runToolGuarded(handler, tc, baseCtx);
+      // Advance in 40ms steps: each progress tick re-arms the watchdog, so it
+      // must never fire before the 250ms resolve. If a tick were dropped, the
+      // 80ms watchdog would fire and the promise would settle wedged.
+      for (let t = 0; t < 250; t += 40) {
+        vi.advanceTimersByTime(40);
+        await Promise.resolve(); // flush microtasks between ticks
+      }
+      vi.advanceTimersByTime(40); // past the resolve; watchdog must stay reset
+      const result = await pending;
+      expect(result.isError).toBeFalsy();
+      expect(result.content).toBe('done');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('passes through a normally-resolving tool untouched', async () => {

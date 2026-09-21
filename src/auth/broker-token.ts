@@ -18,6 +18,7 @@
 
 import * as fs from 'node:fs';
 import * as http from 'node:http';
+import { synchronizeBrokerTokenCache } from './agent-token-cache.js';
 
 /** Default UDS path the broker serves on (matches the sidecar's MCP_AUTH_PROXY_SOCKET default). */
 const DEFAULT_BROKER_SOCKET = '/run/shizuha/mcp-auth-proxy/proxy.sock';
@@ -108,7 +109,9 @@ export function fetchBrokerToken(timeoutMs = 5000): Promise<BrokerToken | null> 
               access?: string;
               expires_at?: string;
             };
-            if (!body.access) {
+            if (typeof body.access !== 'string' || !body.access
+                || (body.expires_at !== undefined && typeof body.expires_at !== 'string')
+                || !synchronizeBrokerTokenCache(body.access, body.expires_at ?? '')) {
               resolve(null);
               return;
             }

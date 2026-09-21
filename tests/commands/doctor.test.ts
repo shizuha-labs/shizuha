@@ -1,9 +1,161 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
-import { runDoctor, printChecks, resolveBuildCheck } from '../../src/commands/doctor.js';
+import { execFileSync } from 'node:child_process';
+import { runDoctor, printChecks, resolveBuildCheck, sanitizeTomlError } from '../../src/commands/doctor.js';
 import type { DoctorCheck } from '../../src/commands/doctor.js';
+
+/** Create a FIFO at `p` via the system `mkfifo` (Node fs has no mkfifo API). */
+function makeFifo(p: string): void {
+  execFileSync('mkfifo', [p], { stdio: 'pipe' });
+}
+
+/**
+ * Build an isolated fixture tree under a fresh temp dir and return the
+ * synthetic cwd plus a cleanup function. All config candidates are placed in
+ * `<cwd>/.shizuha/` so the first candidate fully controls the test surface.
+ */
+async function fixtureCwd(): Promise<{ cwd: string; cleanup: () => Promise<void> }> {
+  const cwd = path.join(os.tmpdir(), 'scli-doctor-boundary-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+  await fsp.mkdir(path.join(cwd, '.shizuha'), { recursive: true });
+  return {
+    cwd,
+    cleanup: () => fsp.rm(cwd, { recursive: true, force: true }),
+  };
+}
+
+// ── Config-file read boundary (SCLI-443) ──
+
+describe('runDoctor config-file boundary (SCLI-443)', () => {
+  it('FIFO at the config path does not hang and yields warn', async () => {
+    const { cwd, cleanup } = await fixtureCwd();
+    try {
+      makeFifo(path.join(cwd, '.shizuha', 'config.toml'));
+      // Must resolve within a deadline — a hang here fails the test via timeout.
+      const check = (await runDoctor(cwd)).find((c) => c.name === 'Config file');
+      expect(check).toBeDefined();
+      expect(check!.status).toBe('warn'); // FIFO skipped → treated as no config
+      expect(check!.message).toContain('No shizuha config.toml found');
+    } finally {
+      await cleanup();
+    }
+  }, 10000);
+
+  it('directory at the config path does not hang and yields warn', async () => {
+    const { cwd, cleanup } = await fixtureCwd();
+    try {
+      await fsp.mkdir(path.join(cwd, '.shizuha', 'config.toml'));
+      const check = (await runDoctor(cwd)).find((c) => c.name === 'Config file');
+      expect(check!.status).toBe('warn');
+    } finally {
+      await cleanup();
+    }
+  }, 10000);
+
+  it('valid regular file yields pass', async () => {
+    const { cwd, cleanup } = await fixtureCwd();
+    try {
+      await fsp.writeFile(path.join(cwd, '.shizuha', 'config.toml'), 'providers = { anthropic = { apiKey = "sk-test" } }\n');
+      const check = (await runDoctor(cwd)).find((c) => c.name === 'Config file');
+      expect(check!.status).toBe('pass');
+    } finally {
+      await cleanup();
+    }
+  }, 10000);
+
+  it('malformed TOML does not leak the raw source line or a secret marker', async () => {
+    const { cwd, cleanup } = await fixtureCwd();
+    try {
+      const marker = 'SCLI178_DOCTOR_SECRET_MARKER';
+      await fsp.writeFile(path.join(cwd, '.shizuha', 'config.toml'), `api_key = "${marker}"\nkey = [unclosed\n`);
+      const check = (await runDoctor(cwd)).find((c) => c.name === 'Config file');
+      expect(check!.status).toBe('fail');
+      expect(check!.message).not.toContain(marker);
+      expect(check!.message).not.toContain('unclosed'); // raw source line must not appear
+      expect(check!.message).toMatch(/invalid TOML \(line \d+, column \d+\)/);
+    } finally {
+      await cleanup();
+    }
+  }, 10000);
+
+  it('NUL-bearing invalid TOML emits no raw NUL byte in the message', async () => {
+    const { cwd, cleanup } = await fixtureCwd();
+    try {
+      const nulContent = 'key = "a\u0000b"\n[ = unclosed\n';
+      await fsp.writeFile(path.join(cwd, '.shizuha', 'config.toml'), nulContent);
+      const check = (await runDoctor(cwd)).find((c) => c.name === 'Config file');
+      expect(check!.status).toBe('fail');
+      expect(check!.message.includes('\u0000')).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  }, 10000);
+
+  it('symlink to a valid regular file yields pass (follows symlinks)', async () => {
+    const { cwd, cleanup } = await fixtureCwd();
+    try {
+      const target = path.join(cwd, 'real-config.toml');
+      await fsp.writeFile(target, 'foo = "bar"\n');
+      await fsp.symlink(target, path.join(cwd, '.shizuha', 'config.toml'));
+      const check = (await runDoctor(cwd)).find((c) => c.name === 'Config file');
+      expect(check!.status).toBe('pass');
+    } finally {
+      await cleanup();
+    }
+  }, 10000);
+
+  it('symlink to a FIFO does not hang and yields warn', async () => {
+    const { cwd, cleanup } = await fixtureCwd();
+    try {
+      const fifo = path.join(cwd, 'fifo-target');
+      makeFifo(fifo);
+      await fsp.symlink(fifo, path.join(cwd, '.shizuha', 'config.toml'));
+      const check = (await runDoctor(cwd)).find((c) => c.name === 'Config file');
+      expect(check!.status).toBe('warn');
+    } finally {
+      await cleanup();
+    }
+  }, 10000);
+
+  it('oversized config file is skipped (bounded read)', async () => {
+    const { cwd, cleanup } = await fixtureCwd();
+    try {
+      await fsp.writeFile(path.join(cwd, '.shizuha', 'config.toml'), 'a'.repeat(5 * 1024 * 1024));
+      const check = (await runDoctor(cwd)).find((c) => c.name === 'Config file');
+      expect(check!.status).toBe('warn');
+      expect(check!.message).toContain('No shizuha config.toml found');
+    } finally {
+      await cleanup();
+    }
+  }, 15000);
+});
+
+describe('sanitizeTomlError', () => {
+  it('uses line/column numbers and never the raw parser message', () => {
+    const msg = sanitizeTomlError('/cfg/config.toml', {
+      line: 3,
+      column: 7,
+      message: 'Invalid TOML document: bad token\n\n  3:  api_key = "SECRET_MARKER"\n      ^',
+    });
+    expect(msg).toContain('/cfg/config.toml');
+    expect(msg).toContain('line 3, column 7');
+    expect(msg).not.toContain('SECRET_MARKER');
+    expect(msg).not.toContain('bad token');
+  });
+
+  it('strips control characters including NUL and ESC', () => {
+    const msg = sanitizeTomlError('/x', { line: 1, column: 2, message: 'a\u0000b\u001b[31mc' });
+    expect(msg.includes('\u0000')).toBe(false);
+    expect(msg.includes('\u001b')).toBe(false);
+  });
+
+  it('falls back to unknown coordinates when fields are absent', () => {
+    const msg = sanitizeTomlError('/x', { message: 'boom' });
+    expect(msg).toMatch(/line unknown, column unknown/);
+  });
+});
 
 // ── Tests ──
 
@@ -279,6 +431,117 @@ describe('runDoctor', () => {
       if (origCortex !== undefined) process.env['CORTEX_BASE_URL'] = origCortex;
       else delete process.env['CORTEX_BASE_URL'];
     }
+  });
+});
+
+describe('SCLI-549: doctor is read-only', () => {
+  const originalHome = process.env['HOME'];
+  const originalDisableMcpJson = process.env['SHIZUHA_DISABLE_MCP_JSON'];
+  const originalAgentUsername = process.env['AGENT_USERNAME'];
+  const originalCortexBaseUrl = process.env['CORTEX_BASE_URL'];
+  const originalCortexApiKey = process.env['CORTEX_API_KEY'];
+  let root: string;
+  let home: string;
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'scli549-doctor-'));
+    home = path.join(root, 'home');
+    fs.mkdirSync(home);
+    process.env['HOME'] = home;
+    delete process.env['SHIZUHA_DISABLE_MCP_JSON'];
+    process.env['AGENT_USERNAME'] = 'scli549-doctor';
+    delete process.env['CORTEX_BASE_URL'];
+    delete process.env['CORTEX_API_KEY'];
+    fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ data: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+  });
+
+  afterEach(() => {
+    if (originalHome === undefined) delete process.env['HOME'];
+    else process.env['HOME'] = originalHome;
+    if (originalDisableMcpJson === undefined) delete process.env['SHIZUHA_DISABLE_MCP_JSON'];
+    else process.env['SHIZUHA_DISABLE_MCP_JSON'] = originalDisableMcpJson;
+    if (originalAgentUsername === undefined) delete process.env['AGENT_USERNAME'];
+    else process.env['AGENT_USERNAME'] = originalAgentUsername;
+    if (originalCortexBaseUrl === undefined) delete process.env['CORTEX_BASE_URL'];
+    else process.env['CORTEX_BASE_URL'] = originalCortexBaseUrl;
+    if (originalCortexApiKey === undefined) delete process.env['CORTEX_API_KEY'];
+    else process.env['CORTEX_API_KEY'] = originalCortexApiKey;
+    fetchSpy.mockRestore();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('leaves a fresh HOME byte-for-byte empty and does not mint auth state', async () => {
+    fs.writeFileSync(path.join(root, '.mcp.json'), JSON.stringify({
+      mcpServers: {
+        'shizuha-pulse': {
+          command: 'node',
+          args: ['pulse-mcp.js'],
+        },
+      },
+    }));
+    const before = fs.readdirSync(home);
+
+    const checks = await runDoctor(root);
+
+    expect(checks.find((check) => check.name === 'SQLite state store')?.status).toBe('pass');
+    expect(checks.find((check) => check.name === 'Permissions')?.status).toBe('pass');
+    expect(fs.readdirSync(home)).toEqual(before);
+    expect(fs.existsSync(path.join(home, '.config', 'shizuha', 'state.db'))).toBe(false);
+    expect(fs.existsSync(path.join(home, '.shizuha', 'auth'))).toBe(false);
+  });
+
+  it('probes an existing database read-only and leaves its bytes unchanged', async () => {
+    const stateDir = path.join(home, '.config', 'shizuha');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const statePath = path.join(stateDir, 'state.db');
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(statePath);
+    db.exec('CREATE TABLE state_check(value INTEGER); INSERT INTO state_check VALUES (1)');
+    db.close();
+    const before = fs.readFileSync(statePath);
+
+    const checks = await runDoctor(root);
+
+    expect(checks.find((check) => check.name === 'SQLite state store')?.status).toBe('pass');
+    expect(fs.readFileSync(statePath).equals(before)).toBe(true);
+  });
+
+  it('rejects a dangling symlink without creating its outside target', async () => {
+    const stateDir = path.join(home, '.config', 'shizuha');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const outsideTarget = path.join(root, 'outside-dangling.db');
+    fs.symlinkSync(outsideTarget, path.join(stateDir, 'state.db'));
+
+    const checks = await runDoctor(root);
+
+    expect(checks.find((check) => check.name === 'SQLite state store')).toMatchObject({
+      status: 'fail',
+      message: expect.stringContaining('not a regular file'),
+    });
+    expect(fs.existsSync(outsideTarget)).toBe(false);
+  });
+
+  it('rejects an outside-file symlink without mutating its target', async () => {
+    const stateDir = path.join(home, '.config', 'shizuha');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const outsideTarget = path.join(root, 'outside.db');
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(outsideTarget);
+    db.exec('CREATE TABLE outside_check(value INTEGER); INSERT INTO outside_check VALUES (7)');
+    db.close();
+    const before = fs.readFileSync(outsideTarget);
+    fs.symlinkSync(outsideTarget, path.join(stateDir, 'state.db'));
+
+    const checks = await runDoctor(root);
+
+    expect(checks.find((check) => check.name === 'SQLite state store')?.status).toBe('fail');
+    expect(fs.readFileSync(outsideTarget).equals(before)).toBe(true);
   });
 });
 

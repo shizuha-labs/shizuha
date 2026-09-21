@@ -7,7 +7,9 @@ untrusted tokens into shell source.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 import sys
 
 
@@ -68,6 +70,13 @@ jq -e \\
   /opt/shizuha/harness-versions.json
 test "$(cat /opt/skills/.source-revision)" = "$SKILLS_SHA"
 """
+    # Run the real candidate gateway through its baked env-only entrypoint.
+    # Both native children must pass this before the promotable index exists.
+    root = Path(__file__).resolve().parent.parent
+    startup_source = (root / 'scripts/verify-agent-runtime-startup.py').read_text()
+    entrypoint_sha = hashlib.sha256((root / 'agent-runtime-entrypoint.sh').read_bytes()).hexdigest()
+    script += (f"python3 - --entrypoint-sha256 {entrypoint_sha} <<'SHIZUHA_STARTUP_SMOKE_PY'\n"
+               + startup_source + "\nSHIZUHA_STARTUP_SMOKE_PY\n")
     job = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -82,6 +91,12 @@ test "$(cat /opt/skills/.source-revision)" = "$SKILLS_SHA"
             "template": {
                 "spec": {
                     "restartPolicy": "Never",
+                    "automountServiceAccountToken": False,
+                    # A fresh home prevents baked user auth/config/state from
+                    # changing the no-credential startup fixture. UID 1000 is
+                    # the image's agent user; fsGroup makes this emptyDir writable.
+                    "securityContext": {"fsGroup": 1000},
+                    "volumes": [{"name": "smoke-home", "emptyDir": {}}],
                     "nodeSelector": {"kubernetes.io/arch": arch},
                     "tolerations": [
                         {
@@ -123,6 +138,7 @@ test "$(cat /opt/skills/.source-revision)" = "$SKILLS_SHA"
                             # once before smoke and is never trusted again.
                             "image": f"localhost:30500/{img}@{digest}",
                             "imagePullPolicy": "Always",
+                            "volumeMounts": [{"name": "smoke-home", "mountPath": "/home/agent"}],
                             "env": [
                                 {"name": "CC_VER", "value": cc},
                                 {"name": "CODEX_VER", "value": codex},

@@ -19,10 +19,25 @@ describe('PLAT-587 agent-health exporter: enabled derives from enabled-agents.js
     const running = new Set(['id-a']);
     const health = buildAgentHealth(agents, enabled, running);
     expect(health).toEqual([
-      { username: 'alice', enabled: true, running: true, capacityUnavailable: false },
-      { username: 'bob', enabled: false, running: false, capacityUnavailable: false },
-      { username: 'carol', enabled: true, running: false, capacityUnavailable: false },
+      { username: 'alice', enabled: true, running: true, capacityUnavailable: false, lifecycleState: 'enabled' },
+      { username: 'bob', enabled: false, running: false, capacityUnavailable: false, lifecycleState: 'operator_stopped' },
+      { username: 'carol', enabled: true, running: false, capacityUnavailable: false, lifecycleState: 'enabled' },
     ]);
+  });
+
+  it('preserves Hive hibernation as wakeable lifecycle intent while process is stopped', () => {
+    const health = buildAgentHealth(
+      agents,
+      new Set(),
+      new Set(),
+      new Set(),
+      new Map([['id-b', 'hibernated']]),
+    );
+    expect(health.find((a) => a.username === 'bob')).toMatchObject({
+      enabled: false,
+      running: false,
+      lifecycleState: 'hibernated',
+    });
   });
 
   it('reflects a toggle immediately when the fresh set changes (no stale cache)', () => {
@@ -51,10 +66,10 @@ describe('PLAT-3367 agent-health exporter startup is idempotent', () => {
 
   it('reuses an existing server instead of binding the same port twice', async () => {
     const first = startAgentHealthServer(() => [
-      { username: 'first', enabled: true, running: true, capacityUnavailable: false },
+      { username: 'first', enabled: true, running: true, capacityUnavailable: false, lifecycleState: 'enabled' },
     ], 0);
     const second = startAgentHealthServer(() => [
-      { username: 'second', enabled: true, running: true, capacityUnavailable: false },
+      { username: 'second', enabled: true, running: true, capacityUnavailable: false, lifecycleState: 'enabled' },
     ], 0);
 
     expect(second).toBe(first);

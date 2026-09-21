@@ -109,6 +109,9 @@ describe('SCLI-345 AgentProcess recovery', () => {
     agent.inbox = { busy: false, queued: () => [], next: async () => null };
     agent.channels = new Map([['ch-1', mockChannel('ch-1')]]);
     agent.running = true;
+    // Heartbeat prefetch would otherwise try live Pulse MCP (~25s) and skip
+    // the mock provider. This test is about recovered prompt size, not prefetch.
+    agent.injectHeartbeatTaskSnapshot = vi.fn(async () => null);
     return agent;
   }
 

@@ -560,6 +560,89 @@ describe('CodexBridge heartbeat boundary arbitration', () => {
     }
   });
 
+  it('SCLI-462: production Connect callback interrupts active heartbeat and starts the single queued DM next', async () => {
+    // Production order from HIVE-1695 / SCLI-462 must go through the real
+    // Connect inbound boundary (handleConnectInboundMessage), not a manual
+    // reconstruction of enqueue/classify/interrupt.
+    const { bridge, cwd } = schedulerFixture();
+    try {
+      const zenContent =
+        '[zen] Please call pulse_get_my_alerts, then pulse_get_my_tasks, and reply with this exact nonce plus whether both calls completed: ZEN-RUI-HIVE1695-20260801T1708Z';
+      const convId = 'ce120ec4-859e-449a-acfe-6d5f8f4947f6';
+
+      bridge.activeThreadId = 'autonomous-heartbeat';
+      bridge.activeThreadStartedAt = Date.now();
+      bridge.activeTurnIsHeartbeat = true;
+      bridge.activeTurnResolve = vi.fn();
+      bridge.codexThreadId = 'codex-heartbeat-thread';
+      bridge.rpcNotify = vi.fn();
+      const realProcessQueue = CodexBridge.prototype.processQueue.bind(bridge);
+      bridge.startExecution = vi.fn(async () => undefined);
+      bridge.fireHeartbeat = vi.fn(async () => undefined);
+      bridge.processQueue = vi.fn(async (...args: unknown[]) => {
+        // While the autonomous heartbeat latch is still held, the production
+        // callback only enqueues + interrupts; drain happens after settle.
+        if (bridge.activeThreadId) return undefined;
+        return realProcessQueue(...args);
+      });
+
+      // Drive the exact production ConnectClient.onMessage boundary.
+      bridge.handleConnectInboundMessage(
+        convId,
+        zenContent,
+        'zen',
+        undefined,
+        'direct',
+        'required',
+      );
+
+      expect(bridge.messageQueue).toHaveLength(1);
+      expect(bridge.messageQueue[0]).toMatchObject({
+        clientId: `connect:${convId}`,
+        content: zenContent,
+        conversationType: 'direct',
+        replyObligation: 'required',
+      });
+      expect(bridge.rpcNotify).toHaveBeenCalledWith('turn/interrupt', {
+        threadId: 'codex-heartbeat-thread',
+      });
+      expect(bridge.processQueue).toHaveBeenCalled();
+      expect(bridge.startExecution).not.toHaveBeenCalled();
+
+      // Interrupt settles: latch clears, single queued DM starts next (no drop/dup).
+      bridge.activeThreadId = null;
+      bridge.activeTurnIsHeartbeat = false;
+      bridge.activeTurnResolve = null;
+      await realProcessQueue();
+
+      expect(bridge.startExecution).toHaveBeenCalledOnce();
+      expect(bridge.startExecution).toHaveBeenCalledWith(
+        `connect:${convId}`,
+        zenContent,
+        'direct',
+        'required',
+      );
+      expect(bridge.messageQueue).toEqual([]);
+      expect(bridge.fireHeartbeat).not.toHaveBeenCalled();
+
+      // Negative control: if the production boundary stopped classifying, a
+      // routine DM must not interrupt.
+      bridge.rpcNotify.mockClear();
+      bridge.activeThreadId = 'autonomous-heartbeat';
+      bridge.activeTurnResolve = vi.fn();
+      bridge.codexThreadId = 'codex-heartbeat-thread';
+      bridge.handleConnectInboundMessage(
+        'other-conv',
+        '[sora] regular inter-agent update',
+        'sora',
+      );
+      expect(bridge.rpcNotify).not.toHaveBeenCalled();
+    } finally {
+      bridge.store.close();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('coalesces routine Connect wakes into an already-active heartbeat', () => {
     const { bridge, cwd } = schedulerFixture();
     try {
@@ -1122,12 +1205,14 @@ describe('CodexBridge turn performance telemetry', () => {
       bridge.fireHeartbeat = vi.fn();
 
       bridge.handleServerNotification({ jsonrpc: '2.0', method: 'turn/completed', params: {} });
+      expect(bridge.codexThreadId).toBeNull();
       vi.advanceTimersByTime(1_000);
       expect(bridge.codexThreadId).toBeNull();
       expect(bridge.fireHeartbeat).toHaveBeenLastCalledWith(true);
 
       // If the single clean-thread rescue is also empty, leave the next attempt
       // to the ordinary cadence instead of burning a third full-context turn.
+      // Admission must fail visible and stay bounded: no third scheduler turn.
       bridge.fireHeartbeat.mockClear();
       bridge.activeThreadId = 'retry-execution';
       bridge.activeThreadStartedAt = Date.now();

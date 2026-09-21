@@ -57,12 +57,22 @@ shizuha --model openai:llama3.2
 
 Use `openai:MODEL` so the request goes to **your** endpoint. A bare name like `Qwen3.6-27B` also uses that endpoint when you have no Cortex login.
 
+**Optional hosted try-out (Shizuha Cortex → OpenCode Zen free models):**
+
+```bash
+shizuha login
+# or: shizuha auth cortex sk-cortex-...
+shizuha --model cortex/big-pickle
+```
+
+Same seven free models OpenCode lists at $0 (2026-08-16): `big-pickle`, `deepseek-v4-flash-free`, `mimo-v2.5-free`, `hy3-free`, `laguna-s-2.1-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`. You do **not** paste an OpenCode key — Cortex relays. Weekly usage is 80,000 weighted tokens, Monday 00:00 IST. Check remaining with `shizuha usage` or `/usage`. Your own URL still wins and is never billed.
+
 ## What you can skip
 
 | Skip | Unless you want |
 |------|-----------------|
-| `shizuha login` | Hosted Cortex models / a future Shizuha Code plan |
-| `shizuha up` | The browser dashboard. TUI/`exec` work without it |
+| `shizuha login` | Hosted Cortex / OpenCode Zen free models |
+| `shizuha up` / `shizuha desktop` | The browser / Desktop GUI + Live voice. TUI/`exec` work without it |
 | ChatGPT / Claude accounts | You already have a local or OpenAI-compatible URL |
 
 ## Troubleshooting

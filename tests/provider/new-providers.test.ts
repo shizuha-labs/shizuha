@@ -3,7 +3,7 @@ import { ProviderRegistry } from '../../src/provider/registry.js';
 import { XaiProvider } from '../../src/provider/xai.js';
 import { GroqProvider } from '../../src/provider/groq.js';
 import { TogetherProvider } from '../../src/provider/together.js';
-import { getModelProfile, resolveReasoningEffortForRequest, shouldEnableThinkingForRequest } from '../../src/provider/model-profile.js';
+import { getModelProfile, resolveReasoningEffortForRequest, shouldEnableThinkingForRequest, resolveMinimalSystemPrompt, GLM_LEAN_INTERACTIVE_PROMPT } from '../../src/provider/model-profile.js';
 import { configSchema } from '../../src/config/schema.js';
 import type { ShizuhaConfig } from '../../src/config/types.js';
 
@@ -129,6 +129,28 @@ describe('GLM-5 family model profiles', () => {
     expect(glm51.defaultThinkingOn).toBe(true);
   });
 
+  it('matches GLM-5.3-Flash before GLM-5 with 500k ctx and 32k output', () => {
+    const flash = getModelProfile('vllm/GLM-5.3-Flash');
+    expect(flash.displayName).toBe('GLM-5.3-Flash');
+    expect(flash.nativeContextWindow).toBe(500000);
+    expect(flash.recommendedMaxOutputTokens).toBe(32768);
+    expect(flash.useFullSystemPrompt).toBe(false);
+    expect(flash.defaultThinkingOn).toBe(true);
+    expect(flash.defaultReasoningEffort).toBe('high');
+    expect(flash.minimalSystemPrompt).toBeTruthy();
+    expect(flash.minimalSystemPrompt).toContain('On [HEARTBEAT]:');
+    expect(resolveMinimalSystemPrompt(flash)).toBe(GLM_LEAN_INTERACTIVE_PROMPT);
+    expect(resolveMinimalSystemPrompt(flash)).not.toContain('On [HEARTBEAT]:');
+    expect(resolveMinimalSystemPrompt(flash)).toContain('There is no [HEARTBEAT]');
+    expect(resolveMinimalSystemPrompt(flash, { role: 'coordinator' })).toContain('On [HEARTBEAT]:');
+
+    const cortex = getModelProfile('cortex/GLM-5.3-Flash');
+    expect(cortex.displayName).toBe('GLM-5.3-Flash');
+    expect(cortex.recommendedMaxOutputTokens).toBe(32768);
+    expect(flash.supportsVision).toBe(true);
+    expect(cortex.supportsVision).toBe(true);
+  });
+
   it('matches GLM-5.2 before GLM-5 with lean prompt + thinking default', () => {
     const qt = getModelProfile('vllm/GLM-5.2-QuantTrio-256K');
     expect(qt.displayName).toBe('GLM-5.2');
@@ -165,6 +187,20 @@ describe('GLM-5 family model profiles', () => {
     expect(modelRequiresThinkingForTools('cortex/Qwen3.6-27B')).toBe(false);
     expect(resolveThinkingLevelForModel('cortex/Qwen3.6-27B', 'off')).toBe('off');
     expect(shouldEnableThinkingForRequest('cortex/Qwen3.6-27B', 'off')).toBe(false);
+  });
+});
+
+describe('GLM-5.3-Flash model profile', () => {
+  it('does not inherit the TUI scaffold temperature of 0', () => {
+    const prof = getModelProfile('cortex/GLM-5.3-Flash');
+    expect(prof.displayName).toBe('GLM-5.3-Flash');
+    expect(prof.nativeContextWindow).toBe(500000);
+    // Live shizuha2 e81682dd sent temperature:0 on every agentic dump and
+    // produced g/g/g path stutter. Model card / vLLM recipe is 1.0 / 0.95.
+    expect(prof.defaultTemperature).toBe(1.0);
+    expect(prof.defaultTopP).toBe(0.95);
+    expect(prof.defaultReasoningEffort).toBe('high');
+    expect(prof.reasoningPassback).toBe('always');
   });
 });
 
@@ -256,6 +292,17 @@ describe('Qwen3.8 model profile', () => {
       expect(prof.displayName, id).toBe('Qwen3.8-27B-Q4');
       expect(prof.nativeContextWindow, id).toBe(122880);
       expect(prof.defaultTemperature, id).toBe(0.6);
+      expect(prof.defaultReasoningEffort, id).toBe('xhigh');
+    }
+  });
+
+  it('pins the i9-ws Q2 256K slot and does not inherit the Q4 122880 window', () => {
+    for (const id of ['Qwen3.8-27B-Q2', 'cortex/Qwen3.8-27B-Q2', 'vllm/Qwen3.8-27B-Q2']) {
+      const prof = getModelProfile(id);
+      expect(prof.displayName, id).toBe('Qwen3.8-27B-Q2');
+      expect(prof.nativeContextWindow, id).toBe(262144);
+      expect(prof.defaultTemperature, id).toBe(0.6);
+      expect(prof.defaultTopP, id).toBe(0.95);
       expect(prof.defaultReasoningEffort, id).toBe('xhigh');
     }
   });

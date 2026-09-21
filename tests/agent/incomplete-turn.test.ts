@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT,
   incompleteTurnError,
   MAX_THINKING_ONLY_RECOVERY,
   shouldContinueAutonomousMaxTokens,
@@ -64,8 +63,7 @@ describe('shouldContinueAutonomousMaxTokens', () => {
     })).toBe(true);
   });
 
-  it('keeps the exec continue prompt stable for bench cells', () => {
-    expect(AUTONOMOUS_MAX_TOKENS_CONTINUE_PROMPT).toContain('Use your tools');
+  it('does not lecture the model to Continue', () => {
     expect(incompleteTurnError('max_tokens')).toMatch(/output-token limit/);
   });
 });

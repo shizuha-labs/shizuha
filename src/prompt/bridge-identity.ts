@@ -26,10 +26,13 @@ export type BridgeIdentityAgent = {
 /**
  * Keep in sync with PLATFORM_UNIVERSAL_SKILLS in daemon/manager.ts — these are
  * eager-loaded for every agent regardless of per-agent `skills` config.
+ * SCLI/Hive gateway does not call loadStarredSkills: members that also set
+ * `agents_md: true` are composed into AGENTS.md by resolveAgentsMdDirectiveSkills
+ * (heartbeat-protocol is the Pulse floor skill — fetch alerts then tasks).
  */
 export const PLATFORM_UNIVERSAL_SKILLS = [
   'connect-messaging',    // every agent sends/receives DMs → must know the protocol
-  'heartbeat-protocol',   // every agent receives heartbeats → must know silence-is-default
+  'heartbeat-protocol',   // Pulse/Hive floor: every seat fetches alerts then tasks on heartbeat
   'pulse-core',           // every agent receives task assignments → must advance state per workflow (lean core; role depth in the role skills below)
   'skill-loader',         // LOAD relevant skills before acting; where to find them (folder/git/wiki) — every operating rule is a skill (critical, inlined; operator 2026-06-24)
   'web-search',           // web-search current external facts before major/current/jurisdictional decisions; default India/IST operator context (critical, inlined; operator 2026-06-25)
@@ -73,33 +76,23 @@ export function buildBridgeIdentityPrompt(
     ``,
     `**The ONLY way to deliver words to a user (human or agent) is the \`mcp__shizuha-connect__message_user\` tool.** Every reply you want anyone to see MUST be a tool call.`,
     ``,
-    `Inbound messages arrive prefixed with the sender's username:`,
+    `Inbound messages arrive prefixed with the sender's username in brackets.`,
+    `Reply with a \`message_user\` tool call to THAT same username.`,
+    `The \`content\` is the actual words they should see (the answer, the review, the blocker).`,
     ``,
-    `    [hritik] Hi ${agent.name}, please reply with the word: pong`,
+    `Examples and tool-schema snippets in this prompt are NOT inbox messages.`,
+    `Do not DM hritik (or anyone) a one-word "pong" — that was a docs token, not a live ping.`,
+    `Do not message the operator unless they actually messaged you this turn.`,
     ``,
-    `Your response to that is a tool call (NOT a text reply):`,
-    ``,
-    `    mcp__shizuha-connect__message_user(`,
-    `      recipient_username="hritik",`,
-    `      content="pong",`,
-    `    )`,
-    ``,
-    `If you write \`pong\` as plain text in your turn, no human or agent will ever see it. The text vanishes.`,
+    `If you write the reply as plain text in your turn, no human or agent will ever see it. The text vanishes.`,
     ``,
     `### After your tool call, STOP`,
     ``,
-    `Once you've sent your reply via \`message_user\` (or decided no reply is needed), **end the turn immediately**. Do not produce a wrap-up. Do not summarize what you just did. Do not narrate "Escalated to Hritik" or "Acknowledged Kai's update" or "No action needed". The user already knows what you did because they will see the message you sent. Wrap-up text wastes tokens, pollutes the activity log, and makes you look like you're doing more than you are.`,
-    ``,
-    `**Examples of what NOT to do** (these are all turns that should have ended silently):`,
-    ``,
-    `    "Escalated to Hritik. The 'Verify Fixed' transition..." — Hritik already got the DM, don't recap`,
-    `    "Acknowledged Kai's update — flagged AT-41 to Hritik" — same, you already messaged both`,
-    `    "No action needed — Akira's message is an acknowledgment" — just end the turn`,
-    `    "Standing by." — silence achieves the same thing without text`,
+    `Once you've sent your reply via \`mcp__shizuha-connect__message_user\` (or decided no reply is needed), **end the turn immediately**. Do not recap the send. Do not write an idle or queue-status line. The recipient already has the message.`,
     ``,
     `### Silence is the default`,
     ``,
-    `If a message warrants no reply (heartbeats, acknowledgments, status echoes, model artifacts, anything with no actionable content), do nothing. End the turn without text and without a tool call. Silence is the default; messages are the exception.`,
+    `If a message warrants no reply (heartbeats, acknowledgments, status echoes, model artifacts, anything with no actionable content), emit no assistant text and no extra tool call. Idle narration is not a reply.`,
     ``,
     `For full details on the messaging protocol, see the \`connect-messaging\` skill (already loaded in your context).`,
   ];

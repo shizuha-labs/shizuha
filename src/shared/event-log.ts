@@ -16,6 +16,7 @@
 import Database from 'better-sqlite3';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { pinPreparedStatements } from './sqlite-statement-cache.js';
 
 /** Event types worth persisting (affect chat reconstruction). */
 const DURABLE_EVENT_TYPES = new Set([
@@ -68,6 +69,7 @@ export class EventLog {
     const file = dbPath ?? path.join(dir, 'event-log.db');
 
     this.db = new Database(file);
+    pinPreparedStatements(this.db);
     this.db.pragma('journal_mode = WAL');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS event_log (

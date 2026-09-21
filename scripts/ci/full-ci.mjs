@@ -9,7 +9,7 @@
 //
 // Escape hatch: the `skip-full-ci` PR label (see .github/workflows/ci.yml)
 // skips the suite for genuine hotfixes only — typecheck still runs.
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -28,6 +28,21 @@ const env = {
   NO_COLOR: '1',
   FORCE_COLOR: '0',
 };
+
+const tmuxPrefix = '/workspace/opt/tmux';
+if (existsSync(path.join(tmuxPrefix, 'bin', 'tmux'))) {
+  env.PATH = `${path.join(tmuxPrefix, 'bin')}:${env.PATH ?? ''}`;
+  const libDir = path.join(tmuxPrefix, 'lib');
+  env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH ? `${libDir}:${env.LD_LIBRARY_PATH}` : libDir;
+}
+try {
+  execSync('tmux -V', { env, stdio: 'ignore' });
+} catch {
+  if (process.env.CI === 'true') {
+    console.error('FATAL: tmux is required for TUI e2e in CI. Install it in the test Job; do not env-gate the suites.');
+    process.exit(1);
+  }
+}
 
 // ── Quarantine list (explicit, loud — never silent) ─────────────────────────
 const quarantinePath = path.join(projectRoot, 'tests', 'quarantine.list');

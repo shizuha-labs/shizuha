@@ -72,7 +72,17 @@ const create = (_stream: NodeJS.WriteStream, { showCursor = false } = {}) => {
       prevScreenStart = 0;
       prevRealRows = realRows;
       prevRealCols = realCols;
-      // Fall through to first-render path with clear prefix
+      // Fall through to first-render path with clear prefix.
+      //
+      // Source-backed scrollback reflow (SCLI-480, adopting codex
+      // resize_reflow.rs): the first-render path below re-emits the FULL
+      // output from the top with natural newlines, so the terminal re-wraps
+      // every finalized line at the new width. To avoid stale-width wrapped
+      // lines surviving in scrollback, we also clear the terminal's scrollback
+      // buffer (CSI 3 J) alongside the screen clear. The re-emitted lines then
+      // populate scrollback re-wrapped at the current width, keeping
+      // copy/paste faithful. Terminals that ignore CSI 3 J are unaffected
+      // (no-op) — the screen reflow still happens.
     }
     prevRealRows = realRows;
     prevRealCols = realCols;
@@ -81,8 +91,10 @@ const create = (_stream: NodeJS.WriteStream, { showCursor = false } = {}) => {
 
     // Prepend screen clear into the same write buffer so clear + content
     // are atomic — no gap for ghost frames between separate writes.
+    // CSI 2 J = clear screen, CSI 3 J = clear scrollback (SCLI-480 reflow),
+    // CSI H = cursor home.
     if (resizeCleared) {
-      buf.push('\x1b[2J\x1b[H');
+      buf.push('\x1b[2J\x1b[3J\x1b[H');
     }
 
     if (prevRenderedCount === 0) {

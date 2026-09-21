@@ -76,7 +76,7 @@ export const BUILTIN_TOOLSETS: Record<string, Toolset> = {
       'memory', 'skill',
       'message_user', 'list_agents',
       'search_skills', 'use_skill',
-      'mcp__shizuha-pulse__pulse_get_my_alerts', 'mcp__shizuha-pulse__pulse_get_my_tasks', 'mcp__shizuha-pulse__pulse_complete_task',
+      'mcp__shizuha-pulse__pulse_get_my_work', 'mcp__shizuha-pulse__pulse_get_my_alerts', 'mcp__shizuha-pulse__pulse_get_my_tasks', 'mcp__shizuha-pulse__pulse_complete_task',
       'mcp__shizuha-pulse__pulse_update_task',
     ],
   },
@@ -99,8 +99,8 @@ export const BUILTIN_TOOLSETS: Record<string, Toolset> = {
   },
   'qa_engineer': {
     name: 'qa_engineer',
-    description: 'User-perspective testing — read tools + browser, no code writes. pulse/wiki/drive MCP only',
-    include: [...READ_TOOLS, ...TASK_TOOLS, 'browser', ...MCP_COMMON],
+    description: 'User-perspective testing — read tools + browser + least-privilege local write/execute (write/edit/bash) for regression artifacts and fixtures. pulse/wiki/drive MCP only',
+    include: [...READ_TOOLS, ...TASK_TOOLS, ...WRITE_TOOLS, 'browser', ...MCP_COMMON],
   },
   'security_engineer': {
     name: 'security_engineer',

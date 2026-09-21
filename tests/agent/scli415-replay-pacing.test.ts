@@ -65,7 +65,9 @@ describe('SCLI-415 replay pacing derives from the live guard config', () => {
   });
 
   it('spacing tracks the env overrides rather than DEFAULT_CONFIG', () => {
-    const fromDefaults = new ExpensiveTurnGuard(expensiveTurnGuardConfigFromEnv({}));
+    // Guard is opt-in since 2026-09-15 (operator directive): pacing derivation
+    // is only meaningful on an ENABLED guard, so enable both variants here.
+    const fromDefaults = new ExpensiveTurnGuard({ ...expensiveTurnGuardConfigFromEnv({}), enabled: true });
     const fromEnv = new ExpensiveTurnGuard(expensiveTurnGuardConfigFromEnv({
       SHIZUHA_EXPENSIVE_TURN_MIN_TURNS: '8',
       SHIZUHA_EXPENSIVE_TURN_WINDOW_MS: '120000',

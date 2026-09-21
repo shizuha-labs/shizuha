@@ -36,6 +36,11 @@ type Config struct {
 	// CoordinatorBearerToken must carry aud=hive-coordinator + scope=coordinator:model-token.
 	CoordinatorURL         string
 	CoordinatorBearerToken string
+	// PLAT-5275: nonce-bound, signed MCP projection producer. This endpoint is
+	// separate from model-token because it has a different response contract,
+	// timeout, and no provider-token material.
+	ProjectionURL string
+	AgentID       string
 	// PLAT-1173: legacy SA-token bootstrap self-recovery. Enabled by default so
 	// a one-shot /bootstrap TokenReview/mint failure does not leave the sidecar
 	// permanently unbootstrapped.
@@ -68,6 +73,8 @@ func LoadConfig() (Config, error) {
 		IDRefreshURL:           idAuthURL("MCP_AUTH_PROXY_ID_REFRESH_URL", "/id/api/auth/refresh/"),
 		CoordinatorURL:         os.Getenv("MCP_AUTH_PROXY_COORDINATOR_URL"),
 		CoordinatorBearerToken: os.Getenv("MCP_AUTH_PROXY_COORDINATOR_TOKEN"),
+		ProjectionURL:           os.Getenv("MCP_AUTH_PROXY_PROJECTION_URL"),
+		AgentID:                 os.Getenv("AGENT_ID"),
 		BootstrapRetryEnabled:  getenvBoolDefault("MCP_AUTH_PROXY_BOOTSTRAP_RETRY", true),
 		BootstrapRetryBase:     time.Duration(getenvInt("MCP_AUTH_PROXY_BOOTSTRAP_RETRY_BASE_MS", 2000)) * time.Millisecond,
 		BootstrapRetryMax:      time.Duration(getenvInt("MCP_AUTH_PROXY_BOOTSTRAP_RETRY_MAX_MS", 120000)) * time.Millisecond,

@@ -15,20 +15,13 @@ describe("agent runtime multi-architecture gates", () => {
   cancel-in-progress: true`);
   });
 
-  it("reads live coalescer policy through a deterministic Ready Pod", () => {
-    expect(workflow).toContain(`-l app=run-coalescer -o json`);
-    expect(workflow).toContain(`select(.status.phase == "Running")`);
-    expect(workflow).toContain(
-      `select(any(.status.containerStatuses[]?; .ready == true))`,
-    );
-    expect(workflow).toContain(`sort_by(.metadata.name)`);
-    expect(workflow).toContain(
-      `kubectl exec -n origin "$live_coalescer_pod"`,
-    );
-    expect(workflow).not.toContain(
-      `kubectl exec -n origin deployment/run-coalescer`,
-    );
-    expect(workflow).not.toContain(`cat /app/server.py' 2>/dev/null || true`);
+  it("verifies exact native authority before legacy builder cleanup", () => {
+    const verification = workflow.indexOf("python3 scripts/verify-runtime-release-concurrency.py");
+    expect(verification).toBeGreaterThan(-1);
+    expect(verification).toBeLessThan(workflow.indexOf('legacy_orphans="$('));
+    expect(workflow).toContain('--run-id "$ORIGIN_RUN_ID" --source-sha "$SOURCE_SHA"');
+    expect(workflow).toContain('--source-ref "refs/heads/${SOURCE_BRANCH}"');
+    expect(workflow).not.toContain("live_coalescer");
   });
 
   it("uses the shared guard as the sole terminal build observer", () => {
@@ -61,16 +54,27 @@ describe("agent runtime multi-architecture gates", () => {
   });
 
   it("tolerates cold image pulls and a lagging Job Complete condition", () => {
+    // PLS-207/PLAT-1219 (PLAT-6970): `kubectl wait --for=condition=complete`
+    // NEVER returns on a FAILED job — when the job fails and is reaped
+    // (ttlSecondsAfterFinished), `kubectl get job` returns NotFound and the
+    // wait hangs for the full timeout. wait_smoke_job polls Complete OR Failed
+    // conditions instead, keeping the single-Pod success/failure fast path.
     expect(workflow).toContain(
-      `--for=condition=complete "job/\${SMOKE_JOB}" --timeout=1800s &`,
+      `-o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true`,
+    );
+    expect(workflow).toContain(
+      `-o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true`,
     );
     expect(workflow).toContain(
       `-o jsonpath='{.items[0].status.phase}' 2>/dev/null || true`,
     );
     expect(workflow).toContain(`Succeeded)
-                  kill "$WAIT_PID"`);
+                  return 0`);
     expect(workflow).toContain(`Failed)
-                  kill "$WAIT_PID"`);
+                  echo "::error::\${ARCH} runtime image smoke failed"`);
+    expect(workflow).not.toContain(
+      `--for=condition=complete "job/\${SMOKE_JOB}" --timeout=1800s &`,
+    );
     expect(workflow).not.toContain(
       `--for=condition=complete "job/\${SMOKE_JOB}" --timeout=600s`,
     );
@@ -88,7 +92,7 @@ describe("agent runtime multi-architecture gates", () => {
 
   it("does not auto-promote a writer-less tree onto the rt-fleet controller", () => {
     expect(workflow).toContain("skipping DesiredRuntimeRelease promote: k8s actuator is not in this tree");
-    expect(workflow).toContain("if [ ! -f src/plugins/fleet/k8s-backend.ts ]; then");
+    expect(workflow).toContain("k8s fleet backend is not included");
     const promote = workflow.indexOf("name: Auto-promote DesiredRuntimeRelease");
     const skip = workflow.indexOf("skipping DesiredRuntimeRelease promote");
     const append = workflow.indexOf("append-desired-runtime-release.py");

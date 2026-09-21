@@ -125,6 +125,21 @@ export class BackgroundTaskRegistry {
     }
   }
 
+  /**
+   * SCLI-432: feed one line-buffered stdout line to a `monitor` task.
+   *
+   * Mirrors Grok Build's `monitor` tool: each line becomes a progress
+   * notification into the next model turn (via collectAttachments), with
+   * backpressure — a flood of lines is coalesced to at most one event per
+   * PROGRESS_EVENT_MIN_INTERVAL_MS, and the full line history stays in the
+   * task's output buffer for bounded retrieval. Never blocks the caller.
+   */
+  monitorLine(id: string, line: string): void {
+    const task = this.tasks.get(id);
+    if (!task || task.type !== 'monitor') return;
+    this.appendOutput(id, `${line}\n`);
+  }
+
   /** Mark a task as completed. */
   complete(id: string, exitCode?: number): void {
     const task = this.tasks.get(id);
@@ -271,6 +286,119 @@ export class BackgroundTaskRegistry {
       pollInterval.unref();
       timeoutTimer.unref();
     });
+  }
+
+  /**
+   * Wait for ANY of the given tasks to reach a terminal state (SCLI-430).
+   *
+   * Resolves with the first task that completes/fails/kills, or null on
+   * timeout. Unknown ids are skipped (a task that never existed cannot
+   * satisfy the wait); if all ids are unknown, resolves null immediately.
+   * Mirrors Grok Build's wait-any: returns as soon as one of the tracked
+   * background tasks finishes.
+   */
+  async waitAny(ids: string[], timeoutMs: number = 30000): Promise<BackgroundTask | null> {
+    const known = ids.filter((id) => this.tasks.has(id));
+    if (known.length === 0) return null;
+
+    const terminal = (id: string): BackgroundTask | undefined => {
+      const t = this.tasks.get(id);
+      return t && isTerminalStatus(t.status) ? t : undefined;
+    };
+
+    // Already-terminal task wins immediately.
+    for (const id of known) {
+      const t = terminal(id);
+      if (t) return t;
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (task: BackgroundTask | null) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(pollInterval);
+        clearTimeout(timeoutTimer);
+        this.terminalWaiters.delete(onTerminal);
+        resolve(task);
+      };
+      const onTerminal = (task: BackgroundTask) => {
+        if (known.includes(task.id)) finish(task);
+      };
+      const pollInterval = setInterval(() => {
+        for (const id of known) {
+          const t = terminal(id);
+          if (t) return finish(t);
+        }
+      }, 100);
+      const timeoutTimer = setTimeout(() => finish(null), timeoutMs);
+      this.terminalWaiters.add(onTerminal);
+      pollInterval.unref();
+      timeoutTimer.unref();
+    });
+  }
+
+  /**
+   * Wait for ALL of the given tasks to reach a terminal state (SCLI-430).
+   *
+   * Resolves true when every known task is terminal, false on timeout.
+   * Unknown ids are ignored; an empty/unknown-only set resolves true
+   * immediately (nothing left to wait for).
+   */
+  async waitAll(ids: string[], timeoutMs: number = 30000): Promise<boolean> {
+    const known = ids.filter((id) => this.tasks.has(id));
+    if (known.length === 0) return true;
+
+    const allTerminal = (): boolean =>
+      known.every((id) => {
+        const t = this.tasks.get(id);
+        return t !== undefined && isTerminalStatus(t.status);
+      });
+
+    if (allTerminal()) return true;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(pollInterval);
+        clearTimeout(timeoutTimer);
+        this.terminalWaiters.delete(onTerminal);
+        resolve(result);
+      };
+      const onTerminal = () => {
+        if (allTerminal()) finish(true);
+      };
+      const pollInterval = setInterval(() => {
+        if (allTerminal()) finish(true);
+      }, 100);
+      const timeoutTimer = setTimeout(() => finish(allTerminal()), timeoutMs);
+      this.terminalWaiters.add(onTerminal);
+      pollInterval.unref();
+      timeoutTimer.unref();
+    });
+  }
+
+  /**
+   * Structured output poll for a task (SCLI-430).
+   *
+   * Returns the task's current status, exit code/error, and the output
+   * produced since the last poll (or the full buffer when `full` is set).
+   * Returns undefined for an unknown id.
+   */
+  getOutput(id: string, full: boolean = false): { id: string; status: TaskStatus; exitCode?: number; error?: string; deltaOutput: string } | undefined {
+    const task = this.tasks.get(id);
+    if (!task) return undefined;
+    const delta = full ? task.output : task.output.slice(task.outputOffset);
+    if (!full) task.outputOffset = task.output.length;
+    return {
+      id: task.id,
+      status: task.status,
+      exitCode: task.exitCode,
+      error: task.error,
+      deltaOutput: delta,
+    };
   }
 
   /** Return the next terminal task whose attachment has not been consumed. */
