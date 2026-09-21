@@ -10,7 +10,7 @@ import {
 
 // PLAT-4205 — gpt-* codex agents must use the HTTP-only chatgpt-http provider +
 // a pinned static catalog (openai/codex#22634 WS-wedge). Ported from deprecated#3
-// + sara2574/deprecated#1 to the canonical shizuha-beta codex-bridge, with the
+// + sara2574/deprecated#1 to the canonical shizuha codex-bridge, with the
 // corrected endpoint and revi's failure-atomic / never-undefined-provider P1s.
 
 describe('PLAT-4205 isGptCodexModel', () => {

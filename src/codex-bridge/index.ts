@@ -534,7 +534,7 @@ export type FailbackChainStep = { method?: string; model?: string };
  * bridge's P1) and there is no config.toml TOML-placement to get wrong (its P2).
  * The corrected endpoint is `https://chatgpt.com/backend-api/codex` (revi-verified;
  * NOT `api.openai.com`). Ported from deprecated#3 + sara2574/deprecated#1 to the
- * canonical shizuha-beta codex-bridge.
+ * canonical shizuha codex-bridge.
  */
 export function isGptCodexModel(model: string | undefined): boolean {
   return /^gpt-/i.test(model ?? '');

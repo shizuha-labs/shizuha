@@ -6,7 +6,7 @@ import json, os, pty, subprocess, sys, time
 # enters state T, then runs `fg` and asserts the TUI resumes (state S).
 # Emits one JSON line per run. Exit non-zero if any assertion fails.
 
-REPO = '/home/agent/.shizuha/work/shizuha-beta'
+REPO = '/home/agent/.shizuha/work/shizuha'
 MODEL = 'gpt-5.3-codex'
 
 

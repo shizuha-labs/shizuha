@@ -67,7 +67,7 @@ import { runtimeLaneHealthFromProbe } from './runtime-lane-health.js';
 import { launchConcurrentlyWithIoYield } from './startup-scheduler.js';
 import { launchBareMetalChild } from './bare-metal-workspace.js';
 // PLAT-7787: static ESM import — `require('./agent-accounts.js')` throws ERR_REQUIRE_ESM
-// in this ESM module (review finding on shizuha-beta#349).
+// in this ESM module (review finding on shizuha (dev repo) #349).
 import { consumeEnsureAgentAccountDiag } from './agent-accounts.js';
 import { type AgentIdentity, validateAgentIdentity } from './agent-identity.js';
 import * as dns from 'node:dns';

@@ -74,7 +74,7 @@ export interface SkillStalenessReport {
 export interface SkillStalenessInput {
   /** `/opt/skills/.source-revision` on this pod. */
   podRevision: string | null | undefined;
-  /** `runtime-skills.lock` in shizuha-beta — what the image should carry. */
+  /** `runtime-skills.lock` in the dev repo — what the image should carry. */
   lockRevision: string | null | undefined;
   /**
    * Skills repo HEAD. Optional: an agent that cannot reach the forge still

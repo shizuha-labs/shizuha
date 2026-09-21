@@ -265,7 +265,7 @@ Instructions for spawning sub-agents.
 
   // PLAT-465 (BUILD-1) — role/team-targeted catalog filter (HLD PLAT-458 §3.3).
   // Guards the non-breaking default + OR-semantics of buildCatalog/skillMatchesAudience;
-  // this is the fleet-wide skill loader and shizuha-beta has no working CI, so this
+  // this is the fleet-wide skill loader and shizuha has no working CI, so this
   // unit test is the safety net (per aoi's merge-gate requirement).
   describe('buildCatalog role/team targeting (PLAT-465)', () => {
     const mkSkill = (name: string, roles?: string[], starred?: boolean): Skill => ({

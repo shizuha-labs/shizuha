@@ -944,7 +944,7 @@ class OverlayWorkflowTests(unittest.TestCase):
             for container in init:
                 script = container["args"][0]
                 script = script.replace(
-                    "http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha-beta.git",
+                    "http://forgejo-http.origin.svc.cluster.local/shizuha-labs/shizuha.git",
                     source_origin.as_uri(),
                 ).replace(
                     "http://forgejo-http.origin.svc.cluster.local/shizuha-labs/skills.git",
