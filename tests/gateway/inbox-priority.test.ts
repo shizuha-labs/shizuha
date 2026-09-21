@@ -193,7 +193,7 @@ describe('gateway scheduler inbox priority', () => {
   it('keeps a real user DM ahead of a queued cron watch', async () => {
     const inbox = new Inbox();
     inbox.busy = true;
-    inbox.push(message('watch shizuha-beta#297', { source: 'cron', id: 'cron-2', userName: 'Cron' }));
+    inbox.push(message('watch shizuha (dev repo) #297', { source: 'cron', id: 'cron-2', userName: 'Cron' }));
     inbox.push(message('[kei] stall escalation on cortex#179', { userName: 'kei' }));
     inbox.busy = false;
 

@@ -5,7 +5,7 @@ import type { TurnTelemetryWindow, TurnTelemetryRecord } from '../telemetry/turn
 
 /**
  * SCLI-32: detect when an agent run is STRUGGLING and emit a heuristic-only
- * `struggle` event (no LLM). Ported from the shizuha prototype to shizuha-beta
+ * `struggle` event (no LLM). Ported from the shizuha prototype to shizuha
  * per the architect ruling: it drives the completed-turn heuristics
  * (THRASH / ERROR_DENSITY / LONG_RUN) off the REAL SCLI-31 telemetry window
  * (`TurnTelemetryRecord[]` via `getTurnTelemetryWindow()`) instead of a private

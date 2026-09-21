@@ -1,6 +1,6 @@
 /**
  * PLAT-5468: the people-ops audit action/query contract (PLAT-1076) must be
- * recorded and queryable from the canonical shizuha-beta audit logger.
+ * recorded and queryable from the canonical shizuha audit logger.
  *
  * Ports the two old shizuha regressions at the current consumer boundary:
  *  1. persistence/reload with mixed audit events — people-ops entries survive

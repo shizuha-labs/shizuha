@@ -953,13 +953,13 @@ describe('recovery_action v1 policy', () => {
     const sanitized = sanitizeSummary({
       token: 'ghp_abcdefghijklmnopqrstuvwxyz0123456789',
       message: 'upstream failed with sk-abcdefghijklmnopqrstuvwxyz012345',
-      url: 'https://origin.shizuha.com/shizuha-labs/shizuha-beta',
+      url: 'https://origin.shizuha.com/shizuha-labs/shizuha',
       hash: '0123456789abcdef'.repeat(4),
     });
     expect(sanitized).toEqual({
       token: '[redacted-secret]',
       message: 'upstream failed with [redacted-secret]',
-      url: 'https://origin.shizuha.com/shizuha-labs/shizuha-beta',
+      url: 'https://origin.shizuha.com/shizuha-labs/shizuha',
       hash: '0123456789abcdef'.repeat(4),
     });
   });

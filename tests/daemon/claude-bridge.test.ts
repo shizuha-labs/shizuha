@@ -262,11 +262,11 @@ describe('Claude bridge turn-boundary arbitration', () => {
 
 describe('Claude bridge retained-session durable provenance (PLAT-4707)', () => {
   const taskRef = { kind: 'pulse_task' as const, taskKey: 'PLAT-4707' };
-  const prRef = { kind: 'origin_pr' as const, repo: 'shizuha-labs/shizuha-beta', number: 48 };
+  const prRef = { kind: 'origin_pr' as const, repo: 'shizuha-labs/shizuha', number: 48 };
 
   it('extracts canonical Pulse and Origin references without retaining message prose', () => {
     expect(extractClaudeSessionAuthorityRefs(
-      'Handle PLAT-4707 using https://origin.shizuha.com/shizuha-labs/shizuha-beta/pulls/48; PLAT-4707 again',
+      'Handle PLAT-4707 using https://origin.shizuha.com/shizuha-labs/shizuha/pulls/48; PLAT-4707 again',
     )).toEqual([prRef, taskRef]);
   });
 

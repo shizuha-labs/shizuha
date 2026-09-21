@@ -26,7 +26,7 @@
  *                 so HEAD is the newest published skills revision without a
  *                 per-call network round-trip.
  *
- *   lockRevision  runtime-skills.lock in shizuha-beta — "what the current
+ *   lockRevision  runtime-skills.lock in the dev repo — "what the current
  *                 runtime image pins". The pod image was built FROM a lock, so
  *                 the current lock is the revision a freshly built image would
  *                 carry. Fetched best-effort from the Origin raw URL with a

@@ -20,7 +20,7 @@ guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 SOURCE = "a" * 40
 REF = "refs/heads/master"
-REPOSITORY = "shizuha-labs/shizuha-beta"
+REPOSITORY = "shizuha-labs/shizuha"
 PROJECTED = b"exact qualified observer source\n"
 PROJECTED_SHA = hashlib.sha256(PROJECTED).hexdigest()
 
@@ -150,7 +150,7 @@ class RuntimeReleaseConcurrencyTests(unittest.TestCase):
         self.assertIn("default_transaction_read_only=on", self.connections[0]["options"])
         self.assertIn("statement_timeout=10000", self.connections[0]["options"])
         self.assertEqual(self.closed, 1)
-        self.assertEqual(self.queries[0][1], (42, "shizuha-beta", "shizuha-labs"))
+        self.assertEqual(self.queries[0][1], (42, "shizuha", "shizuha-labs"))
         self.assertEqual(self.queries[1][1], (40, guard.GROUP, 42))
         self.row = (*self.row[:3], "b" * 40, *self.row[4:])
         second = self.invoke(43, "b" * 40)

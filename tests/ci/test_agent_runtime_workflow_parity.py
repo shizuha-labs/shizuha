@@ -138,7 +138,7 @@ class AgentRuntimeWorkflowParityTests(unittest.TestCase):
 
         self.assertIn('--run-id "$ORIGIN_RUN_ID" --source-sha "$SOURCE_SHA"', section)
         self.assertIn('--source-ref "refs/heads/${SOURCE_BRANCH}"', section)
-        self.assertIn('--repository shizuha-labs/shizuha-beta', section)
+        self.assertIn('--repository shizuha-labs/shizuha', section)
         self.assertIn(
             "^ci-build-agentrt-harness-[0-9]{12}-[0-9a-f]{7}-(amd64|arm64)$",
             section,

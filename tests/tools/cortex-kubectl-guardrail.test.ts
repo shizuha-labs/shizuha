@@ -6,13 +6,13 @@ import type { ToolContext } from '../../src/tools/types.js';
 
 /**
  * PLAT-5392: Cortex kubectl guardrail — ported from the stranded `shizuha`
- * repo into the authoritative `shizuha-beta` runtime and wired into the bash
+ * repo into the authoritative `shizuha` runtime and wired into the bash
  * tool. These fixtures exercise the REAL caller boundary (bashTool.execute),
  * not just the guardrail helper, so a green suite proves the guard is enforced
  * in the artifact every fleet agent runs.
  *
  * Red-first: before this port the shipped runtime had ZERO enforcement — the
- * guardrail file was absent from shizuha-beta and from the built bundle
+ * guardrail file was absent from the dev repo and from the built bundle
  * (hiro's grep evidence on PLAT-5392). A mutating `kubectl -n ai-models` from
  * the bash tool sailed through. These fixtures are green only because the
  * guard is now wired in.
