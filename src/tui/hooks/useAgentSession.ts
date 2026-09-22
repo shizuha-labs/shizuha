@@ -11,6 +11,7 @@ import { shouldAnimateTUI } from '../utils/terminal.js';
 import { addAnthropicToken, setOpenAIKey, setGoogleKey, setCortexApiKey } from '../../config/credentials.js';
 import { formatTokenProgressStatus } from '../../utils/perf-metrics.js';
 import { DEFAULT_TUI_STALL_ESCALATION_MS, longWaitDisplayMs } from '../utils/stallDisplay.js';
+import { retryBannerClass } from '../retry-banner.js';
 import {
   loginToShizuhaId,
   clearShizuhaAuth,
@@ -725,6 +726,23 @@ export function useAgentSession(
     setCompletedEntries((prev) => {
       const last = prev[prev.length - 1];
       if (last?.role === 'system' && last.content === trimmed) return prev;
+      // shizuha2 2026-09-22: each 502/ECONNRESET retry appended a new ↻
+      // line until the pane was a stack of the same failure. A later
+      // notice of the same class replaces the previous one.
+      const nextClass = retryBannerClass(trimmed);
+      if (
+        nextClass
+        && last?.role === 'system'
+        && retryBannerClass(last.content) === nextClass
+      ) {
+        const replaced = prev.slice();
+        replaced[replaced.length - 1] = {
+          ...last,
+          content: trimmed,
+          timestamp: Date.now(),
+        };
+        return replaced;
+      }
       const systemEntry: TranscriptEntry = {
         id: `system-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
         role: 'system',

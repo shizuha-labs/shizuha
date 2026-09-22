@@ -30,6 +30,8 @@ import * as crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 import { pinPreparedStatements } from '../shared/sqlite-statement-cache.js';
 
+import { limitWalSize, startWalCheckpointTimer, walCheckpointTruncate } from '../state/wal-hygiene.js';
+
 // ── Types ──
 
 export interface MemoryChunk {
@@ -311,6 +313,7 @@ export class MemoryIndex {
   private cfg: Required<MemoryIndexConfig>;
   private workspace: string;
   private hasVecExtension = false;
+  private stopWalCheckpointTimer: () => void;
 
   constructor(workspace: string, config?: MemoryIndexConfig) {
     this.workspace = workspace;
@@ -350,6 +353,10 @@ export class MemoryIndex {
     pinPreparedStatements(this.db);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
+    // SCLI-762/763: same WAL-hygiene contract as StateStore — bound the -wal
+    // file and checkpoint periodically; see src/state/wal-hygiene.ts.
+    limitWalSize(this.db);
+    this.stopWalCheckpointTimer = startWalCheckpointTimer(this.db);
 
     this.initSchema();
     this.tryLoadVecExtension();
@@ -814,6 +821,9 @@ export class MemoryIndex {
   }
 
   close(): void {
+    // SCLI-763: best-effort TRUNCATE checkpoint before closing (see wal-hygiene.ts).
+    this.stopWalCheckpointTimer();
+    walCheckpointTruncate(this.db);
     this.db.close();
   }
 }

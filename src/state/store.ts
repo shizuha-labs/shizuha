@@ -8,6 +8,7 @@ import type { ToolResult } from '../tools/types.js';
 import type { InterruptCheckpoint, Session } from './types.js';
 import type { ProviderPrefixSnapshot } from '../telemetry/provider-prefix-continuity.js';
 import { stableJson } from '../telemetry/prefix-fingerprint.js';
+import { limitWalSize, startWalCheckpointTimer, walCheckpointTruncate } from './wal-hygiene.js';
 
 function hashJson(value: unknown): string {
   return createHash('sha256').update(stableJson(value)).digest('hex');
@@ -98,6 +99,7 @@ export function defaultStateDbPath(): string {
 
 export class StateStore {
   private db: Database.Database;
+  private stopWalCheckpointTimer: () => void;
 
   constructor(dbPath?: string) {
     const dir = dbPath ? path.dirname(dbPath) : path.join(process.env['HOME'] ?? '.', '.config', 'shizuha');
@@ -107,6 +109,12 @@ export class StateStore {
     this.db = new Database(file);
     pinPreparedStatements(this.db);
     this.db.pragma('journal_mode = WAL');
+    // SCLI-762/763: bound the WAL file. Continuous long-lived readers starve
+    // the default auto-checkpoint, and without a size limit the -wal file
+    // grows unbounded (observed 10x the DB size) and never shrinks — even
+    // across restarts. See src/state/wal-hygiene.ts.
+    limitWalSize(this.db);
+    this.stopWalCheckpointTimer = startWalCheckpointTimer(this.db);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
@@ -1580,6 +1588,10 @@ export class StateStore {
   }
 
   close(): void {
+    // SCLI-763: best-effort TRUNCATE checkpoint before closing so the -wal
+    // file resets on shutdown instead of persisting its high-water mark.
+    this.stopWalCheckpointTimer();
+    walCheckpointTruncate(this.db);
     this.db.close();
   }
 }

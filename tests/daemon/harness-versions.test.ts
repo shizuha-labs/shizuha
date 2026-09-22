@@ -291,6 +291,11 @@ printf 'gemini 0.50.0\n'
   it('reports the dominant running image during a partial roll (no more forever-rolling)', () => {
     // operator 2026-08-06: at 3/4 on the new image, the baseline must track
     // what most agents actually run rather than freezing until 100%.
+    // PLAT-5589 refuses an image the reviewed release document does not
+    // admit. This case is the no-document fleet; a host that has
+    // /etc/shizuha/runtime-release/desired.json must not change it.
+    const previousReleasePath = process.env['SHIZUHA_DESIRED_RUNTIME_RELEASE_PATH'];
+    process.env['SHIZUHA_DESIRED_RUNTIME_RELEASE_PATH'] = '/tmp/shizuha-no-such-runtime-release.json';
     __resetConvergenceStateForTest();
     noteDominantAgentRuntimeImage([
       { currentImage: 'registry/shizuha-agent-runtime:new', replicas: 1, readyReplicas: 1 },
@@ -299,6 +304,8 @@ printf 'gemini 0.50.0\n'
       { currentImage: 'registry/shizuha-agent-runtime:old', replicas: 1, readyReplicas: 1 },
     ]);
     expect(harnessReport().agent_runtime_image).toBe('registry/shizuha-agent-runtime:new');
+    if (previousReleasePath == null) delete process.env['SHIZUHA_DESIRED_RUNTIME_RELEASE_PATH'];
+    else process.env['SHIZUHA_DESIRED_RUNTIME_RELEASE_PATH'] = previousReleasePath;
   });
 
   it('does not count an unready pod on the new image as running', () => {
