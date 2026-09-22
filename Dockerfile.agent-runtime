@@ -20,32 +20,51 @@
 # NOTE: push via gx10-1:30500 (s1's trusted registry path); fleet pods PULL via
 # each node's loopback localhost:30500 (same in-cluster registry).
 # =============================================================================
-# Browser bytes are inherited from the last qualified multi-arch runtime, by
-# immutable index digest. This keeps lockfile-only rebuilds off Playwright's
-# public CDN while retaining native amd64/arm64 selection at manifest resolve.
-FROM registry.registry.svc.cluster.local:5000/shizuha-agent-runtime@sha256:f11a905ba5998ea7072b787bf961abf88ec7b8e801a64e595529d308e8df761e AS playwright-donor
+# Browser bytes come from a donor stage (ARG-selected below): internal builds
+# inherit from the last qualified multi-arch runtime by immutable index
+# digest; public builds use the official Microsoft Playwright image.
+# Playwright browser donor. PUBLIC DEFAULT: the official Microsoft Playwright
+# image matching the repo's playwright lockfile (1.58.x → chromium-1208 builds,
+# served at /ms-playwright). Internal CI overrides both ARGs to the pinned
+# in-registry donor index (browsers at /opt/playwright-browsers). The
+# post-COPY browser assertions below qualify whichever donor is used — a
+# mismatch fails the build (fail-closed), so the public default cannot
+# silently drift from the payload contract.
+ARG PLAYWRIGHT_DONOR_IMAGE=mcr.microsoft.com/playwright:v1.58.2-noble
+ARG PLAYWRIGHT_BROWSERS_SRC=/ms-playwright
+FROM ${PLAYWRIGHT_DONOR_IMAGE} AS playwright-donor
 
 FROM ubuntu:24.04
 
-ARG PACKAGE_CACHE_HOST=s1.tail.shizuha.com
+# Package fetch coordinates — PUBLIC DEFAULTS (registry.npmjs.org, pypi.org,
+# apt direct). Internal CI overrides these per-arch via kaniko build-args
+# (build-agent-runtime.yml) so cluster builds keep using the in-cluster
+# caches; the produced image is identical either way, only the fetch path
+# differs. Runtime ENVs stay public-correct for open-source users — an
+# external `docker build` needs no extra flags.
 ARG TARGETARCH
 ARG KUBECTL_VERSION=v1.34.6
+ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
+ARG PIP_INDEX_URL=https://pypi.org/simple/
+ARG APT_HTTP_PROXY=
 ENV DEBIAN_FRONTEND=noninteractive
 # Current OpenClaw releases require Node 24.16+ (24.x) or 26.1+.
 # Install every native dependency under the same supported Node runtime.
 ENV NODE_MAJOR=24
-ENV NPM_CONFIG_REGISTRY=http://${PACKAGE_CACHE_HOST}:30512/
-ENV PIP_INDEX_URL=http://${PACKAGE_CACHE_HOST}:30511/simple/
-ENV PIP_TRUSTED_HOST=${PACKAGE_CACHE_HOST}
-RUN printf 'registry=http://%s:30512/\n' "${PACKAGE_CACHE_HOST}" > /etc/npmrc \
-  && printf '[global]\nindex-url = http://%s:30511/simple/\ntrusted-host = %s\n' "${PACKAGE_CACHE_HOST}" "${PACKAGE_CACHE_HOST}" > /etc/pip.conf
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+RUN printf 'registry=%s\n' "${NPM_CONFIG_REGISTRY}" > /etc/npmrc \
+  && { printf '[global]\nindex-url = %s\n' "${PIP_INDEX_URL}"; \
+       case "${PIP_INDEX_URL}" in \
+         http://*) printf 'trusted-host = %s\n' "$(printf '%s' "${PIP_INDEX_URL}" | sed -E 's|^http://([^/:]+).*|\1|')" ;; \
+       esac; } > /etc/pip.conf
 
-# Route apt through the in-cluster apt-cache proxy (apt-cacher-ng). The build
-# nodes can't reach http://ports.ubuntu.com (arm64 archive) directly over WAN —
-# "Network is unreachable" broke every arm64 agent-runtime build (2026-07-16).
-# The cache has egress and serves both archive.ubuntu.com (amd64) and
-# ubuntu-ports (arm64). https stays DIRECT (cli.github/nodesource are reachable).
-RUN printf 'Acquire::http::Proxy "http://apt-cache.registry.svc.cluster.local:3142";\nAcquire::https::Proxy "DIRECT";\nAcquire::Retries "3";\n' > /etc/apt/apt.conf.d/00shizuha-apt-cache
+# apt: public default is DIRECT; internal CI passes the in-cluster
+# apt-cacher-ng proxy (build nodes can't reach ports.ubuntu.com over WAN —
+# "Network is unreachable" broke every arm64 build on 2026-07-16). https stays
+# DIRECT either way (cli.github / nodesource are reachable).
+RUN { [ -n "${APT_HTTP_PROXY}" ] && printf 'Acquire::http::Proxy "%s";\n' "${APT_HTTP_PROXY}"; true; \
+      printf 'Acquire::Retries "3";\n'; } > /etc/apt/apt.conf.d/00shizuha-apt-cache
 
 # ── Layer 1: System packages + Node.js 24 + gh ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -136,7 +155,8 @@ RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true \
 # unrelated npm lock entry changes. The post-npm-ci assertion below refuses a
 # future Playwright upgrade until this qualified donor digest is advanced.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
-COPY --from=playwright-donor /opt/playwright-browsers /opt/playwright-browsers
+ARG PLAYWRIGHT_BROWSERS_SRC=/ms-playwright
+COPY --from=playwright-donor ${PLAYWRIGHT_BROWSERS_SRC} /opt/playwright-browsers
 RUN test -d /opt/playwright-browsers/chromium-1208 \
   && test -d /opt/playwright-browsers/chromium_headless_shell-1208 \
   && test -d /opt/playwright-browsers/ffmpeg-1011 \

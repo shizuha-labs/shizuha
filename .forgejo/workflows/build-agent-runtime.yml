@@ -551,6 +551,15 @@ jobs:
                       - --insecure-pull
                       - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
                       - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      # Internal coordinates for the public-default Dockerfile
+                      # ARGs (Dockerfile.agent-runtime defaults are the public
+                      # registries so external builds need no flags):
+                      # pip cache, apt-cacher-ng (arm64 ports.ubuntu.com is
+                      # unreachable over WAN), and the pinned browser donor.
+                      - --build-arg=PIP_INDEX_URL=http://s1.tail.shizuha.com:30511/simple/
+                      - --build-arg=APT_HTTP_PROXY=http://apt-cache.registry.svc.cluster.local:3142
+                      - --build-arg=PLAYWRIGHT_DONOR_IMAGE=registry.registry.svc.cluster.local:5000/shizuha-agent-runtime@sha256:f11a905ba5998ea7072b787bf961abf88ec7b8e801a64e595529d308e8df761e
+                      - --build-arg=PLAYWRIGHT_BROWSERS_SRC=/opt/playwright-browsers
                       # Kaniko does not auto-inject TARGETARCH the way buildx does;
                       # empty TARGETARCH fails Dockerfile kubectl install
                       # ("unsupported TARGETARCH="). Pass the job arch explicitly.

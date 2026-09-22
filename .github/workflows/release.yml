@@ -1,0 +1,146 @@
+# release — GitHub-side artifact lane for the open-source shizuha code CLI and
+# the shizuha-agent-runtime image.
+#
+# This file ships to the public repo through the same agent-gated publish lane
+# as every other file (Origin .forgejo publishes → GitHub master), so external
+# users get exactly the automation we run. It is INERT on Forgejo (Forgejo
+# reads .forgejo/) and only ever runs on GitHub.
+#
+# Security posture:
+# - NO repository secrets. The only credential is the auto-scoped, revocable
+#   GITHUB_TOKEN (contents:write for the release, packages:write for GHCR).
+# - Releases cut from the published master only; pull_request never triggers
+#   this workflow, so untrusted code cannot reach the artifact path.
+# - Third-party actions pinned by full-length commit SHA (supply chain).
+# - Artifacts carry the source SHA; the runtime image build uses the
+#   Dockerfile's public-default ARGs (public registries, official Playwright
+#   donor) so an external rebuild of the same SHA reproduces the same image.
+
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  cli-tarball:
+    name: CLI npm tarball + GitHub release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Build CLI
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build:node
+
+      - name: Pack
+        run: |
+          mkdir -p release-pkg
+          VERSION=$(node -p "require('./package.json').version")
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          npm pack --pack-destination release-pkg
+
+      - name: Checksums
+        run: |
+          cd release-pkg
+          sha256sum *.tgz > SHA256SUMS.txt
+
+      - name: Changelog
+        run: |
+          node scripts/release/generate-changelog.mjs > release-notes.md || \
+            echo "Release of shizuha v${VERSION} (source ${GITHUB_SHA})" > release-notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${VERSION}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "shizuha v${VERSION}" --notes-file release-notes.md
+          fi
+          gh release upload "$TAG" release-pkg/*.tgz release-pkg/SHA256SUMS.txt --clobber
+
+  runtime-image:
+    name: shizuha-agent-runtime image (multi-arch) → GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node (build dist for the image context)
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Build dist
+        run: |
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --no-audit --no-fund
+          npm run build:node
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86fd1c19397b5d678cf14 # v3.6.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.14.0
+        with:
+          context: .
+          file: ./Dockerfile.agent-runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ghcr.io/shizuha-labs/shizuha-agent-runtime:${{ github.sha }}
+            ghcr.io/shizuha-labs/shizuha-agent-runtime:latest
+          build-args: |
+            SCLI_VERSION=${{ github.sha }}
+            SCLI_SOURCE_SHA=${{ github.sha }}
+            SKILLS_SOURCE_SHA=${{ github.sha }}
+
+      - name: Record provenance in the job summary
+        env:
+          SRC_SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "## shizuha-agent-runtime $SRC_SHA"
+            echo "- image: \`ghcr.io/shizuha-labs/shizuha-agent-runtime:$SRC_SHA\`"
+            echo "- source: <https://github.com/shizuha-labs/shizuha/commit/$SRC_SHA>"
+            echo "- platforms: linux/amd64, linux/arm64"
+            echo "- donors/caches: Dockerfile public defaults (mcr.microsoft.com/playwright, registry.npmjs.org, pypi.org)"
+          } >> "$GITHUB_STEP_SUMMARY"
