@@ -103,6 +103,25 @@ jobs:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --no-audit --no-fund
           npm run build:node
 
+      - name: Resolve harness versions + render lock (mirror the internal lane)
+        env:
+          AGY_MANIFEST_URL: https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json
+        run: |
+          CC_VER=$(npm view @anthropic-ai/claude-code version)
+          CODEX_VER=$(npm view @openai/codex version)
+          AGY_VER=$(curl -fsSL "$AGY_MANIFEST_URL" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          # openclaw: newest release whose engines.node the Node-24 base accepts
+          # (same walk-back contract as the internal lane, PLAT-8128).
+          curl -fsS --retry 3 "https://registry.npmjs.org/openclaw" > /tmp/openclaw-doc.json
+          OPENCLAW_VER=$(python3 scripts/harness_node_compat.py pick-newest --doc-file /tmp/openclaw-doc.json --base-major 24)
+          printf 'claude_code=%s\ncodex=%s\nantigravity=%s\nopenclaw=%s\n' \
+            "$CC_VER" "$CODEX_VER" "$AGY_VER" "$OPENCLAW_VER" > .harness-build-versions.lock
+          cat .harness-build-versions.lock
+          echo "CC_VER=$CC_VER" >> "$GITHUB_ENV"
+          echo "CODEX_VER=$CODEX_VER" >> "$GITHUB_ENV"
+          echo "AGY_VER=$AGY_VER" >> "$GITHUB_ENV"
+          echo "OPENCLAW_VER=$OPENCLAW_VER" >> "$GITHUB_ENV"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
 
@@ -132,6 +151,10 @@ jobs:
             SCLI_VERSION=${{ github.sha }}
             SCLI_SOURCE_SHA=${{ github.sha }}
             SKILLS_SOURCE_SHA=${{ github.sha }}
+            CLAUDE_CODE_VERSION=${{ env.CC_VER }}
+            CODEX_VERSION=${{ env.CODEX_VER }}
+            ANTIGRAVITY_VERSION=${{ env.AGY_VER }}
+            OPENCLAW_VERSION=${{ env.OPENCLAW_VER }}
 
       - name: Record provenance in the job summary
         env:
