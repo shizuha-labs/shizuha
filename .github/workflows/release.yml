@@ -151,6 +151,8 @@ jobs:
             SCLI_VERSION=${{ github.sha }}
             SCLI_SOURCE_SHA=${{ github.sha }}
             SKILLS_SOURCE_SHA=${{ github.sha }}
+            SKILLS_MIN_COUNT=0
+            SKILLS_REQUIRED=
             CLAUDE_CODE_VERSION=${{ env.CC_VER }}
             CODEX_VERSION=${{ env.CODEX_VER }}
             ANTIGRAVITY_VERSION=${{ env.AGY_VER }}
