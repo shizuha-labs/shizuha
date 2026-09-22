@@ -152,25 +152,43 @@ class AgentRuntimeWorkflowParityTests(unittest.TestCase):
 
     def test_browser_payload_uses_qualified_internal_donor(self):
         text = DOCKERFILE.read_text()
+        workflow = (
+            ROOT / ".forgejo" / "workflows" / "build-agent-runtime.yml"
+        ).read_text()
         package_lock = json.loads((ROOT / "package-lock.json").read_text())
 
+        # Public-first Dockerfile (2026-09-22): the donor is an ARG. The public
+        # default is the official Microsoft Playwright image; the INTERNAL
+        # donor digest moved from the Dockerfile into the CI build-args below —
+        # qualified donor advanced 2026-09-19 (PLAT-9231): the prior donor
+        # index digest 02137f09… was garbage-collected from the registry
+        # (PLAT-9225 loss class; build run 6752 on 35316466
+        # MANIFEST_UNKNOWN, both attempts), so the donor moved to
+        # the live harness-202609170222-58dba8c index digest. The
+        # in-Dockerfile post-COPY assertions (chromium-1208 /
+        # chromium_headless_shell-1208 / ffmpeg-1011) remain the payload
+        # qualification for either donor; the internal donor was built from
+        # beta master 58dba8c with the same playwright 1.58.2 lockfile.
         self.assertIn(
-            "registry.registry.svc.cluster.local:5000/shizuha-agent-runtime@"
-            # Qualified donor advanced 2026-09-19 (PLAT-9231): the prior donor
-            # index digest 02137f09… was garbage-collected from the registry
-            # (PLAT-9225 loss class; build run 6752 on 35316466
-            # MANIFEST_UNKNOWN, both attempts), so the Dockerfile base moved to
-            # the live harness-202609170222-58dba8c index digest. The
-            # in-Dockerfile post-COPY assertions (chromium-1208 /
-            # chromium_headless_shell-1208 / ffmpeg-1011) remain the payload
-            # qualification; the donor was built from beta master 58dba8c with
-            # the same playwright 1.58.2 lockfile.
-            "sha256:f11a905ba5998ea7072b787bf961abf88ec7b8e801a64e595529d308e8df761e "
-            "AS playwright-donor",
+            "ARG PLAYWRIGHT_DONOR_IMAGE=mcr.microsoft.com/playwright:v1.58.2-noble",
             text,
         )
         self.assertIn(
-            "COPY --from=playwright-donor /opt/playwright-browsers "
+            "FROM ${PLAYWRIGHT_DONOR_IMAGE} AS playwright-donor",
+            text,
+        )
+        self.assertIn(
+            "--build-arg=PLAYWRIGHT_DONOR_IMAGE=registry.registry.svc.cluster.local:"
+            "5000/shizuha-agent-runtime@"
+            "sha256:f11a905ba5998ea7072b787bf961abf88ec7b8e801a64e595529d308e8df761e",
+            workflow,
+        )
+        self.assertIn(
+            "--build-arg=PLAYWRIGHT_BROWSERS_SRC=/opt/playwright-browsers",
+            workflow,
+        )
+        self.assertIn(
+            "COPY --from=playwright-donor ${PLAYWRIGHT_BROWSERS_SRC} "
             "/opt/playwright-browsers",
             text,
         )

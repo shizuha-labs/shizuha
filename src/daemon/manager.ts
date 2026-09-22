@@ -1312,14 +1312,17 @@ const AGENT_IMAGE_VERSION = '4'; // Bump to force rebuild (v4: route npm/pip ins
 const AGENT_DOCKERFILE = `
 FROM ubuntu:24.04
 
-ARG PACKAGE_CACHE_HOST=100.64.0.3
+ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
+ARG PIP_INDEX_URL=https://pypi.org/simple/
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_MAJOR=22
-ENV NPM_CONFIG_REGISTRY=http://\${PACKAGE_CACHE_HOST}:30512/
-ENV PIP_INDEX_URL=http://\${PACKAGE_CACHE_HOST}:30511/simple/
-ENV PIP_TRUSTED_HOST=\${PACKAGE_CACHE_HOST}
-RUN printf 'registry=http://%s:30512/\\n' "\${PACKAGE_CACHE_HOST}" > /etc/npmrc \\
-  && printf '[global]\\nindex-url = http://%s:30511/simple/\\ntrusted-host = %s\\n' "\${PACKAGE_CACHE_HOST}" "\${PACKAGE_CACHE_HOST}" > /etc/pip.conf
+ENV NPM_CONFIG_REGISTRY=\${NPM_CONFIG_REGISTRY}
+ENV PIP_INDEX_URL=\${PIP_INDEX_URL}
+RUN printf 'registry=%s\n' "\${NPM_CONFIG_REGISTRY}" > /etc/npmrc \\
+  && { printf '[global]\nindex-url = %s\n' "\${PIP_INDEX_URL}"; \\
+       case "\${PIP_INDEX_URL}" in \\
+         http://*) printf 'trusted-host = %s\n' "$(printf '%s' "\${PIP_INDEX_URL}" | sed -E 's|^http://([^/:]+).*|\\1|')" ;; \\
+       esac; } > /etc/pip.conf
 
 # ── Layer 1: System packages + Node.js 22 ──
 RUN apt-get update && apt-get install -y --no-install-recommends \\
@@ -1379,14 +1382,17 @@ const DIND_IMAGE_VERSION = '29'; // Bump to force rebuild (v29: Claude auth/quot
 const DIND_DOCKERFILE = `
 FROM ubuntu:24.04
 
-ARG PACKAGE_CACHE_HOST=100.64.0.3
+ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
+ARG PIP_INDEX_URL=https://pypi.org/simple/
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_MAJOR=22
-ENV NPM_CONFIG_REGISTRY=http://\${PACKAGE_CACHE_HOST}:30512/
-ENV PIP_INDEX_URL=http://\${PACKAGE_CACHE_HOST}:30511/simple/
-ENV PIP_TRUSTED_HOST=\${PACKAGE_CACHE_HOST}
-RUN printf 'registry=http://%s:30512/\\n' "\${PACKAGE_CACHE_HOST}" > /etc/npmrc \\
-  && printf '[global]\\nindex-url = http://%s:30511/simple/\\ntrusted-host = %s\\n' "\${PACKAGE_CACHE_HOST}" "\${PACKAGE_CACHE_HOST}" > /etc/pip.conf
+ENV NPM_CONFIG_REGISTRY=\${NPM_CONFIG_REGISTRY}
+ENV PIP_INDEX_URL=\${PIP_INDEX_URL}
+RUN printf 'registry=%s\n' "\${NPM_CONFIG_REGISTRY}" > /etc/npmrc \\
+  && { printf '[global]\nindex-url = %s\n' "\${PIP_INDEX_URL}"; \\
+       case "\${PIP_INDEX_URL}" in \\
+         http://*) printf 'trusted-host = %s\n' "$(printf '%s' "\${PIP_INDEX_URL}" | sed -E 's|^http://([^/:]+).*|\\1|')" ;; \\
+       esac; } > /etc/pip.conf
 
 # ── Layer 1: System packages + Node.js + Docker ──
 RUN apt-get update && apt-get install -y --no-install-recommends \\
@@ -1835,7 +1841,14 @@ export function ensureAgentImage(): boolean {
   fs.writeFileSync(path.join(buildDir, 'Dockerfile'), dockerfile);
   try {
     const buildEnv = { ...process.env };
-    const packageCacheHost = buildEnv['SHIZUHA_PACKAGE_CACHE_HOST'] ?? buildEnv['PACKAGE_CACHE_HOST'] ?? '100.64.0.3';
+    // Public-first: no cache env → build against the public registries (the
+// Dockerfile defaults). Internal fleet passes SHIZUHA_PACKAGE_CACHE_HOST and
+// gets the in-cluster caches routed in explicitly.
+    const packageCacheHost = buildEnv['SHIZUHA_PACKAGE_CACHE_HOST'] ?? buildEnv['PACKAGE_CACHE_HOST'];
+    const packageCacheArgs = packageCacheHost
+      ? ' --build-arg NPM_CONFIG_REGISTRY=http://' + packageCacheHost + ':30512/'
+        + ' --build-arg PIP_INDEX_URL=http://' + packageCacheHost + ':30511/simple/'
+      : '';
     if (process.platform === 'darwin') {
       const extraPaths = [
         '/Applications/Docker.app/Contents/Resources/bin',
@@ -1844,7 +1857,7 @@ export function ensureAgentImage(): boolean {
       ];
       buildEnv['PATH'] = [...extraPaths, buildEnv['PATH'] ?? ''].join(':');
     }
-    execSync(resolveDockerPath() + ' build --build-arg PACKAGE_CACHE_HOST=' + packageCacheHost + ' -t ' + AGENT_IMAGE + ' ' + buildDir, {
+    execSync(resolveDockerPath() + ' build' + packageCacheArgs + ' -t ' + AGENT_IMAGE + ' ' + buildDir, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 900_000, // 15 min (larger image)
       env: buildEnv,
@@ -1906,7 +1919,14 @@ export function ensureDindImage(): boolean {
     // PATH (which is minimal under launchd). Extend PATH so docker build can
     // find docker-credential-desktop/osxkeychain when resolving base images.
     const buildEnv = { ...process.env };
-    const packageCacheHost = buildEnv['SHIZUHA_PACKAGE_CACHE_HOST'] ?? buildEnv['PACKAGE_CACHE_HOST'] ?? '100.64.0.3';
+    // Public-first: no cache env → build against the public registries (the
+// Dockerfile defaults). Internal fleet passes SHIZUHA_PACKAGE_CACHE_HOST and
+// gets the in-cluster caches routed in explicitly.
+    const packageCacheHost = buildEnv['SHIZUHA_PACKAGE_CACHE_HOST'] ?? buildEnv['PACKAGE_CACHE_HOST'];
+    const packageCacheArgs = packageCacheHost
+      ? ' --build-arg NPM_CONFIG_REGISTRY=http://' + packageCacheHost + ':30512/'
+        + ' --build-arg PIP_INDEX_URL=http://' + packageCacheHost + ':30511/simple/'
+      : '';
     if (process.platform === 'darwin') {
       const extraPaths = [
         '/Applications/Docker.app/Contents/Resources/bin',
@@ -1916,7 +1936,7 @@ export function ensureDindImage(): boolean {
       ];
       buildEnv['PATH'] = [...extraPaths, buildEnv['PATH'] ?? ''].join(':');
     }
-    execSync(resolveDockerPath() + ' build --build-arg PACKAGE_CACHE_HOST=' + packageCacheHost + ' -t ' + DIND_IMAGE + ' ' + buildDir, {
+    execSync(resolveDockerPath() + ' build' + packageCacheArgs + ' -t ' + DIND_IMAGE + ' ' + buildDir, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 600_000, // 10 min (larger image now)
       env: buildEnv,
