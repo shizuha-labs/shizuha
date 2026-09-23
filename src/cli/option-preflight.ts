@@ -60,6 +60,27 @@ export class OptionPreflightError extends Error {
   }
 }
 
+/**
+ * Shared --cwd validation leg (SCLI-529/SCLI-558/SCLI-796). Runs the
+ * assertWorkspaceDir contract and wraps failures as OptionPreflightError so
+ * every call site — action-path preflight AND the commander help-exit catch —
+ * emits the identical field-specific diagnostic. Undefined/null (option not
+ * supplied) passes through as undefined.
+ */
+export function validateCwdOption(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const rawCwd = String(value);
+  try {
+    return assertWorkspaceDir(rawCwd);
+  } catch (err) {
+    throw new OptionPreflightError(
+      'cwd',
+      rawCwd,
+      err instanceof Error ? err.message : '--cwd must be an existing directory',
+    );
+  }
+}
+
 export function requireEnum(
   field: string,
   value: unknown,
@@ -606,16 +627,7 @@ export function validateCommonAgentOptions(opts: CommonAgentOpts): {
   // explicitly, so invalid cwd values fail before metrics/session/gateway work.
   let cwd: string | undefined;
   if (opts.cwd !== undefined && opts.cwd !== null) {
-    const rawCwd = String(opts.cwd);
-    try {
-      cwd = assertWorkspaceDir(rawCwd);
-    } catch (err) {
-      throw new OptionPreflightError(
-        'cwd',
-        rawCwd,
-        err instanceof Error ? err.message : '--cwd must be an existing directory',
-      );
-    }
+    cwd = validateCwdOption(opts.cwd);
   }
 
   // Optional model selector: non-empty, no whitespace/control/newline. SCLI-588:

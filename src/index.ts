@@ -39,6 +39,7 @@ import {
   requireOptionalNonEmpty,
   PERMISSION_MODES,
   validateCommonAgentOptions,
+  validateCwdOption,
 } from './cli/option-preflight.js';
 import { preflightMcpServersOrExit } from './cli/mcp-preflight.js';
 import {
@@ -2716,6 +2717,14 @@ rejectUnknownCommand(program, process.argv);
 // order) now rejects nonzero with the same field-specific diagnostic as the
 // action path; a valid mode (or subcommand help) exits 0 with help already
 // printed by commander.
+// SCLI-796: commander's stdout writes (help/version text) are buffered during
+// parse so a help exit that our post-parse validation REJECTS can be answered
+// with the diagnostic alone — never help output (the SCLI-796 acceptance is
+// stricter than the SCLI-580 mode precedent). Non-rejected outcomes flush the
+// buffer unchanged, preserving today's behavior for valid help/version.
+let commanderOutBuffer = '';
+let suppressCommanderOut = false;
+program.configureOutput({ writeOut: (str: string) => { commanderOutBuffer += str; } });
 try {
   program.parse();
 } catch (err) {
@@ -2743,7 +2752,35 @@ try {
       console.error(`Error: ${e.message}`);
       process.exitCode = 1;
     }
+    // SCLI-796: --help must not mask an explicit-empty/whitespace --cwd either
+    // (same class as the SCLI-580 --mode masking above). Commander parses the
+    // full argv before firing the help exit, so any command that parsed a
+    // --cwd value (root or bridge — --cwd has no default, so a defined value
+    // means it was actually supplied) is routed through the shared preflight
+    // leg here; `antigravity-bridge --cwd= --help` and friends now reject
+    // nonzero with the standard diagnostic instead of false-succeeding on
+    // help output. Valid cwd values keep exiting 0 with help.
+    for (const cmd of [program, ...program.commands] as Array<{ opts: () => Record<string, unknown> }>) {
+      const parsedCwd = cmd.opts().cwd;
+      if (parsedCwd === undefined || parsedCwd === null) continue;
+      try {
+        validateCwdOption(parsedCwd);
+      } catch (e) {
+        if (!(e instanceof OptionPreflightError)) throw e;
+        suppressCommanderOut = true;
+        console.error(`Error: ${e.message}`);
+        process.exitCode = 1;
+        break;
+      }
+    }
   }
+}
+// SCLI-796: flush commander's buffered stdout (help/version) unless this was
+// a help exit that our validation rejected — rejected help exits answer with
+// the diagnostic alone.
+if (!suppressCommanderOut && commanderOutBuffer) {
+  process.stdout.write(commanderOutBuffer);
+  commanderOutBuffer = '';
 }
 
 // Helper: run agent with an initial user prompt

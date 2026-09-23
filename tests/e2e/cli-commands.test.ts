@@ -166,6 +166,36 @@ describe('CLI E2E tests (dist/shizuha.js)', () => {
       }
     });
 
+    // SCLI-796 regression: the equals-form empty value used to short-circuit
+    // into commander's --help handler (exit 0 + usage text) before the shared
+    // preflight saw it — a false success the SCLI-558 acceptance explicitly
+    // forbids. The help exit must now route the parsed --cwd through the
+    // shared preflight and answer with the standard diagnostic alone.
+    it('--help must not mask an explicit-empty --cwd on any bridge or the root (no help output, standard diagnostic)', async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scli796-cli-cwd-help-'));
+      try {
+        for (const command of ['codex-bridge', 'openclaw-bridge', 'antigravity-bridge']) {
+          const result = await runCli([command, '--cwd=', '--help'], {
+            cwd: root,
+            timeout: 5_000,
+          });
+          expect(result.exitCode, command).toBe(1);
+          expect(result.stdout, `${command}: help output must not leak`).toBe('');
+          expect(result.stderr, command).toContain('--cwd');
+          expect(result.stderr, command).toContain('(empty or whitespace-only)');
+          expect(result.stderr.endsWith('\n'), command).toBe(true);
+          expect(result.stderr.slice(0, -1), command).not.toContain('\n');
+        }
+        // Same contract at the root (the --cwd option exists there too).
+        const rootResult = await runCli(['--cwd=', '--help'], { cwd: root, timeout: 5_000 });
+        expect(rootResult.exitCode).toBe(1);
+        expect(rootResult.stdout, 'root: help output must not leak').toBe('');
+        expect(rootResult.stderr).toContain('(empty or whitespace-only)');
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it('rejects every invalid cwd at both exported entrypoints before logs, listeners, or state', async () => {
       const previousGatewayPassword = process.env['GATEWAY_PASSWORD'];
       process.env['GATEWAY_PASSWORD'] = 'scli529-test-gateway-password';
