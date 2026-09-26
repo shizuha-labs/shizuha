@@ -21,7 +21,7 @@
     "build:tauri": "vite build --config vite.tauri.config.ts",
     "tauri": "tauri",
     "test": "vitest run",
-    "test:tui:ci": "vitest run tests/tui/session.test.ts tests/tui/turn-permission.test.ts tests/tui/tool-visibility.test.ts tests/tui/tool-input-preview.test.ts tests/tui/text-edit.test.ts tests/tui/slash-commands.test.ts tests/tui/rate-limit.test.ts tests/tui/status-config.test.ts tests/tui/state-store-sessions.test.ts tests/tui/types.test.ts tests/tui/osc8.test.ts tests/tui/terminal.test.ts tests/tui/ask-user-callback.test.ts tests/tui/mode-cycle-key.test.ts tests/tui/resume-transcript.test.ts",
+    "test:tui:ci": "vitest run tests/tui/session.test.ts tests/tui/turn-permission.test.ts tests/tui/tool-visibility.test.ts tests/tui/tool-input-preview.test.ts tests/tui/text-edit.test.ts tests/tui/slash-commands.test.ts tests/tui/rate-limit.test.ts tests/tui/status-config.test.ts tests/tui/state-store-sessions.test.ts tests/tui/types.test.ts tests/tui/osc8.test.ts tests/tui/terminal.test.ts tests/tui/ask-user-callback.test.ts tests/tui/mode-cycle-key.test.ts tests/tui/resume-transcript.test.ts tests/tui/session-lock.test.ts",
     "test:perf": "vitest run tests/perf/",
     "bench:tui-input": "tsx scripts/bench-tui-input-latency.ts",
     "perf:update-baseline": "vitest run tests/perf/ --reporter=verbose && node scripts/update-perf-baseline.mjs",
