@@ -33,6 +33,11 @@ Runtime: **Node.js 22+**.
 
 ### From source (developers)
 
+Works on **linux-x64**, **linux-arm64**, **darwin-x64**, and **darwin-arm64**.
+`./install.sh` downloads the official Node.js 22 build for that architecture
+when `node` is missing or older than 22. No Homebrew or root access is required.
+Windows users: install inside WSL, or see [BUILD_WINDOWS.md](BUILD_WINDOWS.md) for the desktop app.
+
 ```bash
 git clone https://github.com/shizuha-labs/shizuha.git
 cd shizuha

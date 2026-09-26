@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ToolDefinition } from '../../src/tools/types.js';
 import { AgentProcess, retainDeclaredMcpToolsOnRefresh } from '../../src/gateway/agent-process.js';
+import { authoredCustomInstructions, DEFERRED_TOOL_INSTRUCTIONS } from '../../src/prompt/authored-instructions.js';
+import { buildSystemPrompt, DYNAMIC_BOUNDARY_MARKER } from '../../src/prompt/builder.js';
 
 vi.mock('../../src/utils/logger.js', () => ({
   logger: {
@@ -34,6 +36,7 @@ function makeHarness(overrides: Record<string, unknown> = {}) {
     systemPrompt: 'fresh prompt\n\n---\n\n## Git Context\nBranch: main\nStatus:\nM new.ts',
     toolDefs: [tool('read_file'), tool('bash')],
     pendingPromptRefresh: null as null | { systemPrompt: string; toolDefs: ToolDefinition[] },
+    pendingAuthoredInstructionsRefresh: false,
     store: {
       loadProviderPrefixHead: vi.fn(() => null as null | { createdAt: number; model: string; systemPrompt: string; toolDefs: string }),
       saveProviderPrefixHead: vi.fn((sessionId: string, head: { model: string; systemPrompt: string; toolDefs: string }) => {
@@ -184,6 +187,65 @@ describe('resume prompt pin (PLAT-4189)', () => {
     runAdopt(harness, 'post_turn_compaction');
     expect(harness.systemPrompt).toBe(before);
     expect(saved).toHaveLength(0);
+  });
+});
+
+describe('authored instructions refresh at semantic compaction', () => {
+  const prompt = (authored: string, catalog = '', tail = 'working directory') => [
+    'Base policy',
+    ...(authored || catalog ? [`## Custom Instructions\n\n${authored}${catalog}`] : []),
+    DYNAMIC_BOUNDARY_MARKER, `## Working Directory\n${tail}`,
+  ].join('\n\n---\n\n');
+
+  it.each([['old instructions', 'new instructions'], ['', 'new instructions'], ['old instructions', '']])(
+    'pins changed instructions until compaction: %s to %s', (before, after) => {
+      const { harness, saved } = makeHarness({ systemPrompt: prompt(after) });
+      harness.store.loadProviderPrefixHead = vi.fn(() => ({
+        createdAt: 1, model: harness.model,
+        systemPrompt: prompt(before), toolDefs: JSON.stringify(harness.toolDefs),
+      }));
+      runPin(harness);
+      expect(harness.pendingAuthoredInstructionsRefresh).toBe(true);
+      expect(harness.systemPrompt).toBe(prompt(before));
+      expect(saved).toHaveLength(0);
+      runAdopt(harness, 'pre_turn_semantic_compaction');
+      expect(harness.systemPrompt).toBe(prompt(after));
+      expect(harness.pendingAuthoredInstructionsRefresh).toBe(false);
+      harness.store.loadProviderPrefixHead = vi.fn(() => ({ createdAt: 2, ...saved[0]!.head }));
+      runPin(harness);
+      expect(harness.pendingAuthoredInstructionsRefresh).toBe(false);
+    },
+  );
+
+  it.each(['unchanged authored instructions', ''])('ignores catalog and volatile drift with %s', (authored) => {
+    const { harness } = makeHarness({ systemPrompt: prompt(authored, `${DEFERRED_TOOL_INSTRUCTIONS}\n\nAvailable sources:\n- **wiki**: Docs`, 'new directory') });
+    harness.store.loadProviderPrefixHead = vi.fn(() => ({
+      createdAt: 1, model: harness.model,
+      systemPrompt: prompt(authored, `${DEFERRED_TOOL_INSTRUCTIONS}\n\nAvailable sources:\n- **pulse**: Tasks`),
+      toolDefs: JSON.stringify(harness.toolDefs),
+    }));
+    runPin(harness);
+    expect(harness.pendingPromptRefresh).not.toBeNull();
+    expect(harness.pendingAuthoredInstructionsRefresh).toBe(false);
+  });
+
+  it('preserves authored headings and separators rather than hashing their generated-looking section name', () => {
+    const authored = 'First rule\n\n---\n\nNested section\n\n## More Tools (via ToolSearch)\nMy own tool policy';
+    expect(authoredCustomInstructions(prompt(authored, DEFERRED_TOOL_INSTRUCTIONS))).toBe(authored);
+    expect(authoredCustomInstructions(prompt(authored))).toBe(authored);
+    expect(authoredCustomInstructions(prompt(`${authored}${DEFERRED_TOOL_INSTRUCTIONS}\nThis is authored, not the generated suffix`)))
+      .toBe(`${authored}${DEFERRED_TOOL_INSTRUCTIONS}\nThis is authored, not the generated suffix`);
+  });
+
+  it('recognizes authored instructions from the real full system prompt builder', async () => {
+    const authored = 'Use message_user to deliver replies.\n\n---\n\n## More Tools\nPreserve this authored section.';
+    const composed = await buildSystemPrompt({
+      cwd: '/nonexistent/atlas-authored-instructions-test', tools: [],
+      customPrompt: `${authored}${DEFERRED_TOOL_INSTRUCTIONS}\n\nAvailable sources:\n- **connect**: Messaging`,
+    });
+    expect(authoredCustomInstructions(composed)).toBe(authored);
+    const withoutCustom = await buildSystemPrompt({ cwd: '/nonexistent/atlas-authored-instructions-test', tools: [] });
+    expect(authoredCustomInstructions(withoutCustom)).toBe('');
   });
 });
 

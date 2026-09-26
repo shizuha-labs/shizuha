@@ -4,6 +4,9 @@ You do **not** need a Shizuha ID. You need Node.js 22+ and an LLM endpoint.
 
 ## 1. Install
 
+Supported source-build machines: linux-x64, linux-arm64, darwin-x64, darwin-arm64.
+`./install.sh` downloads Node.js 22 for that architecture when it is not already installed.
+
 ```bash
 git clone https://github.com/shizuha-labs/shizuha.git
 cd shizuha

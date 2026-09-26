@@ -11,9 +11,11 @@
 #
 # Multi-arch: native compilation per arch (better-sqlite3 etc. ship arch-specific
 # .node), so each linux target builds in an in-cluster node:22-bookworm Job pinned
-# to a matching-arch node (amd64 = s1, arm64 = gx10) — no QEMU. macOS/darwin builds
-# on the Mac host (`ssh shizuha-mb@v4`) are Phase 2 (needs MAC_SSH_KEY) — intentionally
-# not stubbed as a disabled job (SCLI-364: `if: false` false-failed the whole run).
+# to a matching-arch node (amd64 = s1, arm64 = gx10) — no QEMU. darwin-arm64 and
+# darwin-x64 are cross-packaged in the linux-x64 job from vendored Node and
+# better-sqlite3 prebuilds (rt-build/package-darwin-cross.sh). Do not add a
+# disabled build-darwin stub — Forgejo treats `if: false` as pending and fails
+# the whole run (SCLI-364).
 #
 # Trigger: source pushes, manual dispatch, and version tags. Rebuilding an
 # unchanged SHA nightly produced byte-different tarballs and needless client
@@ -248,6 +250,11 @@ jobs:
                         # and Forgejo rejects the duplicate package file (409).
                         if [ "\${TARGET}" = "linux-x64" ]; then
                           curl -sSf -X PUT -H "Authorization: token \${FORGEJO_TOKEN}" -T /out/install.sh "\${REGISTRY_BASE}/install.sh"
+                          # Same release id as the linux archives. Finalize
+                          # refuses to promote unless both darwin archives
+                          # uploaded by this step verify.
+                          export VERSION BUILD_ABI NODE_VERSION
+                          bash rt-build/package-darwin-cross.sh
                         fi
                         echo "PUBLISHED \${NAME}.tar.gz sha=\${SHA} size=\${SIZE}"
                     volumeMounts:
@@ -348,7 +355,7 @@ jobs:
               shizuha.io/source-sha: "${SHORT}"
           spec:
             backoffLimit: 0
-            activeDeadlineSeconds: 300
+            activeDeadlineSeconds: 900
             ttlSecondsAfterFinished: 1800
             template:
               spec:
@@ -372,7 +379,7 @@ jobs:
                         LATEST="\${ROOT}/latest"
                         AUTH="Authorization: token \${FORGEJO_TOKEN}"
                         tmp="\$(mktemp -d)"
-                        for platform in linux-x64 linux-arm64; do
+                        for platform in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
                           curl -fsS -H "\${AUTH}" "\${STAGE}/\${platform}.json" -o "\${tmp}/\${platform}.json"
                           test "\$(jq -r .sourceSha "\${tmp}/\${platform}.json")" = "\${CI_SOURCE_SHA}"
                           artifact="\$(basename "\$(jq -r .url "\${tmp}/\${platform}.json")")"
@@ -380,12 +387,16 @@ jobs:
                           echo "\$(jq -r .sha256 "\${tmp}/\${platform}.json")  \${tmp}/\${artifact}" | sha256sum -c -
                         done
                         test "\$(jq -r .version "\${tmp}/linux-x64.json")" = "\$(jq -r .version "\${tmp}/linux-arm64.json")"
+                        test "\$(jq -r .version "\${tmp}/linux-x64.json")" = "\$(jq -r .version "\${tmp}/darwin-arm64.json")"
+                        test "\$(jq -r .version "\${tmp}/linux-x64.json")" = "\$(jq -r .version "\${tmp}/darwin-x64.json")"
                         curl -fsS -H "\${AUTH}" "\${STAGE}/install.sh" -o "\${tmp}/install.sh"
                         jq -n \
                           --arg releaseId "\${RELEASE_ID}" \
                           --arg sourceSha "\${CI_SOURCE_SHA}" \
                           --slurpfile x64 "\${tmp}/linux-x64.json" \
                           --slurpfile arm64 "\${tmp}/linux-arm64.json" \
+                          --slurpfile darwinArm64 "\${tmp}/darwin-arm64.json" \
+                          --slurpfile darwinX64 "\${tmp}/darwin-x64.json" \
                           '{
                             schemaVersion: 1,
                           releaseId: \$releaseId,
@@ -394,10 +405,12 @@ jobs:
                           publishedAt: \$x64[0].publishedAt,
                           platforms: {
                             "linux-x64": \$x64[0],
-                            "linux-arm64": \$arm64[0]
+                            "linux-arm64": \$arm64[0],
+                            "darwin-arm64": \$darwinArm64[0],
+                            "darwin-x64": \$darwinX64[0]
                           }
                           }' > "\${tmp}/release.json"
-                        for platform in linux-x64 linux-arm64; do
+                        for platform in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
                           artifact="\$(basename "\$(jq -r .url "\${tmp}/\${platform}.json")")"
                           for file in "\${artifact}" "\${platform}.json"; do
                             curl -sS -X DELETE -H "\${AUTH}" "\${LATEST}/\${file}" >/dev/null || true
@@ -492,9 +505,7 @@ jobs:
           exit 0
 
 
-  # Phase 2 (SCLI-126): macOS/darwin build on the Mac host (`ssh shizuha-mb@v4`)
-  # needs MAC_SSH_KEY + v4 Tailscale reachability. The previous `build-darwin`
-  # job stub used `if: false`, which under Forgejo Actions lands as `pending`
-  # and marks the whole publish run `failure` even when linux publish succeeds
-  # (SCLI-364 / recurring on-call pages). Do not re-add a disabled stub job —
-  # restore a real darwin job only when Phase 2 is wired end-to-end.
+  # darwin-arm64 and darwin-x64 are cross-packaged by the linux-x64 job
+  # (rt-build/package-darwin-cross.sh) into the same release.json. Do not
+  # re-add a disabled `build-darwin` stub: Forgejo Actions treats `if: false`
+  # as pending and fails the whole publish run (SCLI-364).

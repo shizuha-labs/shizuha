@@ -1337,7 +1337,9 @@ describe('AgentSession', () => {
           toolCalls: [],
           toolResults: [],
           inputTokens: 10,
-          outputTokens: 5,
+          // A full requested budget (32768) is a finished think, not the
+          // 256-token provider floor. That short stop continues.
+          outputTokens: 32768,
           stopReason: 'max_tokens',
         })) as typeof turnModule.executeTurn)
         .mockImplementationOnce((async () => ({
@@ -1403,6 +1405,103 @@ describe('AgentSession', () => {
         } else {
           process.env['HOME'] = previousHome;
         }
+        await fs.rm(tempHome, { recursive: true, force: true });
+      }
+    });
+
+    it('continues after a tool result when the next completion is a 256-token reasoning stop', async () => {
+      // shizuha2 e81682dd 2026-09-23: the edit result was fed back, Cortex
+      // forwarded 256 of the requested 32768, and the TUI ended the turn on
+      // the hidden reasoning. The answer has to come out on the next sample.
+      const previousHome = process.env['HOME'];
+      const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'shizuha-session-short-length-'));
+      process.env['HOME'] = tempHome;
+      let resumed: AgentSession | null = null;
+      let ensureProviderSpy:
+        | ReturnType<typeof vi.spyOn<{
+          ensureProvider: () => unknown;
+        }, 'ensureProvider'>>
+        | null = null;
+      const executeTurnSpy = vi.spyOn(turnModule, 'executeTurn')
+        .mockImplementationOnce((async () => ({
+          assistantMessage: {
+            role: 'assistant',
+            content: [{
+              type: 'tool_use',
+              id: 'call-edit',
+              name: 'edit',
+              input: { file_path: '/tmp/base.html' },
+            }],
+            timestamp: Date.now(),
+          },
+          toolCalls: [{ id: 'call-edit', name: 'edit', input: { file_path: '/tmp/base.html' } }],
+          toolResults: [{
+            toolUseId: 'call-edit',
+            content: 'The file /tmp/base.html has been edited.',
+            isError: false,
+          }],
+          inputTokens: 1000,
+          outputTokens: 155,
+          stopReason: 'tool_use',
+        })) as typeof turnModule.executeTurn)
+        .mockImplementationOnce((async () => ({
+          assistantMessage: {
+            role: 'assistant',
+            content: [{
+              type: 'reasoning',
+              id: 'r-floor',
+              rawContent: 'CSS fix + favicon done. Now the architecture piece.',
+            }],
+            timestamp: Date.now(),
+          },
+          toolCalls: [],
+          toolResults: [],
+          inputTokens: 1100,
+          outputTokens: 256,
+          stopReason: 'max_tokens',
+        })) as typeof turnModule.executeTurn)
+        .mockImplementationOnce((async () => ({
+          assistantMessage: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'STATIC_URL now carries the /guild prefix.' }],
+            timestamp: Date.now(),
+          },
+          toolCalls: [],
+          toolResults: [],
+          inputTokens: 1200,
+          outputTokens: 40,
+          stopReason: 'end_turn',
+        })) as typeof turnModule.executeTurn);
+      try {
+        await session.init(process.cwd(), 'GLM-5.3-Flash', 'autonomous');
+        ensureProviderSpy = vi.spyOn(
+          session as unknown as { ensureProvider: () => unknown },
+          'ensureProvider',
+        ).mockReturnValue({});
+        const events: AgentEvent[] = [];
+        session.on('agent_event', (e: AgentEvent) => events.push(e));
+        await session.submitPrompt('fix the guild static urls');
+        expect(executeTurnSpy).toHaveBeenCalledTimes(3);
+        expect(events.some((e) => e.type === 'error' && /output-token limit/.test(e.error))).toBe(false);
+        expect(events.some((e) => e.type === 'complete')).toBe(true);
+
+        resumed = new AgentSession();
+        await resumed.init(process.cwd(), 'GLM-5.3-Flash', 'autonomous');
+        let resumedSession: { messages: Array<{ role: string; content: unknown }> } | null = null;
+        resumed.on('session_resumed', (payload) => {
+          resumedSession = payload as typeof resumedSession;
+        });
+        expect(await resumed.resumeSession(session.currentSessionId!)).toBe(true);
+        const blob = JSON.stringify(resumedSession!.messages);
+        expect(blob).toContain('STATIC_URL now carries the /guild prefix.');
+        expect(blob).not.toContain('response was cut off');
+        expect(blob).not.toContain('Your previous response was not visible');
+      } finally {
+        ensureProviderSpy?.mockRestore();
+        executeTurnSpy.mockRestore();
+        if (resumed) await resumed.destroy();
+        if (previousHome == null) delete process.env['HOME'];
+        else process.env['HOME'] = previousHome;
         await fs.rm(tempHome, { recursive: true, force: true });
       }
     });

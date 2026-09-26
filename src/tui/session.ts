@@ -45,7 +45,7 @@ import {
   reasoningTextFromContent,
   visibleTextFromContent,
 } from '../agent/content.js';
-import { incompleteTurnError } from '../agent/incomplete-turn.js';
+import { incompleteTurnError, MAX_LENGTH_CONTINUATIONS, shouldContinueAutonomousMaxTokens } from '../agent/incomplete-turn.js';
 import {
   DEGENERACY_RECOVERY_PROMPT,
   detectOutputDegeneracy,
@@ -1525,8 +1525,9 @@ export class AgentSession extends EventEmitter {
 
     // Continuation logic:
     // - Has tool_use → execute tools, continue
-    // - max_tokens / transport salvage → explicit incomplete terminal, no replay
-    // - No tool_use (text-only or reasoning-only) → STOP immediately
+    // - max_tokens with partial text → extend the same prefix until a real stop
+    // - transport salvage → incomplete terminal, no replay (cancel may still be in flight)
+    // - No tool_use and a real EOS → stop
     const MAX_TRUNCATION_RECOVERY = 3;
     const MAX_EMPTY_TOOL_RESULT_RECOVERY = 1;
     const MAX_NON_THINKING_REASONING_RECOVERY = 1;
@@ -2237,10 +2238,52 @@ export class AgentSession extends EventEmitter {
           }
         }
 
-        // Continuation: incomplete provider terminals are visible failures and
-        // are never replayed automatically after partial output.
+        // Length is a budget, not <|user|> / a finished tool call / EOS.
+        // shizuha2 e81682dd stopped mid-list on this branch. Extend the
+        // persisted prefix; do not surface the incomplete-turn error yet.
         if (result.toolCalls.length === 0) {
-          const incompleteError = incompleteTurnError(result.stopReason);
+          const lengthReasoningText = reasoningTextFromContent(result.assistantMessage.content);
+          const lengthAssistantText = visibleTextFromContent(result.assistantMessage.content);
+          // A cut-off visible answer is a length budget. Reasoning-only output
+          // that consumed the requested budget is persisted CoT. Reasoning-only
+          // output far below that budget is the provider floor (shizuha2
+          // 2026-09-23: Cortex forwarded 256 of a 32768 request after a tool
+          // result). Continue that one from the persisted prefix.
+          const reasoningOnlyLengthStop = lengthReasoningText.trim().length > 0
+            && lengthAssistantText.trim().length === 0
+            && (result.stopReason === 'max_tokens' || result.stopReason === 'stall_salvage');
+          const recoverableShortLength = reasoningOnlyLengthStop
+            && result.outputTokens > 0
+            && result.outputTokens < maxOutputTokens
+            && this._mode !== 'plan';
+          if ((!reasoningOnlyLengthStop || recoverableShortLength) && shouldContinueAutonomousMaxTokens({
+            stopReason: result.stopReason,
+            permissionMode: this._mode,
+            reasoningText: lengthReasoningText,
+            assistantText: lengthAssistantText,
+            recoveryCount: truncationRecoveryCount,
+            maxRecovery: MAX_LENGTH_CONTINUATIONS,
+            outputTokens: result.outputTokens,
+          })) {
+            truncationRecoveryCount++;
+            logger.warn(
+              {
+                turnIndex,
+                attempt: truncationRecoveryCount,
+                outputTokens: result.outputTokens,
+                requestedMaxOutputTokens: maxOutputTokens,
+                stopReason: result.stopReason,
+                sessionId: this.sessionId,
+              },
+              recoverableShortLength
+                ? 'TUI: length stop below the requested output budget — continuing from persisted prefix'
+                : 'TUI: output budget ended before a terminal sentinel — continuing from persisted prefix',
+            );
+            continue;
+          }
+          const incompleteError = reasoningOnlyLengthStop && !recoverableShortLength
+            ? null
+            : incompleteTurnError(result.stopReason);
           if (incompleteError) {
             hadError = true;
             lastFailureMessage = incompleteError;
@@ -2313,11 +2356,21 @@ export class AgentSession extends EventEmitter {
                 // from that prefix. Do not inject a "you left off" user lecture
                 // (operator 2026-09-10) — that is the policy layer and it also
                 // hits hasRecentToolResult below with a misleading continue prompt.
-                logger.info({ turnIndex, reasoningLen: reasoningStr.length, stopReason: result.stopReason }, 'TUI: reasoning-only stop; continuing generation');
                 if (result.stopReason === 'max_tokens' || result.stopReason === 'stall_salvage') {
+                  logger.info(
+                    {
+                      turnIndex,
+                      reasoningLen: reasoningStr.length,
+                      stopReason: result.stopReason,
+                      outputTokens: result.outputTokens,
+                      requestedMaxOutputTokens: maxOutputTokens,
+                    },
+                    'TUI: reasoning-only output cap reached; keeping the persisted reasoning',
+                  );
                   if (this.drainQueuedInput()) continue;
                   break;
                 }
+                logger.info({ turnIndex, reasoningLen: reasoningStr.length, stopReason: result.stopReason }, 'TUI: reasoning-only stop; continuing generation');
                 // shizuha2 2026-09-19: GLM repetition_detected think-loop
                 // (`g/g/g/g` path mash). Continuing from that prefix re-fed the
                 // garbled CoT and the next tool_use copied it. Stop the loop.

@@ -446,6 +446,52 @@ function visionImageUrlPart(mediaType: string, base64: string): VLlmContentPart 
   return { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } };
 }
 
+/** Cortex GLM vision rejects more than this many images in one prompt. */
+export const VLLM_MAX_IMAGES_PER_PROMPT = 4;
+
+const OMITTED_IMAGE_NOTE =
+  '[Earlier screenshot omitted: this model accepts at most 4 images in one prompt.]';
+
+function isDataImagePart(part: unknown): boolean {
+  return Boolean(
+    part && typeof part === 'object'
+    && (part as { type?: string }).type === 'image_url'
+    && String((part as { image_url?: { url?: string } }).image_url?.url ?? '').startsWith('data:'),
+  );
+}
+
+/**
+ * Keep the newest images and replace older ones with a text note.
+ * The stored transcript is not involved — this only shapes the outbound payload.
+ */
+export function capVisionImagesPerPrompt(
+  messages: VLlmMessage[],
+  maxImages = VLLM_MAX_IMAGES_PER_PROMPT,
+): { messages: VLlmMessage[]; dropped: number } {
+  const found: Array<{ messageIndex: number; partIndex: number }> = [];
+  messages.forEach((message, messageIndex) => {
+    if (!Array.isArray(message.content)) return;
+    message.content.forEach((part, partIndex) => {
+      if (isDataImagePart(part)) found.push({ messageIndex, partIndex });
+    });
+  });
+  if (found.length <= maxImages) return { messages, dropped: 0 };
+  const drop = new Set(
+    found.slice(0, found.length - maxImages).map(({ messageIndex, partIndex }) => `${messageIndex}:${partIndex}`),
+  );
+  const next = messages.map((message, messageIndex) => {
+    if (!Array.isArray(message.content)) return message;
+    let changed = false;
+    const content = message.content.map((part, partIndex) => {
+      if (!drop.has(`${messageIndex}:${partIndex}`)) return part;
+      changed = true;
+      return { type: 'text' as const, text: OMITTED_IMAGE_NOTE };
+    });
+    return changed ? { ...message, content } : message;
+  });
+  return { messages: next, dropped: drop.size };
+}
+
 /** Count data-URI image parts without treating base64 as text tokens. */
 export function countVisionImageParts(messages: VLlmMessage[]): number {
   let n = 0;
@@ -1423,6 +1469,16 @@ export class VLlmProvider implements LLMProvider {
         const ackMsg: VLlmMessage = { role: 'assistant', content: 'Understood.' };
         vMessages.splice(userIdx, 0, contextMsg, ackMsg);
       }
+    }
+
+    const cappedImages = capVisionImagesPerPrompt(vMessages);
+    if (cappedImages.dropped > 0) {
+      logger.warn({
+        dropped: cappedImages.dropped,
+        kept: VLLM_MAX_IMAGES_PER_PROMPT,
+        model,
+      }, `${this.logLabel}: omitted older screenshots so the prompt stays within the vision image cap`);
+      vMessages = cappedImages.messages;
     }
 
     // Also cap max_tokens to match what the model expects.
@@ -3698,6 +3754,8 @@ export class VLlmProvider implements LLMProvider {
               && !accReasoning.trim()
               && !accContent.trim()
               && toolCallBuilders.size === 0
+              && !everBuiltToolCall
+              && !sawStreamedToolCall
               && !recoveredLeakedToolCall
             ) {
               logger.warn(

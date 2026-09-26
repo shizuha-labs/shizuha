@@ -1,0 +1,78 @@
+name: qualify-agent-runtime
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact original runtime source commit
+        required: true
+      build_run_id:
+        description: Original Origin build-agent-runtime run ID
+        required: true
+      index_digest:
+        description: Existing sha256 multi-architecture index digest
+        required: true
+concurrency:
+  group: build-agent-runtime
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: deploy-lane
+    timeout-minutes: 55
+    steps:
+      - name: Require canonical primary-branch manual qualification
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = shizuha-labs/shizuha
+          test "$REF" = refs/heads/master
+          test "$EVENT_NAME" = workflow_dispatch
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned kubectl and CI cluster access
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          case "$(uname -m)" in
+            x86_64) ARCH=amd64; SHA256=7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3 ;;
+            aarch64) ARCH=arm64; SHA256=420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450 ;;
+            *) echo "Unsupported runner architecture" >&2; exit 1 ;;
+          esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${ARCH}"
+          echo "${SHA256}  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Verify original provenance and re-run native qualification
+        env:
+          RUNTIME_SOURCE_SHA: ${{ github.event.inputs.source_sha }}
+          ORIGINAL_BUILD_RUN_ID: ${{ github.event.inputs.build_run_id }}
+          RUNTIME_INDEX_DIGEST: ${{ github.event.inputs.index_digest }}
+          QUALIFICATION_SOURCE_SHA: ${{ github.sha }}
+          QUALIFICATION_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qualify_agent_runtime.py \
+            --source-sha "$RUNTIME_SOURCE_SHA" \
+            --workflow-sha "$QUALIFICATION_SOURCE_SHA" \
+            --build-run-id "$ORIGINAL_BUILD_RUN_ID" \
+            --qualification-run-id "$QUALIFICATION_RUN_ID" \
+            --index-digest "$RUNTIME_INDEX_DIGEST" \
+            --source-directory "$RUNNER_TEMP/runtime-qualification-source" \
+            --receipt "$RUNNER_TEMP/runtime-qualification.json"
+      - name: Retain qualification result
+        if: always()
+        uses: actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf
+        with:
+          name: runtime-qualification
+          path: ${{ runner.temp }}/runtime-qualification.json
+          if-no-files-found: warn
+          retention-days: 90

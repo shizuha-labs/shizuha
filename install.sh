@@ -33,9 +33,14 @@ Options:
   -v, --version      Print the installer version and exit.
 
 Environment variables:
-  SHIZUHA_DIR        Install directory (default: $HOME/.shizuha)
-  BIN_DIR            Binary install directory (default: $HOME/.local/bin)
-  SHIZUHA_BUILDS_URL Release manifest base (default: https://shizuha.com/builds/releases)
+  SHIZUHA_DIR          Install directory (default: $HOME/.shizuha)
+  BIN_DIR              Binary install directory (default: $HOME/.local/bin)
+  SHIZUHA_BUILDS_URL   Release manifest base (default: https://shizuha.com/builds/releases)
+  SHIZUHA_SKIP_DAEMON  Set to 1 to build and install without starting the daemon
+
+Source builds (./install.sh inside a git clone) support linux-x64, linux-arm64,
+darwin-x64, and darwin-arm64. Node.js 22 is downloaded for that architecture
+when it is missing.
 
 Examples:
   curl -fsSL https://shizuha.com/install.sh | bash
@@ -174,50 +179,88 @@ esac
 TARGET="${PLATFORM}-${ARCH_NAME}"
 ok "Platform: ${TARGET}${IS_TERMUX:+ (Termux)}"
 
+# Official Node builds. The names match TARGET for every architecture the
+# public repo supports: linux-x64, linux-arm64, darwin-x64, darwin-arm64.
+NODE_DIST_VERSION="22.14.0"
+
+sha256_file() {
+  if command -v sha256sum &>/dev/null; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+same_path() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; raise SystemExit(0 if os.path.realpath(sys.argv[1])==os.path.realpath(sys.argv[2]) else 1)' "$1" "$2"
+    return
+  fi
+  [ "$1" = "$2" ]
+}
+
 # ── Ensure Node.js ──────────────────────────────────────────────────────
-ensure_node() {
-  if command -v node &>/dev/null; then
-    local ver
-    ver=$(node --version 2>/dev/null || echo "unknown")
-    ok "Node.js $ver found"
-    return 0
-  fi
-
-  if [ "$IS_TERMUX" = true ]; then
-    info "Installing Node.js via pkg..."
-    pkg install -y nodejs || { err "Failed to install Node.js. Run: pkg install nodejs"; exit 1; }
-    return 0
-  fi
-
-  # Auto-install Node.js 22 via NodeSource
-  step "Installing Node.js 22..."
-  if [ "$PLATFORM" = "linux" ]; then
-    if command -v curl &>/dev/null; then
-      curl_shizuha -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - 2>/dev/null
-      sudo apt-get install -y nodejs 2>/dev/null || {
-        err "Failed to install Node.js. Install manually: https://nodejs.org"
-        exit 1
-      }
-    else
-      err "Node.js not found and curl not available for auto-install."
-      err "Install Node.js 22+: https://nodejs.org"
+# Source builds need a Node 22+ that matches this machine. Download the
+# official tarball into the install prefix when the system node is missing
+# or too old. No sudo, no Homebrew, no distro package manager.
+install_official_node() {
+  case "$TARGET" in
+    linux-x64|linux-arm64|darwin-x64|darwin-arm64) ;;
+    *)
+      err "No official Node.js build for ${TARGET}."
+      err "Supported source-build architectures: linux-x64, linux-arm64, darwin-x64, darwin-arm64."
       exit 1
-    fi
-  elif [ "$PLATFORM" = "darwin" ]; then
-    if command -v brew &>/dev/null; then
-      brew install node@22 || { err "brew install node failed"; exit 1; }
-    else
-      err "Node.js not found. Install via: brew install node@22"
-      err "Or download from: https://nodejs.org"
-      exit 1
-    fi
-  fi
-
-  if ! command -v node &>/dev/null; then
-    err "Node.js installation failed. Install manually: https://nodejs.org"
+      ;;
+  esac
+  local tarname url tmp dest want got
+  tarname="node-v${NODE_DIST_VERSION}-${TARGET}.tar.xz"
+  url="https://nodejs.org/dist/v${NODE_DIST_VERSION}/${tarname}"
+  dest="$SHIZUHA_DIR/node-v${NODE_DIST_VERSION}"
+  step "Installing Node.js ${NODE_DIST_VERSION} (${TARGET})..."
+  mkdir -p "$SHIZUHA_DIR"
+  tmp="$(mktemp -d)"
+  curl_shizuha -fSL "$url" -o "$tmp/$tarname"
+  curl_shizuha -fsSL "https://nodejs.org/dist/v${NODE_DIST_VERSION}/SHASUMS256.txt" -o "$tmp/SHASUMS256.txt"
+  want="$(awk -v n="$tarname" '$2==n {print $1}' "$tmp/SHASUMS256.txt")"
+  got="$(sha256_file "$tmp/$tarname")"
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    err "Node.js checksum mismatch for ${tarname}."
+    err "  Expected: ${want:-<missing>}"
+    err "  Got:      $got"
+    rm -rf "$tmp"
     exit 1
   fi
-  ok "Node.js $(node --version) installed"
+  tar -xJf "$tmp/$tarname" -C "$tmp"
+  rm -rf "$dest"
+  mv "$tmp/node-v${NODE_DIST_VERSION}-${TARGET}" "$dest"
+  rm -rf "$tmp"
+  export PATH="$dest/bin:$PATH"
+  hash -r 2>/dev/null || true
+  ok "Node.js $(node --version) ready for ${TARGET}"
+}
+
+ensure_node() {
+  if [ "$IS_TERMUX" = true ]; then
+    if ! command -v node &>/dev/null; then
+      info "Installing Node.js via pkg..."
+      pkg install -y nodejs || { err "Failed to install Node.js. Run: pkg install nodejs"; exit 1; }
+    fi
+    ok "Node.js $(node --version) found"
+    return 0
+  fi
+
+  if command -v node &>/dev/null; then
+    local major
+    major="$(node -p 'parseInt(process.versions.node, 10)' 2>/dev/null || echo 0)"
+    if [ "${major:-0}" -ge 22 ]; then
+      ok "Node.js $(node --version) found"
+      return 0
+    fi
+    warn "Node.js $(node --version) is older than 22. Downloading Node.js ${NODE_DIST_VERSION} for ${TARGET}."
+  else
+    info "Node.js not found. Downloading Node.js ${NODE_DIST_VERSION} for ${TARGET}."
+  fi
+  install_official_node
 }
 
 # ════════════════════════════════════════════════════════════════════════
@@ -228,14 +271,16 @@ install_from_source() {
 
   ensure_node
 
-  # Install dependencies
+  # Install dependencies. Skip the Playwright browser download; the CLI
+  # does not need it for a source build, and the download is platform-specific.
   step "Installing dependencies..."
-  (cd "$SOURCE_DIR" && npm install --production=false 2>&1 | tail -3)
+  export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD="${PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD:-1}"
+  (cd "$SOURCE_DIR" && npm install --no-audit --no-fund)
   ok "Dependencies installed"
 
   # Build
   step "Building..."
-  (cd "$SOURCE_DIR" && npm run build 2>&1 | tail -5)
+  (cd "$SOURCE_DIR" && npm run build)
   ok "Build complete"
 
   # Install to ~/.shizuha/lib/
@@ -248,7 +293,7 @@ install_from_source() {
   local dist_entry dist_dest
   for dist_entry in "$SOURCE_DIR/dist/"*; do
     dist_dest="$SHIZUHA_DIR/lib/$(basename "$dist_entry")"
-    if [ -e "$dist_dest" ] && [ "$(readlink -f "$dist_entry")" = "$(readlink -f "$dist_dest")" ]; then
+    if [ -e "$dist_dest" ] && same_path "$dist_entry" "$dist_dest"; then
       continue
     fi
     rm -rf "$dist_dest"
@@ -281,6 +326,18 @@ install_from_source() {
   cat > "$SHIZUHA_DIR/bin/shizuha" << 'WRAPPER'
 #!/usr/bin/env bash
 SHIZUHA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Prefer the Node build this installer downloaded for the machine. A source
+# build must run when the user has no system node on PATH.
+NODE_BIN=""
+for candidate in "$SHIZUHA_ROOT"/node-v*/bin/node; do
+  if [ -x "$candidate" ]; then
+    NODE_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$NODE_BIN" ]; then
+  NODE_BIN="node"
+fi
 # SCLI heap: V8 defaults to a ~4GB old-space cap regardless of host RAM, which
 # killed deep interactive/TUI sessions (2026-08-07 OOM at 3.8GB on a 499GB
 # host mid-session). `v8.setFlagsFromString` cannot move it after startup; only
@@ -289,7 +346,7 @@ SHIZUHA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -z "${NODE_OPTIONS:-}" ]; then
   export NODE_OPTIONS="--max-old-space-size=${SHIZUHA_NODE_HEAP_MB:-12288}"
 fi
-node "$SHIZUHA_ROOT/lib/shizuha.js" "$@"
+"$NODE_BIN" "$SHIZUHA_ROOT/lib/shizuha.js" "$@"
 SCLI_EXIT=$?
 # Hard-crash recovery hint: a V8 OOM abort (or any crash) bypasses JS handlers,
 # so the TUI can't print its own "Resume with" line. The TUI persists the active
@@ -313,7 +370,17 @@ WRAPPER
   echo "source" > "$SHIZUHA_DIR/INSTALL_MODE"
 
   VERSION="$src_version"
-  ok "Installed to $SHIZUHA_DIR"
+
+  # The bundle externalizes better-sqlite3. Prove the native addon for THIS
+  # architecture loads before telling the user the build succeeded.
+  if ! (cd "$SHIZUHA_DIR/lib" && node -e 'const db=require("better-sqlite3")(":memory:"); if (db.prepare("select 1 as ok").get().ok!==1) process.exit(1);'); then
+    err "Source build installed, but better-sqlite3 did not load on ${TARGET}."
+    err "Install a C toolchain and rerun ./install.sh:"
+    err "  Linux:  sudo apt-get install -y build-essential python3"
+    err "  macOS:  xcode-select --install"
+    exit 1
+  fi
+  ok "Installed to $SHIZUHA_DIR (${TARGET}, better-sqlite3 loads)"
 }
 
 # ════════════════════════════════════════════════════════════════════════
@@ -335,7 +402,10 @@ install_from_binary() {
     step "Checking latest version..."
     MANIFEST_URL="${BUILDS_URL}/latest.json"
     MANIFEST_FILE="$TMPDIR_DL/latest.json"
-    if ! curl_shizuha -fsSL "$MANIFEST_URL" -o "$MANIFEST_FILE" 2>/dev/null; then
+    # no-cache: curl itself does not store this, and any cache that honors
+    # the request header must revalidate. The release nginx also does not
+    # cache latest.json.
+    if ! curl_shizuha -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" "$MANIFEST_URL" -o "$MANIFEST_FILE" 2>/dev/null; then
       if [ "${SHIZUHA_ALLOW_INSTALL_FALLBACK:-0}" = "1" ]; then
         VERSION="$FALLBACK_VERSION"
         DOWNLOAD_URL="${BUILDS_URL}/shizuha-${VERSION}-${TARGET}.tar.gz"
@@ -389,7 +459,7 @@ install_from_binary() {
     err "Available platforms: linux-x64, linux-arm64, darwin-x64, darwin-arm64"
     err ""
     err "Alternative: install from source:"
-    err "  git clone https://github.com/shizuha-labs/shizuha-beta && cd shizuha-beta && ./install.sh"
+    err "  git clone https://github.com/shizuha-labs/shizuha && cd shizuha && ./install.sh"
     exit 1
   fi
 
@@ -551,11 +621,16 @@ else
 fi
 
 # ── Start daemon ────────────────────────────────────────────────────────
-step "Starting daemon..."
-shizuha down 2>/dev/null || true
 DAEMON_STARTED=false
-if shizuha up 2>/dev/null; then
-  DAEMON_STARTED=true
+if [ "${SHIZUHA_SKIP_DAEMON:-0}" = "1" ]; then
+  step "Skipping daemon start..."
+  info "SHIZUHA_SKIP_DAEMON=1 — the CLI is installed; start it later with: shizuha up"
+else
+  step "Starting daemon..."
+  shizuha down 2>/dev/null || true
+  if shizuha up 2>/dev/null; then
+    DAEMON_STARTED=true
+  fi
 fi
 
 # ── Done ────────────────────────────────────────────────────────────────

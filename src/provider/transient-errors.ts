@@ -259,6 +259,17 @@ export function isTransientProviderFailure(input: {
     return false;
   }
 
+  // Cortex/vLLM 400: the prompt itself has more images than the model allows.
+  // "Cortex stream error:" is the wrapper, not a dropped stream. Retrying
+  // sends the same images again (shizuha2, GLM limit 4, 2026-09-23).
+  if (
+    /at most \d+ image/i.test(blob)
+    || /parameter=image/i.test(blob)
+    || (input.status === 400 && /image\(s\) may be provided/i.test(blob))
+  ) {
+    return false;
+  }
+
   // SCLI-384: invalid provider/model is never a transient upstream blip.
   if (isInvalidModelOrProviderFailure(input)) {
     return false;

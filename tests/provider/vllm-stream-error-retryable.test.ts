@@ -123,6 +123,14 @@ describe('VLlmProvider Cortex SSE stream error retryability', () => {
     })).toBe(true);
   });
 
+  it('does not retry a 400 that the prompt has more images than the model allows', () => {
+    expect(isTransientProviderFailure({
+      message: 'Cortex stream error: At most 4 image(s) may be provided in one prompt. (parameter=image) (code: 400)',
+      status: 400,
+      retryable: true,
+    })).toBe(false);
+  });
+
   it('marks OpenAI server_error as retryable even without retryable flag', async () => {
     const caught = await throwFromStreamError({
       message:

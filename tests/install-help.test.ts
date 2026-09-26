@@ -18,6 +18,7 @@ describe('SCLI-586 install.sh --help', () => {
       expect(result.status).toBe(0);
       expect(result.stdout).toMatch(/Usage:/);
       expect(result.stdout).toMatch(/--help/);
+      expect(result.stdout).toMatch(/linux-x64, linux-arm64,\s+darwin-x64, and darwin-arm64/);
       expect(result.stdout).not.toMatch(/静葉/);
       expect(fs.readdirSync(tmpHome)).toEqual([]);
     } finally {

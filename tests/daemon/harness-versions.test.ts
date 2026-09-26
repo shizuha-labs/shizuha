@@ -206,9 +206,22 @@ printf 'gemini 0.50.0\n'
     expect(workflow).toContain('generic/scli-builds/${RELEASE_ID}');
     expect(workflow).toContain('consumers use release.json as the atomic commit marker');
     expect(workflow).toContain('if [ "\\${TARGET}" = "linux-x64" ]; then');
+    expect(workflow).toContain('bash rt-build/package-darwin-cross.sh');
     expect(workflow).not.toContain('for f in "\\${NAME}.tar.gz" "\\${TARGET}.json" "install.sh"');
     expect(workflow).toContain('releaseId: \\$releaseId');
     expect(workflow).toContain('"linux-arm64": \\$arm64[0]');
+    expect(workflow).toContain('"darwin-arm64": \\$darwinArm64[0]');
+    expect(workflow).toContain('"darwin-x64": \\$darwinX64[0]');
+    expect(workflow).toContain('for platform in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do');
+    const darwinPack = fs.readFileSync(
+      path.join(projectRoot, 'rt-build/package-darwin-cross.sh'),
+      'utf8',
+    );
+    expect(darwinPack).toContain('better-sqlite3-v${BSQL_VER}-node-v${BUILD_ABI}-${target}.tar.gz');
+    expect(darwinPack).toContain('package_one darwin-arm64 16777228');
+    expect(darwinPack).toContain('package_one darwin-x64 16777223');
+    expect(darwinPack).toContain('vec0.dylib');
+    expect(darwinPack).toContain('0xFEEDFACF');
     expect(workflow).not.toMatch(/(?<!\\)\\$releaseId/);
     expect(workflow).toContain('for file in install.sh release.json');
     expect(workflow).toContain('PROMOTED releaseId=\\${RELEASE_ID} sourceSha=\\${CI_SOURCE_SHA}');
@@ -256,7 +269,8 @@ printf 'gemini 0.50.0\n'
     const lock = fs.readFileSync(path.join(projectRoot, 'runtime-skills.lock'), 'utf8').trim();
     expect(lock).toMatch(/^[0-9a-f]{40}$/);
     expect(dockerfile).toContain('COPY .runtime-skills /opt/skills');
-    expect(dockerfile).toContain('[ "$skill_count" -ge 50 ]');
+    expect(dockerfile).toContain('ARG SKILLS_MIN_COUNT=50');
+    expect(dockerfile).toContain('[ "$skill_count" -ge "$SKILLS_MIN_COUNT" ]');
     expect(dockerfile).toContain('test ! -e /opt/skills/.git');
     expect(dockerfile).toContain('/opt/skills/${skill}/SKILL.md');
   });

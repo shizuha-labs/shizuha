@@ -11,7 +11,7 @@ import { shouldAnimateTUI } from '../utils/terminal.js';
 import { addAnthropicToken, setOpenAIKey, setGoogleKey, setCortexApiKey } from '../../config/credentials.js';
 import { formatTokenProgressStatus } from '../../utils/perf-metrics.js';
 import { DEFAULT_TUI_STALL_ESCALATION_MS, longWaitDisplayMs } from '../utils/stallDisplay.js';
-import { retryBannerClass } from '../retry-banner.js';
+import { retryBannerClass, withoutResolvedRetryBanners } from '../retry-banner.js';
 import {
   loginToShizuhaId,
   clearShizuhaAuth,
@@ -885,7 +885,11 @@ export function useAgentSession(
           // stalledMs but left that chrome up until executeTurn completed —
           // so a working bash turn still showed "API error (429) … stalled 27s"
           // (shizuha1, 2026-09-16). Always drop it on the first real token/tool.
+          // shizuha2 2026-09-23: the live notice cleared, but each ↻ line had
+          // already been committed between partial answers and stayed in the
+          // viewport after ECONNREFUSED recovered.
           setError(null);
+          setCompletedEntries((prev) => withoutResolvedRetryBanners(prev));
         }
         if (
           isProviderRecoverySignal(event)

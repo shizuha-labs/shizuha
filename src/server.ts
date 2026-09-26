@@ -23,10 +23,9 @@ import {
 import { checkRateLimit, recordFailure, resetFailures } from './devices/rateLimit.js';
 import {
   incompleteTurnError,
-  MAX_THINKING_ONLY_RECOVERY,
   shouldContinueAutonomousMaxTokens,
 } from './agent/incomplete-turn.js';
-import { reasoningTextFromContent } from './agent/content.js';
+import { reasoningTextFromContent, visibleTextFromContent } from './agent/content.js';
 
 interface QueryRequest {
   prompt: string;
@@ -429,8 +428,8 @@ export async function startServer(port = 8015, host = '0.0.0.0'): Promise<void> 
             stopReason: result.stopReason,
             permissionMode: config.permissionMode,
             reasoningText: reasoningTextFromContent(result.assistantMessage.content),
+            assistantText: visibleTextFromContent(result.assistantMessage.content),
             recoveryCount: thinkingOnlyRecoveryCount,
-            maxRecovery: MAX_THINKING_ONLY_RECOVERY,
             outputTokens: result.outputTokens,
           })) {
             thinkingOnlyRecoveryCount++;

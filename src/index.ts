@@ -43,10 +43,9 @@ import {
 import { preflightMcpServersOrExit } from './cli/mcp-preflight.js';
 import {
   incompleteTurnError,
-  MAX_THINKING_ONLY_RECOVERY,
   shouldContinueAutonomousMaxTokens,
 } from './agent/incomplete-turn.js';
-import { reasoningTextFromContent } from './agent/content.js';
+import { reasoningTextFromContent, visibleTextFromContent } from './agent/content.js';
 import { versionQueryError } from './cli/version-query.js';
 
 // Keep CLI output clean from Node runtime deprecation warnings.
@@ -3448,14 +3447,14 @@ async function* runAgentWithPrompt(
           stopReason: result.stopReason,
           permissionMode,
           reasoningText: reasoningTextFromContent(result.assistantMessage.content),
+          assistantText: visibleTextFromContent(result.assistantMessage.content),
           recoveryCount: thinkingOnlyRecoveryCount,
-          maxRecovery: MAX_THINKING_ONLY_RECOVERY,
           outputTokens: result.outputTokens,
         })) {
           thinkingOnlyRecoveryCount++;
           logger.warn(
             { turnIndex, attempt: thinkingOnlyRecoveryCount, outputTokens: result.outputTokens, stopReason: result.stopReason },
-            'SCLI: max_tokens hit on a thinking-only autonomous turn — continuing from persisted prefix (no Continue lecture)',
+            'SCLI: output budget ended before a terminal sentinel — continuing from persisted prefix',
           );
           continue;
         }

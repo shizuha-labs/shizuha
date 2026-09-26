@@ -19,6 +19,7 @@ describe('exec/android/server share the autonomous max_tokens continue helper', 
     'src/android-entry.ts',
     'src/server.ts',
     'src/agent/loop.ts',
+    'src/tui/session.ts',
   ];
 
   it('imports shouldContinueAutonomousMaxTokens in every agent loop', () => {
