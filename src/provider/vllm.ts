@@ -1126,8 +1126,12 @@ export class VLlmProvider implements LLMProvider {
    * short-lived (~1h) and get refreshed into auth.json by startShizuhaAuthAutoRefresh,
    * but a frozen constructor key kept serving the expired JWT (401 Signature has
    * expired) after earlier turns worked (operator 2026-07-23).
+   * The resolver may be async: the Cortex resolver awaits an on-demand token
+   * refresh when the sync read refuses the login JWT (pre-expiry skew window),
+   * so a request is never sent with NO Authorization header while a refreshable
+   * login session exists.
    */
-  private apiKeyOrResolver: string | (() => string | undefined) | undefined;
+  private apiKeyOrResolver: string | (() => string | undefined | Promise<string | undefined>) | undefined;
   /**
    * Optional force-refresh callback. When set, called on 401 "Signature has
    * expired" to force a token refresh (the server-side RS256 signing key may
@@ -1160,7 +1164,7 @@ export class VLlmProvider implements LLMProvider {
   constructor(
     baseUrl?: string,
     contextWindow?: number,
-    apiKey?: string | (() => string | undefined),
+    apiKey?: string | (() => string | undefined | Promise<string | undefined>),
     providerName = 'vllm',
     forceRefreshKey?: () => Promise<string | undefined>,
   ) {
@@ -1178,12 +1182,15 @@ export class VLlmProvider implements LLMProvider {
     this.forceRefreshKey = forceRefreshKey;
   }
 
-  /** Resolve auth for this request (re-reads JWT/API key when a resolver is set). */
-  private resolveApiKey(): string | undefined {
+  /** Await-capable auth resolution. An async resolver (Cortex) may refresh the
+   *  login JWT on demand; both header-building sites must await it so the
+   *  Authorization header is present on the FIRST attempt, not only after a
+   *  401 retry. */
+  private async resolveApiKeyAsync(): Promise<string | undefined> {
     const v = this.apiKeyOrResolver;
     if (typeof v === 'function') {
       try {
-        return v() || undefined;
+        return (await v()) || undefined;
       } catch {
         return undefined;
       }
@@ -1255,7 +1262,7 @@ export class VLlmProvider implements LLMProvider {
     };
     try {
       const headers: Record<string, string> = {};
-      const apiKey = this.resolveApiKey();
+      const apiKey = await this.resolveApiKeyAsync();
       if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
       const hostOverride = process.env['VLLM_HOST_HEADER'];
       if (hostOverride) headers['Host'] = hostOverride;
@@ -2166,7 +2173,7 @@ export class VLlmProvider implements LLMProvider {
     // this loop — continue rateRetry kept sending the dead JWT).
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     {
-      const apiKey = this.resolveApiKey();
+      const apiKey = await this.resolveApiKeyAsync();
       if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
       const affinitySessionId = process.env['VLLM_AFFINITY_SESSION_ID']?.trim() || options.sessionId;
       if (affinitySessionId) headers['X-Cortex-Session-Id'] = affinitySessionId;
@@ -2510,7 +2517,7 @@ export class VLlmProvider implements LLMProvider {
       // 401 auth error — one force-refresh + retry when possible. Cortex can
       // reject a JWT whose `exp` still looks valid if the RS256 signing key
       // rotated (or we held a stale JWT). forceRefreshKey rewrites auth.json;
-      // continue rateRetry rebuilds headers via resolveApiKey().
+      // continue rateRetry rebuilds headers via resolveApiKeyAsync().
       if (response.status === 401 && this.forceRefreshKey && !authRefreshAttempted) {
         const bodyText = await response.text().catch(() => '');
         const isSignatureExpired = /signature has expired|token_not_valid/i.test(bodyText);
@@ -2527,7 +2534,7 @@ export class VLlmProvider implements LLMProvider {
           const freshToken = await this.forceRefreshKey();
           if (freshToken) {
             // forceRefresh rewrote auth.json; the next rateRetry rebuilds
-            // headers via resolveApiKey() which re-reads that file. If the
+            // headers via resolveApiKeyAsync() which re-reads that file. If the
             // resolver is a static string, pin the fresh token so retry works.
             if (typeof this.apiKeyOrResolver !== 'function') {
               this.apiKeyOrResolver = freshToken;
