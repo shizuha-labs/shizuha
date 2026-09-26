@@ -20,10 +20,9 @@ import type { AgentEvent } from './events/types.js';
 import type { Message } from './agent/types.js';
 import {
   incompleteTurnError,
-  MAX_THINKING_ONLY_RECOVERY,
   shouldContinueAutonomousMaxTokens,
 } from './agent/incomplete-turn.js';
-import { reasoningTextFromContent } from './agent/content.js';
+import { reasoningTextFromContent, visibleTextFromContent } from './agent/content.js';
 
 /**
  * Run the full Shizuha agent loop with an initial user prompt.
@@ -454,8 +453,8 @@ export async function* runAgentWithPrompt(
           stopReason: result.stopReason,
           permissionMode,
           reasoningText: reasoningTextFromContent(result.assistantMessage.content),
+          assistantText: visibleTextFromContent(result.assistantMessage.content),
           recoveryCount: thinkingOnlyRecoveryCount,
-          maxRecovery: MAX_THINKING_ONLY_RECOVERY,
           outputTokens: result.outputTokens,
         })) {
           thinkingOnlyRecoveryCount++;

@@ -326,24 +326,30 @@ describe('runAgent — repeated identical tool call (loop guard)', () => {
 });
 
 describe('runAgent — incomplete model turns', () => {
-  it('treats max_tokens as an explicit incomplete terminal without replay', async () => {
+  it('extends a max_tokens visible answer until a real stop, without the incomplete-turn error', async () => {
     mockProvider.queueResponse(ResponseBuilder.truncated('Partial but visible response.'));
+    mockProvider.queueResponse(ResponseBuilder.textOnly('Finished the list.'));
 
     const events = await collectEvents({ model: 'DeepSeek-V4-Flash' });
     const complete = findEvent<{ type: 'complete'; totalTurns: number }>(events, 'complete');
     const error = findEvent<{ type: 'error'; error: string }>(events, 'error');
-    expect(complete?.totalTurns).toBe(1);
-    expect(mockProvider.callCount).toBe(1);
-    expect(error?.error).toContain('output-token limit');
+    expect(complete?.totalTurns).toBe(2);
+    expect(mockProvider.callCount).toBe(2);
+    expect(error).toBeUndefined();
+    const second = mockProvider.capturedMessages[1]!;
+    expect(second[second.length - 1]?.role).toBe('assistant');
+    expect(second.some((m) => typeof m.content === 'string' && /Continue\.|left off/i.test(m.content))).toBe(false);
   });
 
-  it('applies the same fail-closed rule to Claude', async () => {
+  it('extends a truncated Claude answer the same way', async () => {
     mockProvider.queueResponse(ResponseBuilder.truncated('partial output...'));
-    mockProvider.queueResponse(ResponseBuilder.textOnly('must not be consumed'));
+    mockProvider.queueResponse(ResponseBuilder.textOnly('done'));
     const events = await collectEvents({ model: 'claude-sonnet-4-6' });
     const complete = findEvent<{ type: 'complete'; totalTurns: number }>(events, 'complete');
-    expect(complete?.totalTurns).toBe(1);
-    expect(mockProvider.callCount).toBe(1);
+    const error = findEvent<{ type: 'error'; error: string }>(events, 'error');
+    expect(complete?.totalTurns).toBe(2);
+    expect(mockProvider.callCount).toBe(2);
+    expect(error).toBeUndefined();
   });
 
   it('continues an autonomous thinking-only max_tokens turn so the model can tool-call', async () => {

@@ -109,6 +109,7 @@ import {
   effectiveContextTokens,
 } from '../prompt/context.js';
 import { countTokens } from '../utils/tokens.js';
+import { authoredCustomInstructions, DEFERRED_TOOL_INSTRUCTIONS } from '../prompt/authored-instructions.js';
 import { modelSupportsAppendOnlyToolActivation } from '../tools/tool-search.js';
 import {
   DEFAULT_FIRST_HEARTBEAT_MS,
@@ -992,6 +993,7 @@ export class AgentProcess {
   /** Fresh prompt/tool composition held back by the resume pin; adopted at the
    *  next compaction, where the prefix cache breaks anyway (PLAT-4189). */
   private pendingPromptRefresh: { systemPrompt: string; toolDefs: ToolDefinition[] } | null = null;
+  private pendingAuthoredInstructionsRefresh = false;
   /** Frozen provider-wire payload prefix — the exact ChatMessage[] last sent
    *  (operator 2026-08-08: provably identical re-serialization across
    *  restart). Next payload = this prefix ++ convert(new tail); invalidated
@@ -1971,10 +1973,7 @@ export class AgentProcess {
       const serverCatalog = buildConfiguredServerSummaries(mcpConfigs)
         .map((server) => `- **${server.name}**: ${server.description}`)
         .join('\n');
-      const deferredSection = `\n\n## More Tools (via ToolSearch)\n` +
-        `Additional MCP tools are available but withheld here to keep your context lean. ` +
-        `Use ToolSearch with a keyword query (e.g. "wiki create page", "pulse transition") ` +
-        `or "select:<exact_tool_name>" to find and load the tool you need before calling it.` +
+      const deferredSection = DEFERRED_TOOL_INSTRUCTIONS +
         (serverCatalog ? `\n\nAvailable sources:\n${serverCatalog}` : '');
 
       logger.info({
@@ -3742,6 +3741,8 @@ export class AgentProcess {
       const added = freshNames.filter((n) => !persistedNames.includes(n));
       const removed = persistedNames.filter((n) => !freshNames.includes(n));
       this.pendingPromptRefresh = { systemPrompt: this.systemPrompt, toolDefs: this.toolDefs };
+      this.pendingAuthoredInstructionsRefresh = authoredCustomInstructions(persisted.systemPrompt)
+        !== authoredCustomInstructions(this.systemPrompt);
       const changedSections = diffSystemPromptSections(
         hashSystemPromptSections(persisted.systemPrompt),
         hashSystemPromptSections(this.systemPrompt),
@@ -3752,6 +3753,7 @@ export class AgentProcess {
         agent: this.config.agentName ?? this.config.agentId,
         samePrompt,
         changedSections,
+        authoredInstructionsRefresh: this.pendingAuthoredInstructionsRefresh,
         addedTools: added,
         removedTools: removed,
         pinnedPromptChars: persisted.systemPrompt.length,
@@ -3771,6 +3773,7 @@ export class AgentProcess {
     this.pendingPromptRefresh = null;
     this.systemPrompt = refresh.systemPrompt;
     this.toolDefs = refresh.toolDefs;
+    this.pendingAuthoredInstructionsRefresh = false;
     try {
       this.store.saveProviderPrefixHead?.(this.sessionId, {
         createdAt: Date.now(), model: this.model,
@@ -4574,9 +4577,14 @@ export class AgentProcess {
 
     const origin = platform.endsWith('/pulse') ? platform.replace(/\/pulse$/, '') : platform;
     try {
-      for (const email of emails) {
+      // Token identity drives the decision server-side, so one call suffices;
+      // the email list remains as the fail-closed identity-existence gate.
+      for (const email of emails.slice(0, 1)) {
         const url = new URL('/pulse/api/items/heartbeat-preflight/', origin);
-        url.searchParams.set('assignee_email', email);
+        // Operator 2026-09-24: Pulse resolves the scheduler decision from the
+        // SIGNED TOKEN identity. The email param is no longer sent — what the
+        // agent claims about itself must not influence whose work is fetched.
+        void email;
         let response = await fetch(url, {
           headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
           signal: AbortSignal.timeout(5_000),
@@ -5311,6 +5319,7 @@ export class AgentProcess {
           source, activeProvider, activeModel, this.maxContextTokens,
           {
             overheadTokens, force: true, abortSignal: abort.signal,
+            allowNonReducing: this.pendingAuthoredInstructionsRefresh,
             onProviderError: (error) => { providerFailure = { error }; },
             // PLAT-9194 band: multi-pass compaction must re-validate the
             // transaction fence BEFORE each additional model pass — a source
@@ -5406,7 +5415,11 @@ export class AgentProcess {
       }
       this.refreshContextWindow(activeModel, activeProvider);
       const turnMaxOutputTokens = this.maxOutputTokensForMessage(msg, heartbeatQueueToolPending ? 0 : turnIndex);
-      const systemOverheadTokens = estimateOverheadTokens(this.systemPrompt, this.toolDefs, activeModel);
+      const pendingRefresh = this.pendingAuthoredInstructionsRefresh ? this.pendingPromptRefresh : null;
+      const systemOverheadTokens = Math.max(
+        estimateOverheadTokens(this.systemPrompt, this.toolDefs, activeModel),
+        pendingRefresh ? estimateOverheadTokens(pendingRefresh.systemPrompt, pendingRefresh.toolDefs, activeModel) : 0,
+      );
       let budgetCheck = AgentProcess.inspectContextBudget(
         this.messages, activeModel, this.maxContextTokens, this.systemPrompt, this.toolDefs,
         turnMaxOutputTokens, this.lastReportedPromptTokens,
@@ -5418,7 +5431,7 @@ export class AgentProcess {
 
       // Pre-turn compaction check — prevents context overflow when the session
       // has accumulated too many messages (eternal sessions can grow indefinitely).
-      if (budgetCheck.exceeded || needsCompaction(
+      if (pendingRefresh || budgetCheck.exceeded || needsCompaction(
         this.messages,
         this.maxContextTokens,
         activeModel,

@@ -1,0 +1,61 @@
+# Public source build. Runs on GitHub (this file is inert on Forgejo).
+# Proves a clone of github.com/shizuha-labs/shizuha builds on every
+# architecture GitHub-hosted runners still provide. darwin-x64 uses the same
+# ./install.sh path; GitHub no longer offers an Intel macOS runner.
+name: build-source
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-source-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source:
+    name: source build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-latest
+            target: darwin-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install, build, and load the native addon
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: |
+          set -euo pipefail
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) expect=linux-x64 ;;
+            Linux-aarch64) expect=linux-arm64 ;;
+            Darwin-arm64) expect=darwin-arm64 ;;
+            Darwin-x86_64) expect=darwin-x64 ;;
+            *) echo "unsupported runner $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+          esac
+          test "$expect" = "${{ matrix.target }}"
+          npm ci --no-audit --no-fund
+          npm run build:node
+          node -e 'const db=require("better-sqlite3")(":memory:"); if (db.prepare("select 1 as ok").get().ok!==1) process.exit(1); console.log("sqlite_ok", process.platform, process.arch);'
+          test -f dist/shizuha.js

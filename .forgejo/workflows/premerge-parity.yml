@@ -27,6 +27,8 @@ jobs:
         run: python3 -m unittest -v tests.ci.test_agent_runtime_python_lock
       - name: Agent runtime OCI overlay contract
         run: python3 -m unittest -v tests.ci.test_agent_runtime_overlay
+      - name: Immutable runtime requalification contract
+        run: python3 -m unittest -v tests.ci.test_agent_runtime_qualification
       # PLAT-5803 / PLAT-4720: negative controls for the full-suite gate must
       # execute on every PR so removing a fail-closed guard turns CI red.
       - name: Full-suite gate fail-closed guards (PLAT-4720)

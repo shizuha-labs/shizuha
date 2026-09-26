@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   incompleteTurnError,
+  MAX_LENGTH_CONTINUATIONS,
   MAX_THINKING_ONLY_RECOVERY,
   shouldContinueAutonomousMaxTokens,
 } from '../../src/agent/incomplete-turn.js';
@@ -24,14 +25,33 @@ describe('shouldContinueAutonomousMaxTokens', () => {
     })).toBe(true);
   });
 
-  it('does not continue without a reasoning block', () => {
+  it('does not continue without a reasoning block or visible text', () => {
     expect(shouldContinueAutonomousMaxTokens({ ...base, reasoningText: '' })).toBe(false);
     expect(shouldContinueAutonomousMaxTokens({ ...base, reasoningText: '   ' })).toBe(false);
   });
 
-  it('does not continue in plan or supervised modes', () => {
+  it('continues a cut-off visible answer with no reasoning block (shizuha2)', () => {
+    expect(shouldContinueAutonomousMaxTokens({
+      ...base,
+      reasoningText: '',
+      assistantText: '- 10',
+      permissionMode: 'autonomous',
+    })).toBe(true);
+    expect(shouldContinueAutonomousMaxTokens({
+      ...base,
+      reasoningText: '',
+      assistantText: 'still writing the manifest',
+      permissionMode: 'supervised',
+    })).toBe(true);
+  });
+
+  it('does not continue in plan mode', () => {
     expect(shouldContinueAutonomousMaxTokens({ ...base, permissionMode: 'plan' })).toBe(false);
-    expect(shouldContinueAutonomousMaxTokens({ ...base, permissionMode: 'supervised' })).toBe(false);
+    expect(shouldContinueAutonomousMaxTokens({
+      ...base,
+      permissionMode: 'plan',
+      assistantText: 'partial plan',
+    })).toBe(false);
   });
 
   it('does not continue for stall_salvage or other stop reasons', () => {
@@ -52,15 +72,16 @@ describe('shouldContinueAutonomousMaxTokens', () => {
     })).toBe(false);
   });
 
-  it('stops after MAX_THINKING_ONLY_RECOVERY continues', () => {
+  it('stops after MAX_LENGTH_CONTINUATIONS continues', () => {
     expect(shouldContinueAutonomousMaxTokens({
       ...base,
-      recoveryCount: MAX_THINKING_ONLY_RECOVERY,
+      recoveryCount: MAX_LENGTH_CONTINUATIONS,
     })).toBe(false);
     expect(shouldContinueAutonomousMaxTokens({
       ...base,
-      recoveryCount: MAX_THINKING_ONLY_RECOVERY - 1,
+      recoveryCount: MAX_LENGTH_CONTINUATIONS - 1,
     })).toBe(true);
+    expect(MAX_THINKING_ONLY_RECOVERY).toBeLessThan(MAX_LENGTH_CONTINUATIONS);
   });
 
   it('does not lecture the model to Continue', () => {

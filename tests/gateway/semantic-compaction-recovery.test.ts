@@ -121,6 +121,81 @@ function drainUnconsumed(h: ReturnType<typeof harness>) {
 }
 
 describe('gateway semantic compaction transaction', () => {
+  it('uses a validated semantic checkpoint for authored changes even when the tiny history cannot shrink', async () => {
+    const h = harness();
+    h.append({ id: 'tiny-prior', role: 'user', content: 'Investigate ABC-7 without lifecycle changes.', timestamp: 1000 });
+    h.append({ id: 'tiny-answer', role: 'assistant', content: 'The receipt is preserved.', timestamp: 1001 });
+    const freshPrompt = '## Custom Instructions\n\nSend concise replies through message_user.';
+    h.agent.pendingPromptRefresh = { systemPrompt: freshPrompt, toolDefs: h.agent.toolDefs };
+    h.agent.pendingAuthoredInstructionsRefresh = true;
+    h.provider.queueResponse(ResponseBuilder.textOnly(goodSummary), ResponseBuilder.textOnly('Delivered.'));
+    await h.agent.processInboxMessage({ ...h.inbound('tiny-latest'), source: undefined });
+    expect(h.provider.capturedOptions.map((options) => options.requestKind)).toEqual(['compaction', undefined]);
+    expect(h.agent.systemPrompt).toBe(freshPrompt);
+    expect(h.agent.pendingAuthoredInstructionsRefresh).toBe(false);
+    expect(h.history().some((message) => message.id === 'tiny-latest')).toBe(true);
+    expect(h.channel.ackProcessed).toHaveBeenCalledWith('tiny-latest');
+  });
+
+  it('adopts changed authored instructions before a low-context user turn and stays stable on the next turn', async () => {
+    const h = harness(); h.seed();
+    h.agent.maxContextTokens = 1_000_000;
+    h.provider.maxContextWindow = 1_000_000;
+    const oldPrompt = '## Custom Instructions\n\nOld delivery contract';
+    const freshPrompt = '## Custom Instructions\n\nDeliver the answer through message_user';
+    h.agent.systemPrompt = oldPrompt;
+    h.agent.pendingPromptRefresh = { systemPrompt: freshPrompt, toolDefs: h.agent.toolDefs };
+    h.agent.pendingAuthoredInstructionsRefresh = true;
+    const prewarm = vi.spyOn(h.agent, 'prewarmPrefixCache').mockResolvedValue(true);
+    h.provider.queueResponse(ResponseBuilder.textOnly(goodSummary), ResponseBuilder.textOnly('First answer'));
+    await h.agent.processInboxMessage({ ...h.inbound('authored-first'), source: undefined });
+    expect(h.provider.capturedOptions.map((options) => options.requestKind)).toEqual(['compaction', undefined]);
+    expect(h.provider.capturedOptions[1]?.systemPrompt).toBe(freshPrompt);
+    expect(h.agent.systemPrompt).toBe(freshPrompt);
+    expect(h.agent.pendingAuthoredInstructionsRefresh).toBe(false);
+    expect(h.agent.pendingPromptRefresh).toBeNull();
+    expect(h.agent.store.loadProviderPrefixHead(h.agent.sessionId)?.systemPrompt).toBe(freshPrompt);
+    expect(prewarm).toHaveBeenCalledWith(expect.anything(), expect.anything(), { reason: 'post_compaction' });
+    expect(h.history().some((message) => message.id === 'authored-first')).toBe(true);
+    drainUnconsumed(h);
+    h.provider.queueResponse(ResponseBuilder.textOnly('Second answer'));
+    await h.agent.processInboxMessage({ ...h.inbound('authored-second'), source: undefined });
+    expect(h.provider.capturedOptions.filter((options) => options.requestKind === 'compaction')).toHaveLength(1);
+    expect(h.provider.capturedOptions.at(-1)?.systemPrompt).toBe(freshPrompt);
+  });
+
+  it.each(['provider', 'quality', 'persistence'])('retains authored refresh and old head after %s failure, then applies it on retry', async (failure) => {
+    const h = harness(); h.seed();
+    const oldPrompt = h.agent.systemPrompt;
+    const freshPrompt = '## Custom Instructions\n\nUpdated delivery contract';
+    h.agent.pendingPromptRefresh = { systemPrompt: freshPrompt, toolDefs: h.agent.toolDefs };
+    h.agent.pendingAuthoredInstructionsRefresh = true;
+    const before = h.history();
+    const originalChat = h.provider.chat.bind(h.provider);
+    if (failure === 'provider') {
+      h.provider.chat = async function* () { throw new Error('provider unavailable'); };
+    } else if (failure === 'quality') {
+      fail(h);
+    } else {
+      h.agent.store.db.exec("CREATE TRIGGER reject_custom_compaction BEFORE INSERT ON messages WHEN new.content LIKE '[Conversation Summary]%' BEGIN SELECT RAISE(ABORT, 'fixture persistence denied'); END");
+      h.provider.queueResponse(ResponseBuilder.textOnly(goodSummary));
+    }
+    await h.agent.processInboxMessage(h.inbound('authored-retry'));
+    expect(h.agent.systemPrompt).toBe(oldPrompt);
+    expect(h.agent.pendingPromptRefresh?.systemPrompt).toBe(freshPrompt);
+    expect(h.agent.pendingAuthoredInstructionsRefresh).toBe(true);
+    expect(h.history().slice(0, before.length)).toEqual(before);
+    expect(h.channel.ackProcessed).not.toHaveBeenCalled();
+    h.provider.chat = originalChat;
+    if (failure === 'persistence') h.agent.store.db.exec('DROP TRIGGER reject_custom_compaction');
+    drainUnconsumed(h);
+    succeed(h);
+    await h.agent.processInboxMessage(h.inbound('authored-retry'));
+    expect(h.agent.systemPrompt).toBe(freshPrompt);
+    expect(h.agent.pendingAuthoredInstructionsRefresh).toBe(false);
+    expect(h.history().filter((message) => message.id === 'authored-retry')).toHaveLength(1);
+  });
+
   it('preserves the exact active and canonical transcript, frozen prefix and unacknowledged input on quality failure', async () => {
     const h = harness(); h.seed(); fail(h);
     const before = h.history(); const wire = structuredClone(h.agent.providerWirePrefix);

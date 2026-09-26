@@ -1079,13 +1079,14 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
           stopReason: result.stopReason,
           permissionMode,
           reasoningText: reasoningTextFromContent(result.assistantMessage.content),
+          assistantText: visibleTextFromContent(result.assistantMessage.content),
           recoveryCount: thinkingOnlyRecoveryCount,
           outputTokens: result.outputTokens,
         })) {
           thinkingOnlyRecoveryCount++;
           logger.warn(
             { turnIndex, attempt: thinkingOnlyRecoveryCount, outputTokens: result.outputTokens, stopReason: result.stopReason },
-            'SCLI: max_tokens hit on a thinking-only autonomous turn — continuing from persisted prefix (no Continue lecture)',
+            'SCLI: output budget ended before a terminal sentinel — continuing from persisted prefix',
           );
           continue;
         }

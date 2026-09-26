@@ -1,17 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { toVLlmMessages } from '../../src/provider/vllm.js';
+import { capVisionImagesPerPrompt, toVLlmMessages, VLLM_MAX_IMAGES_PER_PROMPT } from '../../src/provider/vllm.js';
 import { getModelProfile } from '../../src/provider/model-profile.js';
 import type { ChatMessage } from '../../src/provider/types.js';
 
 const TINY_PNG =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
 
-function toolImageTurn(): ChatMessage {
+function toolImageTurn(n = 0): ChatMessage {
   return {
     role: 'user',
     content: [{
       type: 'tool_result',
-      toolUseId: 'toolu_shot',
+      toolUseId: n === 0 ? 'toolu_shot' : `toolu_shot_${n}`,
       content: 'Screenshot captured.',
       image: { base64: TINY_PNG, mediaType: 'image/png' },
     }],
@@ -84,5 +84,28 @@ describe('vLLM vision wire (SCLI-63 / GLM-5.3-Flash)', () => {
     expect(String(out[0]!.content)).toContain('What is in this screenshot?');
     expect(String(out[0]!.content)).toContain('Image not sent');
     expect(JSON.stringify(out)).not.toContain(TINY_PNG);
+  });
+
+  it('keeps only the newest 4 images in one GLM prompt', () => {
+    const turns = Array.from({ length: 6 }, (_, i) => toolImageTurn(i));
+    const wired = toVLlmMessages(turns, undefined, getModelProfile('cortex/GLM-5.3-Flash'));
+    const capped = capVisionImagesPerPrompt(wired);
+    expect(VLLM_MAX_IMAGES_PER_PROMPT).toBe(4);
+    expect(capped.dropped).toBe(2);
+    const urls = capped.messages.flatMap((message) => {
+      if (!Array.isArray(message.content)) return [];
+      return message.content
+        .filter((part) => part.type === 'image_url')
+        .map((part) => (part as { image_url: { url: string } }).image_url.url);
+    });
+    expect(urls).toHaveLength(4);
+    expect(urls.every((url) => url.includes(TINY_PNG))).toBe(true);
+    const notes = capped.messages.flatMap((message) => {
+      if (!Array.isArray(message.content)) return [];
+      return message.content
+        .filter((part) => part.type === 'text' && String(part.text).includes('at most 4 images'))
+        .map((part) => part.text);
+    });
+    expect(notes).toHaveLength(2);
   });
 });
