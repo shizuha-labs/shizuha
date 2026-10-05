@@ -1668,26 +1668,42 @@ class ChatbotBridge {
         `${username}@shizuha.com`,
       ].filter(Boolean)));
       let agentUserId: number | null = null;
+      // PLAT-11313: /api/internal/ endpoints are contractually direct-cluster-
+      // service calls only — the id plane's InternalApiIngressGuardMiddleware
+      // 404s every internal path arriving via the public ingress (XFF
+      // detection, ID-52 follow-up). The legacy CONNECT_API route is
+      // ingress-borne, so every by-email resolution 404'd fleet-wide. Seats
+      // run in-cluster and reach shizuha-id directly; non-cluster installs
+      // (no cluster DNS) fall back to the CONNECT_API proxy path.
+      const idInternalBase = process.env.SHIZUHA_ID_INTERNAL_URL
+        ?? 'http://shizuha-id.shizuha.svc:8001';
       for (const email of emailCandidates) {
-        const url = `${CONNECT_API}/id/api/internal/users/by-email/?email=${encodeURIComponent(email)}`;
-        try {
-          const resp = await fetch(url, {
-            headers: { 'Authorization': `Bearer ${this.platformAccessToken}` },
-            signal: AbortSignal.timeout(5000),
-          });
-          if (resp.ok) {
-            const user = await resp.json() as Record<string, unknown>;
-            if (user && typeof user.id === 'number') {
-              agentUserId = user.id;
-              logger.info({ agentId, email, agentUserId }, '[Connect:lookup] resolved platform user id');
-              break;
+        const emailQuery = `?email=${encodeURIComponent(email)}`;
+        const lookupUrls = [
+          `${idInternalBase}/api/internal/users/by-email/${emailQuery}`,
+          `${CONNECT_API}/id/api/internal/users/by-email/${emailQuery}`,
+        ];
+        for (const url of lookupUrls) {
+          try {
+            const resp = await fetch(url, {
+              headers: { 'Authorization': `Bearer ${this.platformAccessToken}` },
+              signal: AbortSignal.timeout(5000),
+            });
+            if (resp.ok) {
+              const user = await resp.json() as Record<string, unknown>;
+              if (user && typeof user.id === 'number') {
+                agentUserId = user.id;
+                logger.info({ agentId, email, agentUserId, via: url }, '[Connect:lookup] resolved platform user id');
+                break;
+              }
+            } else {
+              logger.info({ email, status: resp.status, via: url }, '[Connect:lookup] email variant not found, trying next');
             }
-          } else {
-            logger.info({ email, status: resp.status }, '[Connect:lookup] email variant not found, trying next');
+          } catch (err) {
+            logger.warn({ email, via: url, err: (err as Error).message }, '[Connect:lookup] email lookup threw');
           }
-        } catch (err) {
-          logger.warn({ email, err: (err as Error).message }, '[Connect:lookup] email lookup threw');
         }
+        if (agentUserId) break;
       }
 
       if (!agentUserId) {
