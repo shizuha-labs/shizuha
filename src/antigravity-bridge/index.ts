@@ -773,13 +773,21 @@ export class AntigravityBridge {
       }
       if (bearerToken) {
         this.platformJwt = bearerToken;
-        const { getPlatformMcpConfigs, PLATFORM_MCP_SERVICES, prunePlatformMcpKeys } = await import('../platform/mcp-services.js');
+        const { getPlatformMcpConfigs, PLATFORM_MCP_SERVICES, prunePlatformMcpKeys, stripPlatformManagedMcpEntries } = await import('../platform/mcp-services.js');
         const { resolveAllowedServers } = await import('../platform/mcp-access-matrix.js');
         const { parseAgentEffectiveMcpServicesFromEnv } = await import('../platform/effective-capabilities.js');
         const agentRole = process.env['AGENT_ROLE'];
         const agentSkills = (process.env['AGENT_SKILLS'] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
         const hiveAllowList = parseAgentEffectiveMcpServicesFromEnv();
         const roleAllowList = hiveAllowList ?? [...resolveAllowedServers(agentRole, this.opts.agentUsername ?? process.env['AGENT_USERNAME'], agentSkills)];
+        // PLAT-4023 verbatim shape (PLAT-9704 leg 2): strip the platform-managed
+        // block from the existing map BEFORE merging so getPlatformMcpConfigs()
+        // output is the single authoritative source for the platform block —
+        // a prior boot's per-service proxies must not survive a switch TO the
+        // multiplexer (both run → duplicate tools, +RSS) and a stale
+        // `shizuha-mcp` must not survive a switch back OFF. Custom entries are
+        // preserved (known platform keys only).
+        Object.assign(mcpServers, stripPlatformManagedMcpEntries(mcpServers));
         const platformConfigs = prunePlatformMcpKeys(
           getPlatformMcpConfigs({ bearerToken, platformUrl: platformBase }),
           roleAllowList,
