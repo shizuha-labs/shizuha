@@ -22,7 +22,15 @@ export function pickVoiceS2SAgent(
   query: string,
 ): VoiceS2SAgentTarget | null {
   const want = String(query || '').trim().toLowerCase();
-  if (!want) return null;
+  if (!want) {
+    const running = (agents || []).filter((row) => {
+      const port = Number(row?.localPort);
+      return Number.isFinite(port) && port > 0;
+    });
+    // noUncheckedIndexedAccess: running[0] is T|undefined; return type is T|null.
+    if (running.length !== 1) return null;
+    return running[0] ?? null;
+  }
   return agents.find((row) => {
     const names = [row.username, row.id];
     return names.some((name) => String(name || '').trim().toLowerCase() === want);

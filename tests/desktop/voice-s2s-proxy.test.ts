@@ -15,7 +15,26 @@ describe('Desktop S2S proxy helpers', () => {
     ];
     expect(pickVoiceS2SAgent(agents, 'hina')?.localPort).toBe(8020);
     expect(pickVoiceS2SAgent(agents, 'A1')?.username).toBe('shizuha');
+    // Multi-agent: empty query stays ambiguous.
     expect(pickVoiceS2SAgent(agents, '')).toBeNull();
+  });
+
+  it('defaults empty query to the sole running local agent', () => {
+    const sole = [{ id: 'a1', username: 'shizuha', localPort: 8017 }];
+    expect(pickVoiceS2SAgent(sole, '')?.username).toBe('shizuha');
+    expect(pickVoiceS2SAgent(sole, '   ')?.localPort).toBe(8017);
+
+    const noneRunning = [
+      { id: 'a1', username: 'shizuha', localPort: 0 },
+      { id: 'a2', username: 'hina', localPort: null },
+    ];
+    expect(pickVoiceS2SAgent(noneRunning, '')).toBeNull();
+
+    const twoRunning = [
+      { id: 'a1', username: 'shizuha', localPort: 8017 },
+      { id: 'a2', username: 'hina', localPort: 8020 },
+    ];
+    expect(pickVoiceS2SAgent(twoRunning, '')).toBeNull();
   });
 
   it('builds loopback upstream URLs', () => {
