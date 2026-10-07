@@ -2268,6 +2268,10 @@ export class AgentProcess {
     setActiveTelemetryWindow(this.gatewayTelemetryWindow);
 
     logger.info('Agent process started — waiting for messages');
+    void import('../platform/post-boot-census.js').then(async ({ runPostBootAccessCensus }) => {
+      const alarm = await runPostBootAccessCensus();
+      if (alarm) logger.warn(alarm);
+    }).catch(() => { /* census must not block boot */ });
     // Clear stale capacity latches from other harnesses (e.g. leftover
     // self:claude-token-pool-exhausted while this seat runs Cortex/shizuha).
     // Hive is SoT for identity; self-availability is only a capacity signal.
