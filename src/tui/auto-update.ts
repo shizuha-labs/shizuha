@@ -129,7 +129,7 @@ export function restartInstalledTui(ctx: TuiRestartContext): ChildProcess {
   const child = spawn(executable, buildTuiRestartArgs(ctx), {
     cwd: ctx.cwd,
     stdio: 'inherit',
-    env: { ...process.env, SHIZUHA_AUTO_UPDATE_RESTARTED: '1' },
+    env: { ...process.env, SHIZUHA_AUTO_UPDATE_RESTARTED: '1', SHIZUHA_TUI_TAKEOVER: '1' },
   });
   return child;
 }
