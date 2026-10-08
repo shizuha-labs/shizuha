@@ -965,6 +965,23 @@ jobs:
                   kubectl delete job -n build "$PREPULL_JOB" --wait=false || true
                   return 0
                 fi
+                # A pod that SCHEDULED and was then OOMKilled has already
+                # achieved the objective: the kubelet pulls the image to start
+                # the container, so the node's cache is warm regardless of the
+                # no-op container's death. The Burstable 16Mi/64Mi /bin/true
+                # pod is the kernel's preferred OOM victim on memory-tight
+                # nodes (gx10-2 GLM residency class) — the same release-failing
+                # class as the unschedulable case above, re-entered via the
+                # post-scheduling path. Skip it like that case; only genuine
+                # pull failures (ImagePullBackOff, registry errors) fail the
+                # release. (PLAT-7350: runs 35428/35467/35481 all failed here.)
+                OOM_REASON="$(kubectl get pods -n build -l "job-name=${PREPULL_JOB}" \
+                  -o jsonpath='{.items[0].status.containerStatuses[0].state.terminated.reason}{.items[0].status.containerStatuses[0].lastState.terminated.reason}' 2>/dev/null || true)"
+                if echo "$OOM_REASON" | grep -q 'OOMKilled'; then
+                  echo "::notice::skipping runtime image pre-pull on ${NODE}: container OOMKilled after image pull under node memory pressure (image cached; pre-pull objective achieved)"
+                  kubectl delete job -n build "$PREPULL_JOB" --wait=false || true
+                  return 0
+                fi
                 echo "::error::runtime image fleet pre-pull failed on ${NODE}"
                 kubectl describe job -n build "$PREPULL_JOB" || true
                 # PLAT-7269: `describe job` alone hides the pod-level failure
