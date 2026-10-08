@@ -16,6 +16,7 @@ import multipart from '@fastify/multipart';
 import WebSocket, { WebSocketServer } from 'ws';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import type { Server } from 'node:http';
 import * as crypto from 'node:crypto';
 import * as net from 'node:net';
 import { execFileSync } from 'node:child_process';
@@ -159,6 +160,11 @@ interface DashboardTcpProxyConfig {
   port: number;
   targetHost: string;
   targetPort?: number;
+  // SCLI-848: true (default) stamps the Docker bridge header so
+  // downstream auth treats traffic as container-originated. Loopback aliases
+  // (SCLI-832) must pass false — they pipe genuine client requests, and
+  // stamping them would strip the localhost auth bypass.
+  markAsBridge?: boolean;
 }
 
 const DASHBOARD_BRIDGE_HEADER = 'x-shizuha-dashboard-bridge';
@@ -229,7 +235,7 @@ function serializeHttpHeaders(headers: HeaderBag): string {
   return lines.join('\r\n');
 }
 
-export async function startDashboardTcpProxy(config: DashboardTcpProxyConfig): Promise<void> {
+export async function startDashboardTcpProxy(config: DashboardTcpProxyConfig): Promise<{ server: Server; port: number }> {
   // Container agents reach the daemon through the Docker gateway alias while
   // the real dashboard stays bound to loopback by default. Use an HTTP/WS
   // bridge instead of a transparent TCP pipe so downstream auth can distinguish
@@ -238,13 +244,18 @@ export async function startDashboardTcpProxy(config: DashboardTcpProxyConfig): P
   const http = await import('node:http');
   const targetHost = dashboardProxyTargetHost(config.targetHost);
   const targetPort = config.targetPort ?? config.port;
+  // SCLI-848: loopback aliases (SCLI-832) forward genuine client requests, so
+  // they must NOT stamp the Docker bridge header — the true client loopback IP
+  // keeps the localhost bypass. The Docker gateway alias keeps the header.
+  const stampBridge = (headers: HeaderBag): HeaderBag =>
+    config.markAsBridge === false ? headers : withDashboardBridgeHeader(headers);
   const server = http.createServer((clientReq, clientRes) => {
     const proxyReq = http.request({
       hostname: targetHost,
       port: targetPort,
       path: clientReq.url,
       method: clientReq.method,
-      headers: withDashboardBridgeHeader(clientReq.headers),
+      headers: stampBridge(clientReq.headers),
     }, (proxyRes) => {
       clientRes.writeHead(proxyRes.statusCode ?? 200, proxyRes.headers);
       proxyRes.pipe(clientRes);
@@ -260,7 +271,7 @@ export async function startDashboardTcpProxy(config: DashboardTcpProxyConfig): P
 
   server.on('upgrade', (clientReq, clientSocket, clientHead) => {
     const upstream = net.connect({ host: targetHost, port: targetPort }, () => {
-      const headers = withDashboardBridgeHeader(clientReq.headers);
+      const headers = stampBridge(clientReq.headers);
       const serializedHeaders = serializeHttpHeaders(headers);
       upstream.write(`${clientReq.method} ${clientReq.url} HTTP/1.1\r\n${serializedHeaders}\r\n\r\n`);
       if (clientHead.length) upstream.write(clientHead);
@@ -295,6 +306,8 @@ export async function startDashboardTcpProxy(config: DashboardTcpProxyConfig): P
     logger.warn({ err: (err as Error).message, listenHost: config.listenHost, port: config.port, targetHost, targetPort }, 'Dashboard container HTTP bridge error');
   });
   server.unref();
+  const bound = server.address();
+  return { server, port: bound && typeof bound === 'object' ? bound.port : config.port };
 }
 
 interface DashboardModelInfo {

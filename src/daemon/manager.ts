@@ -4244,6 +4244,11 @@ async function runDaemon(
             port,
             targetHost: dashboardHost,
             targetPort: port,
+            // SCLI-848: loopback aliases pipe genuine client requests — do not
+            // stamp the Docker bridge header, or the localhost bypass dies and
+            // every session-gated /v1/* route 401s. The Docker gateway alias
+            // (loopbackAlias=false) keeps the header.
+            markAsBridge: !loopbackAlias,
           });
           console.log(`[daemon] Dashboard alias listening on ${proxyHost}:${port} -> ${dashboardHost}:${port}`);
         } catch (err) {
