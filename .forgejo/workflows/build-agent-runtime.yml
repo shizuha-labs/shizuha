@@ -347,13 +347,13 @@ jobs:
           # never downloads or unpacks the multi-gigabyte browser/base rootfs.
           # Any installed dependency, Dockerfile, harness, or ancestry change
           # falls back to the existing full native Kaniko build.
-          # Last smoked multi-arch: harness-202609110337-f1f8d87 (Desired gen 36).
-          OVERLAY_BASE_INDEX_DIGEST="sha256:f9a64b8169408c9128f0da3d2e7df2fc58cb6ea9185009a0fc92d6fb9ec02730"
-          OVERLAY_BASE_SOURCE_SHA="f1f8d87674bd27652a2d9d96bc4a5973b4d5dbd8"
-          OVERLAY_BASE_CC_VER="2.1.268"
-          OVERLAY_BASE_CODEX_VER="0.154.0"
-          OVERLAY_BASE_ANTIGRAVITY_VER="1.2.0"
-          OVERLAY_BASE_OPENCLAW_VER="2026.9.4"
+          # Last smoked multi-arch: harness-202610110610-20efecd (Origin run 8537).
+          OVERLAY_BASE_INDEX_DIGEST="sha256:f409d3aeec3b46715cea1a4ae4373d6cc6738817a9a7234825e00dc72f0f13ea"
+          OVERLAY_BASE_SOURCE_SHA="20efecdfef05505d8b446aa0b7d13c11dca304fa"
+          OVERLAY_BASE_CC_VER="2.1.296"
+          OVERLAY_BASE_CODEX_VER="0.162.1"
+          OVERLAY_BASE_ANTIGRAVITY_VER="1.3.3"
+          OVERLAY_BASE_OPENCLAW_VER="2026.10.1"
           OVERLAY_ELIGIBLE=false
           overlay_eligible_with() {
             python3 scripts/agent_runtime_overlay.py eligible \
@@ -1102,3 +1102,12 @@ jobs:
           git -C "$WORKDIR/deploy" commit -m "release(runtime): promote ${TAG} after smoked multi-arch publish"
           git -C "$WORKDIR/deploy" push origin HEAD:master
           echo "::notice::promoted ${TAG} (${DIGEST}) — deploy-runtime-fleet-broker will apply DesiredRuntimeRelease"
+          # PLAT-10017: record the promotion in the Pulse deployment ledger so
+          # the PLS-675/PLAT-1351 deploy-verified gate can correlate. Honest
+          # state=rollout_started — convergence evidence belongs to the
+          # rt-fleet live-probe receipt / post-rollout carriers, not this lane.
+          if ! "${GITHUB_WORKSPACE}/.forgejo/scripts/record-agent-runtime-promotion-event.sh" \
+              shizuha-agent-runtime agent-runtime \
+              "localhost:30500/shizuha-agent-runtime:${TAG}" "$DIGEST" "$SOURCE_SHA"; then
+            echo "::warning::DeploymentEvent recording failed — promotion landed; a carrier can re-ingest with the idempotency key origin:${GITHUB_REPOSITORY}:shizuha-agent-runtime:agent-runtime:${SOURCE_SHA}"
+          fi

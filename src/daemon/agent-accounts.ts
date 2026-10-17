@@ -226,6 +226,30 @@ function transientAgentLogin(
 type PasswordRollback = (() => void | Promise<void>) | null | undefined;
 type PersistAgentPassword = (password: string) => PasswordRollback | Promise<PasswordRollback>;
 
+/**
+ * PLAT-8992 Defect A: shizuha-id's `InternalFleetProvisionAgentView` enforces
+ * the deliberate domain allowlist (@shizuha.com / @agents.shizuha.io) — a truthy
+ * but non-allowlisted email in drifted daemon state (e.g. `codex@local`) is sent
+ * verbatim to the fleet provisioner and 403s there on EVERY reconcile cycle,
+ * forever. Substitute the canonical `${username}@agents.shizuha.io`-domain email
+ * for provisioner-eligible domains; never weaken the id-side allowlist
+ * (deliberate human-safety invariant, PLAT-4220 / SCLI-205).
+ *
+ * Returns `email` VERBATIM when it is on a provisioner-eligible domain (the
+ * verified-live 200 payload shape); TRIM only. The `@agents.shizuha.io` domain
+ * (the canonical container-domain email) is eligible; the plain domain is
+ * eligible for operator-managed accounts.
+ */
+const PROVISIONER_ELIGIBLE_DOMAINS = ['@shizuha.com', '@agents.shizuha.io'] as const;
+
+export function canonicalAgentEmail(agentUsername: string, email?: string): string {
+  const fallback = `${agentUsername.trim().toLowerCase()}@agents.shizuha.io`;
+  if (!email) return fallback;
+  const normalized = email.trim().toLowerCase();
+  if (PROVISIONER_ELIGIBLE_DOMAINS.some((domain) => normalized.endsWith(domain))) return normalized;
+  return fallback;
+}
+
 const CREDENTIALS_DIR_NAME = 'agent-auth';
 
 function getCredentialsDir(): string {
@@ -333,6 +357,15 @@ async function reconcileCanonicalAccountPassword(opts: {
   email: string;
   userId: number;
   canonicalPassword: string;
+  /**
+   * PLAT-8992 Defect B (minimum): after a successful reconciliation, the
+   * daemon-internal scoped-grant password (#2 in agents.json SSOT — the surface
+   * k8s injects from) is backfilled to the reconciled value. Without this, a
+   * reconciliation can succeed while #2 stays stale, so every pod restart
+   * re-ships the stale AGENT_PASSWORD and the drift loop reopens. Fail-closed:
+   * a failed backroll-free backfill returns null (PLAT-558 single-write).
+   */
+  persistCanonicalPassword?: PersistAgentPassword;
 }): Promise<ProvisionResult | null> {
   // SCLI-205 (A′): prefer the scoped fleet-provisioner endpoint (static token,
   // agents-only, atomic reconnect+set_password+approve) over the operator-admin
@@ -364,6 +397,18 @@ async function reconcileCanonicalAccountPassword(opts: {
     return null;
   }
   logger.info({ agent: opts.agentUsername, userId: loginResult.userId }, 'Agent account: reconciled canonical account password');
+  // PLAT-8992 Defect B (minimum): backfill the scoped grant (#2) to the reconciled
+  // value BEFORE handing the fresh token to the broker, so the daemon SSOT can
+  // never stay stale independently of the account (the drift loop reopens on the
+  // next pod restart otherwise).
+  if (opts.persistCanonicalPassword) {
+    try {
+      await opts.persistCanonicalPassword(opts.canonicalPassword);
+    } catch (err) {
+      logger.error({ agent: opts.agentUsername, err: (err as Error).message }, 'Agent account: scoped-grant password backfill failed');
+      return null;
+    }
+  }
   return saveAgentLogin(opts.agentUsername, opts.email, opts.canonicalPassword, loginResult);
 }
 
@@ -408,7 +453,7 @@ export async function ensureAgentAccount(opts: {
   remintAdminToken?: () => Promise<string | null>;
 }): Promise<ProvisionResult | null> {
   const { agentUsername, platformUrl, adminToken } = opts;
-  const email = opts.agentEmail || `${agentUsername}@agents.shizuha.io`;
+  const email = canonicalAgentEmail(agentUsername, opts.agentEmail);
   const firstName = opts.agentFirstName || agentUsername.charAt(0).toUpperCase() + agentUsername.slice(1);
   const lastName = opts.agentLastName || '(AI Agent)';
   const baseUrl = platformUrl.replace(/\/+$/, '');
@@ -469,6 +514,7 @@ export async function ensureAgentAccount(opts: {
       const userId = decodeUserIdFromJwt(stored.accessToken) ?? stored.userId ?? 0;
       return await reconcileCanonicalAccountPassword({
         baseUrl, admin, agentUsername, email, userId, canonicalPassword: opts.canonicalPassword,
+        persistCanonicalPassword: opts.persistCanonicalPassword,
       });
     }
 
@@ -477,6 +523,7 @@ export async function ensureAgentAccount(opts: {
       if (legacyLogin.kind === 'success') {
         return await reconcileCanonicalAccountPassword({
           baseUrl, admin, agentUsername, email, userId: legacyLogin.userId, canonicalPassword: opts.canonicalPassword,
+          persistCanonicalPassword: opts.persistCanonicalPassword,
         });
       }
     }
@@ -495,6 +542,7 @@ export async function ensureAgentAccount(opts: {
     const driftedUserId = (stored?.accessToken ? decodeUserIdFromJwt(stored.accessToken) : null) ?? stored?.userId ?? 0;
     const healed = await reconcileCanonicalAccountPassword({
       baseUrl, admin, agentUsername, email, userId: driftedUserId, canonicalPassword: opts.canonicalPassword,
+      persistCanonicalPassword: opts.persistCanonicalPassword,
     });
     if (healed) {
       logger.info({ agent: agentUsername }, 'Agent account: fully-drifted account self-healed via unconditional canonical reconcile (PLAT-4006)');

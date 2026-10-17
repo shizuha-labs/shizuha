@@ -68,7 +68,7 @@ func (s *Server) handleMCPProjection(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "projection caller identity refused"})
 		return
 	}
-	if strings.TrimSpace(s.cfg.ProjectionURL) == "" || strings.TrimSpace(s.cfg.CoordinatorBearerToken) == "" {
+	if strings.TrimSpace(s.cfg.ProjectionURL) == "" {
 		s.audit.Emit("mcp-projection-refused", map[string]any{"failure_class": "producer_unconfigured", "uid": peer.UID})
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "projection producer unavailable"})
 		return
@@ -85,7 +85,13 @@ func (s *Server) handleMCPProjection(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "projection audience unavailable"})
 		return
 	}
-	raw, err := fetchMCPProjection(r.Context(), projectionURL, s.cfg.CoordinatorBearerToken, input.Nonce)
+	bearer, err := s.coordinatorBearer(r.Context())
+	if err != nil {
+		s.audit.Emit("mcp-projection-refused", map[string]any{"failure_class": "coordinator_auth", "uid": peer.UID})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "projection producer unavailable"})
+		return
+	}
+	raw, err := fetchMCPProjection(r.Context(), projectionURL, bearer, input.Nonce)
 	if err != nil {
 		s.audit.Emit("mcp-projection-refused", map[string]any{"failure_class": "producer_refusal", "uid": peer.UID, "error": err.Error()})
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "projection unavailable"})

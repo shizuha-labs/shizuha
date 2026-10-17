@@ -70,6 +70,21 @@ describe('vLLM/Cortex Retry-After plumbing', () => {
     expect(retryAfterMsFromError(err)).toBe(5_000);
   }, 120_000);
 
+  it('pauses a typed dry pool after one HTTP attempt and honors its real cooldown', async () => {
+    let hits = 0;
+    const err = await requestAgainst((_req, res) => {
+      hits += 1;
+      res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '7200' });
+      res.end(JSON.stringify({ error: {
+        message: 'Known model temporarily unavailable', type: 'provider_error',
+        code: 'provider_pool_dry', reason: 'provider_pool_dry', retryable: true,
+      } }));
+    });
+    expect(hits).toBe(1);
+    expect(err).toMatchObject({ status: 503, providerPoolDry: true, retryInMs: 7_200_000 });
+    expect(err.message).toContain('provider_pool_dry');
+  }, 15_000);
+
   it('ends the turn on residency_full instead of a 40× 5xx storm', async () => {
     let hits = 0;
     const err = await requestAgainst((_req, res) => {

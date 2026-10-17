@@ -24,7 +24,7 @@ import { getModelProfile, resolveReasoningEffortForRequest, shouldEnableThinking
 import { isDeepSeekV4Model, officialThinkingWire, shouldPassBackReasoning } from './deepseek-wire.js';
 import { countTokens } from '../utils/tokens.js';
 import { getSafetyFactor, IMAGE_TOKEN_ESTIMATE } from '../prompt/context.js';
-import { resolveModelContextWindow } from './context-window.js';
+import { hasKnownModelContextWindow, resolveModelContextWindow } from './context-window.js';
 import { isTransientProviderFailure } from './transient-errors.js';
 import { providerTimeouts, recordScliInferenceTelemetry, recordPromptPrefixDivergence } from '../metrics/registry.js';
 import { PromptPrefixGuard, promptPrefixGuardEnabled, type PromptPrefixPart } from '../telemetry/prompt-prefix-guard.js';
@@ -1436,6 +1436,12 @@ export class VLlmProvider implements LLMProvider {
       if (served) model = served;
     }
 
+    // Budget the requested model, not the provider's last/global discovery.
+    // A hidden known model keeps its model-specific fallback; unknown models
+    // retain the configured conservative window rather than a generic guess.
+    const requestContextWindow = this.discoveredContextWindowFor(model)
+      ?? (hasKnownModelContextWindow(model) ? resolveModelContextWindow(model) : this.maxContextWindow);
+
     const profile = getModelProfile(model);
     const aliases = profile.toolNameAliases ?? {};
     const reverseAliases: Record<string, string> = {};
@@ -1538,7 +1544,7 @@ export class VLlmProvider implements LLMProvider {
     this._rawPromptEstimateLast = rawPromptEstimate;
     const promptTokenEstimate = Math.ceil(rawPromptEstimate * this._calibratedSafetyFactor(model));
     const CONTEXT_GUARD_TOKENS = 256;
-    const remainingForOutput = Math.max(1, this.maxContextWindow - promptTokenEstimate - CONTEXT_GUARD_TOKENS);
+    const remainingForOutput = Math.max(1, requestContextWindow - promptTokenEstimate - CONTEXT_GUARD_TOKENS);
     let maxTokens = Math.min(requestedMaxTokens, maxTokensCap, remainingForOutput);
     // Interactive TUI + GLM/thinking models: originally clamped to 8192 because
     // at ~20 tok/s a 16-24k output held a max_concurrent=1 backend exclusively
@@ -1570,7 +1576,7 @@ export class VLlmProvider implements LLMProvider {
         requestedMaxTokens,
         clampedMaxTokens: maxTokens,
         promptTokenEstimate,
-        maxContextWindow: this.maxContextWindow,
+        maxContextWindow: requestContextWindow,
       }, `${this.logLabel}: clamped max_tokens to fit prompt within context window`);
     }
 
@@ -1584,13 +1590,13 @@ export class VLlmProvider implements LLMProvider {
     // remainingForOutput is large; the guard only fires when the context window
     // itself is the binding constraint.
     const MIN_USABLE_OUTPUT_TOKENS = 512;
-    const contextRemaining = this.maxContextWindow - promptTokenEstimate;
+    const contextRemaining = requestContextWindow - promptTokenEstimate;
     if (remainingForOutput < MIN_USABLE_OUTPUT_TOKENS) {
       const _label = this.baseUrl.includes('cortex') || model.toLowerCase().includes('glm')
         ? 'Cortex/vLLM' : 'vLLM';
       const ctxMsg =
         `${_label}: context window exhausted — ` +
-        `served max_model_len=${this.maxContextWindow} tokens, ` +
+        `served max_model_len=${requestContextWindow} tokens, ` +
         `prompt≈${promptTokenEstimate} tokens, ` +
         `only ${remainingForOutput} output tokens remain after guard band (floor: ${MIN_USABLE_OUTPUT_TOKENS}). ` +
         `Compaction did not reduce context sufficiently. ` +

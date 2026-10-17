@@ -1,3 +1,4 @@
+import { isFrameworkOperationalMessage, modelConversationMessages } from './message-provenance.js';
 import type { Message, ToolCall, ContentBlock } from './types.js';
 import type { LLMProvider, ChatMessage, ChatContentBlock, StreamChunk, ChatOptions } from '../provider/types.js';
 import type { ToolHandler, ToolResult, ToolContext, ToolDefinition } from '../tools/types.js';
@@ -194,6 +195,7 @@ export function assembleWireChatMessages(
     !wirePrefix
     || wirePrefix.sourceCount <= 0
     || wirePrefix.sourceCount > messages.length
+    || messages.slice(0, wirePrefix.sourceCount).some(isFrameworkOperationalMessage)
     || !Array.isArray(wirePrefix.messages)
     || wirePrefix.messages.length === 0
   ) {
@@ -213,7 +215,7 @@ export function assembleWireChatMessages(
 }
 
 export function messagesToChat(messages: Message[]): ChatMessage[] {
-  return messages.map((m) => {
+  return modelConversationMessages(messages).map((m) => {
     if (typeof m.content === 'string') {
       return { role: m.role, content: m.content } as ChatMessage;
     }

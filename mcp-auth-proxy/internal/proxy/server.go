@@ -13,17 +13,21 @@ import (
 )
 
 type Server struct {
-	cfg          Config
-	audit        *AuditEmitter
-	reviewer     TokenReviewer
-	mint         MintClient
-	upstreams    *UpstreamManager
-	mu           sync.RWMutex
-	session      *MintResponse
-	identity     *IdentityTuple
-	agentSession *AgentSession    // PLAT-149: password-minted JWT handed to the agent via GET /token
-	credBroker   CredentialBroker // PLAT-166: platform relay for /credential/request (nil = fail-closed)
-	lastMintErr  string           // SCLI-154: last mint failure reason, surfaced in /token 503 response
+	cfg                       Config
+	audit                     *AuditEmitter
+	reviewer                  TokenReviewer
+	mint                      MintClient
+	upstreams                 *UpstreamManager
+	mu                        sync.RWMutex
+	session                   *MintResponse
+	identity                  *IdentityTuple
+	agentSession              *AgentSession    // PLAT-149: password-minted JWT handed to the agent via GET /token
+	credBroker                CredentialBroker // PLAT-166: platform relay for /credential/request (nil = fail-closed)
+	lastMintErr               string           // SCLI-154: last mint failure reason, surfaced in /token 503 response
+	coordinatorOAuthMu        sync.Mutex
+	coordinatorOAuthToken     string
+	coordinatorOAuthRefreshAt time.Time
+	coordinatorOAuthNow       func() time.Time
 }
 
 // SetAgentSession stores the latest password-minted session (called by the

@@ -262,6 +262,7 @@ describe('gateway semantic compaction transaction', () => {
     expect(h.agent.messages).toEqual(h.history());
     expect(h.agent.providerWirePrefix).toEqual(wire);
     expect(h.agent.recentErrors).toEqual([message]);
+    expect(vi.mocked(h.channel.sendTelemetry!).mock.calls.at(-1)?.[0].activity).toMatchObject({ phase: 'idle', state: 'idle' });
     expect(h.agent.buildTelemetry().health).toMatchObject({
       ...gatewayHealthFromRecentErrors([message]),
       compaction_failure: { category: 'provider', code: 'COMPACTION_PROVIDER_FAILED', cause_code: code, ...(status ? { status } : {}) },

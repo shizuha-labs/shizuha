@@ -3,10 +3,12 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as http from 'node:http';
 import {
   MCP_PROJECTION_PROTOCOL_PREFIX,
   ProjectionAuthority,
   canonicalizeProjectionJson,
+  fetchBrokerProjection,
   loadProjectionHighWater,
   projectionSigningPreimage,
   storeProjectionHighWater,
@@ -175,7 +177,8 @@ describe('PLAT-5275 MCP projection verifier', () => {
     await first.start();
     first.stop();
     expect(loadProjectionHighWater(file)).toBe(2);
-    await expect(authority(1).start()).rejects.toThrow('generation rollback');
+    const rolledBack = authority(1);
+    try { await expect(rolledBack.start()).rejects.toThrow('generation rollback'); } finally { rolledBack.stop(); }
   });
 
   it('rejects replayed and omitted nonces plus stale signing keys', () => {
@@ -226,5 +229,204 @@ describe('PLAT-5275 MCP projection verifier', () => {
     mono = 1_000; wall = 100_000; fail = true;
     await expect(authority.refresh()).rejects.toThrow('silent stall');
     expect(authority.snapshot().state).toBe('fenced');
+    authority.stop();
+  });
+});
+
+
+describe('projection authority authenticated recovery', () => {
+  it('recovers the same consumer after a real broker refusal and later witnessed envelope', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'projection-recovery-'));
+    fixtures.push(directory);
+    const socket = path.join(directory, 'broker.sock');
+    const fixture = signingFixture();
+    let witnessed = false;
+    const nonces: string[] = [];
+    const server = http.createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk) => { body += chunk; });
+      request.on('end', () => {
+        expect(request.url).toBe('/mcp-projection');
+        const nonce = JSON.parse(body).nonce;
+        nonces.push(nonce);
+        if (!witnessed) { response.writeHead(503); response.end('projection not current'); return; }
+        response.end(signedEnvelope({ nonce: Buffer.from(nonce, 'base64url'), ...fixture }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(socket, resolve));
+    const authority = new ProjectionAuthority({
+      agentAudience: 'agent-1', pinnedKeyringJson: fixture.keyring,
+      fetchEnvelope: (nonce) => fetchBrokerProjection(nonce, { MCP_AUTH_PROXY_SOCKET: socket }),
+      clock: { wallNowMs: () => 100_000, monoNowMs: () => 1_000 },
+      refreshMarginMs: 20, loadHighWater: () => -1, storeHighWater: () => {},
+    });
+    try {
+      await expect(authority.start()).rejects.toThrow('HTTP 503');
+      expect(authority.isAllowed('pulse')).toBe(false);
+      witnessed = true;
+      await vi.waitFor(() => expect(authority.isAllowed('pulse')).toBe(true), { timeout: 1_000, interval: 5 });
+      expect(new Set(nonces).size).toBe(nonces.length);
+      expect(nonces.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      authority.stop();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it.each(['refused', 'expired', 'nonce', 'audience', 'signature', 'rollback'])('keeps %s recovery attempts fenced and rearms until a valid response', async (failure) => {
+    vi.useFakeTimers();
+    const fixture = signingFixture();
+    let valid = false;
+    let calls = 0;
+    const authority = new ProjectionAuthority({
+      agentAudience: 'agent-1', pinnedKeyringJson: fixture.keyring,
+      clock: { wallNowMs: () => 100_000, monoNowMs: () => 1_000 },
+      loadHighWater: () => 2, storeHighWater: () => {},
+      fetchEnvelope: async (nonce) => {
+        calls += 1;
+        if (!valid && failure === 'refused') throw new Error('revoked');
+        return signedEnvelope({
+          ...fixture, nonce: !valid && failure === 'nonce' ? Buffer.alloc(32, 1) : nonce,
+          privateKey: !valid && failure === 'signature' ? signingFixture().privateKey : fixture.privateKey,
+          audience: !valid && failure === 'audience' ? 'other-agent' : 'agent-1',
+          generation: !valid && failure === 'rollback' ? 1 : 2,
+          expiresAt: !valid && failure === 'expired' ? 100_000 : 105_000,
+        });
+      },
+    });
+    try {
+      await expect(authority.start()).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(calls).toBe(2);
+      expect(authority.isAllowed('pulse')).toBe(false);
+      valid = true;
+      await vi.advanceTimersByTimeAsync(250);
+      expect(authority.isAllowed('pulse')).toBe(true);
+    } finally { authority.stop(); }
+  });
+
+  it('keeps recovery singleflight and stop fences an in-flight response before persistent writes', async () => {
+    vi.useFakeTimers();
+    const fixture = signingFixture();
+    let complete!: (value: string) => void;
+    let nonce!: Buffer;
+    const writes = vi.fn();
+    const fetch = vi.fn((next: Buffer) => { nonce = next; return new Promise<string>((resolve) => { complete = resolve; }); });
+    const authority = new ProjectionAuthority({
+      agentAudience: 'agent-1', pinnedKeyringJson: fixture.keyring, fetchEnvelope: fetch,
+      clock: { wallNowMs: () => 100_000, monoNowMs: () => 1_000 },
+      loadHighWater: () => -1, storeHighWater: writes,
+    });
+    const starting = authority.start();
+    const concurrent = authority.refresh();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    authority.stop();
+    complete(signedEnvelope({ nonce, ...fixture }));
+    await Promise.all([starting, concurrent]);
+    expect(writes).not.toHaveBeenCalled();
+    expect(authority.isAllowed('pulse')).toBe(false);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains the scheduled challenge when a read observes expiry and recovers after stop/start', async () => {
+    vi.useFakeTimers();
+    const fixture = signingFixture();
+    let mono = 1_000;
+    let calls = 0;
+    const authority = new ProjectionAuthority({
+      agentAudience: 'agent-1', pinnedKeyringJson: fixture.keyring,
+      clock: { wallNowMs: () => 100_000, monoNowMs: () => mono },
+      loadHighWater: () => -1, storeHighWater: () => {},
+      fetchEnvelope: async (nonce) => { calls += 1; return signedEnvelope({ nonce, ...fixture }); },
+    });
+    await authority.start();
+    mono = 5_501;
+    expect(authority.isAllowed('pulse')).toBe(false);
+    await vi.advanceTimersByTimeAsync(4_250);
+    expect(calls).toBe(2);
+    expect(authority.isAllowed('pulse')).toBe(true);
+    authority.stop();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toBe(2);
+    await authority.start();
+    expect(authority.isAllowed('pulse')).toBe(true);
+    authority.stop();
+  });
+
+  it('recovers after a periodic refresh refusal without an external refresh call', async () => {
+    vi.useFakeTimers();
+    const fixture = signingFixture();
+    let fail = false;
+    let calls = 0;
+    const authority = new ProjectionAuthority({
+      agentAudience: 'agent-1', pinnedKeyringJson: fixture.keyring,
+      clock: { wallNowMs: () => 100_000, monoNowMs: () => 1_000 },
+      loadHighWater: () => -1, storeHighWater: () => {},
+      fetchEnvelope: async (nonce) => {
+        calls += 1;
+        if (fail) throw new Error('witness temporarily unavailable');
+        return signedEnvelope({ nonce, ...fixture });
+      },
+    });
+    try {
+      await authority.start();
+      fail = true;
+      await vi.advanceTimersByTimeAsync(4_250);
+      expect(calls).toBe(2);
+      expect(authority.isAllowed('pulse')).toBe(false);
+      fail = false;
+      await vi.advanceTimersByTimeAsync(250);
+      expect(calls).toBe(3);
+      expect(authority.isAllowed('pulse')).toBe(true);
+    } finally { authority.stop(); }
+  });
+
+  it('serializes stop/start behind the old response and rejects its authority', async () => {
+    vi.useFakeTimers();
+    const fixture = signingFixture();
+    let oldNonce!: Buffer;
+    let complete!: (value: string) => void;
+    const writes = vi.fn();
+    const fetch = vi.fn(async (nonce: Buffer) => {
+      if (fetch.mock.calls.length === 1) {
+        oldNonce = nonce;
+        return new Promise<string>((resolve) => { complete = resolve; });
+      }
+      return signedEnvelope({ nonce, ...fixture, generation: 2 });
+    });
+    const authority = new ProjectionAuthority({
+      agentAudience: 'agent-1', pinnedKeyringJson: fixture.keyring, fetchEnvelope: fetch,
+      clock: { wallNowMs: () => 100_000, monoNowMs: () => 1_000 },
+      loadHighWater: () => -1, storeHighWater: writes,
+    });
+    const first = authority.start();
+    authority.stop();
+    const second = authority.start();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(authority.isAllowed('pulse')).toBe(false);
+    complete(signedEnvelope({ nonce: oldNonce, ...fixture, generation: 99 }));
+    await Promise.all([first, second]);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(writes.mock.calls).toEqual([[2]]);
+    expect(authority.isAllowed('pulse')).toBe(true);
+    authority.stop();
+  });
+
+  it('never fetches or rearms when persistent high-water loading fails', async () => {
+    vi.useFakeTimers();
+    const fixture = signingFixture();
+    const fetch = vi.fn();
+    const authority = new ProjectionAuthority({
+      agentAudience: 'agent-1', pinnedKeyringJson: fixture.keyring, fetchEnvelope: fetch,
+      loadHighWater: () => { throw new Error('corrupt high-water'); },
+    });
+    await expect(authority.start()).rejects.toThrow('corrupt high-water');
+    await authority.refresh();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(authority.isAllowed('pulse')).toBe(false);
+    authority.stop();
   });
 });

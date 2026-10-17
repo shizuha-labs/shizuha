@@ -50,10 +50,10 @@ for (const mode of ["failed", "deadline"]) {
 
 test("every generated MCP auth Job has a fail-closed lifetime", () => {
   const renderedJobs = workflow.match(/apiVersion: batch\/v1[\s\S]*?(?=YAML|$)/g) ?? [];
-  assert.equal(renderedJobs.length, 4);
-  for (const job of renderedJobs) {
+  assert.equal(renderedJobs.length, 5);
+  for (const [index, job] of renderedJobs.entries()) {
     assert.match(job, /backoffLimit: 0/);
-    assert.match(job, /activeDeadlineSeconds: 3600/);
+    assert.match(job, index === 4 ? /activeDeadlineSeconds: 300\b/ : /activeDeadlineSeconds: 3600\b/);
     assert.match(job, /ttlSecondsAfterFinished: 300/);
   }
 });
@@ -84,4 +84,18 @@ test("verified broker publication advances the runtime controller rollout pin", 
     /SHIZUHA_BROKER_IMAGE=\$\{BROKER_IMAGE\}[\s\S]*rollout status deployment\/shizuha-runtime-fleet --timeout=300s/,
   );
   assert.match(workflow, /test "\$\{LIVE_BROKER_IMAGE\}" = "\$\{BROKER_IMAGE\}"/);
+});
+
+test("native Hive publication follows qualification and persists all four source authorities", () => {
+  const publication = workflow.indexOf('- name: Publish qualified broker to native Hive source authority');
+  assert.ok(publication > workflow.indexOf('test "${LIVE_BROKER_IMAGE}" = "${BROKER_IMAGE}"'));
+  const body = readFileSync("scripts/publish-hive-broker.sh", "utf8");
+  assert.match(body, /update-hive-broker-pins\.py/);
+  assert.match(body, /--image "\$BROKER_IMAGE" --source-sha "\$SOURCE_SHA"/);
+  assert.match(body, /git -C "\$WORKDIR\/hive" add hive_project\/settings\.py k8s\/hive-backend-live\.yaml \\\n\s+k8s\/shizuha-hive\.yaml \.forgejo\/scripts\/ring-release-fleet\.sh/);
+  assert.match(body, /http\.extraHeader="Authorization: Basic \$\{AUTH\}" push origin HEAD:main/);
+  assert.doesNotMatch(body, /kubectl .* (?:apply|patch|set|replace)|push .*--force/);
+  assert.doesNotMatch(workflow.slice(publication), /kubectl .*get secret/);
+  assert.match(workflow.slice(publication), /secretKeyRef: \{ name: forgejo-token, key: password \}/);
+  assert.match(workflow, /- scripts\/update-hive-broker-pins\.py/);
 });
