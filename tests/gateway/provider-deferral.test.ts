@@ -71,6 +71,92 @@ describe('Gateway typed provider admission deferral', () => {
 
     } finally { agent.store.close(); await new Promise<void>(resolve => server.close(() => resolve())); }
   });
+  it('resumes an admitted routine notification before cron and heartbeat can displace it', async () => {
+    const {agent,channel}=fixture();agent.provider={name:'fixture-provider'};
+    agent.registerChannel({...channel,id:'http-default',type:'http',ackProcessed:undefined});
+    const original={...message('routine-pending'),content:'[system] [Task Assigned] FIX-123',
+      metadata:{schedulerClass:'routine-task',schedulerTaskKey:'FIX-123'}};
+    const attempts:string[]=[];let refuse=true;
+    agent.executeTurns=vi.fn(async(msg:InboundMessage)=>{attempts.push(msg.id);
+      if(refuse)throw Object.assign(new Error('fixture residency occupied'),{status:503,residencyFull:true,retryInMs:1});
+      return false;
+    });
+    try {
+      agent.inbox.push(original);await agent.processNextInboxMessage();
+      const cron={...message('queued-cron'),source:'cron',channelId:'http-default',channelType:'http'};
+      agent.inbox.push(cron);
+      await expect(agent.processNextInboxMessage()).resolves.toBeUndefined();
+      expect(attempts).toEqual(['routine-pending','routine-pending']);
+      expect(channel.ackProcessed).not.toHaveBeenCalled();
+      agent.inbox.push({...message('queued-heartbeat'),source:'heartbeat',channelId:'http-default',channelType:'http'});
+      refuse=false;await agent.processNextInboxMessage();
+      expect(attempts).toEqual(['routine-pending','routine-pending','routine-pending']);
+      expect(channel.ackProcessed.mock.calls.map((call:any[])=>call[0])).toEqual(['routine-pending']);
+      expect(agent.store.pendingProviderInputs(agent.providerDeferralOwner())).toEqual([]);
+      await agent.processNextInboxMessage();await agent.processNextInboxMessage();
+      expect(attempts.slice(3)).toEqual(['queued-heartbeat','queued-cron']);
+      expect(agent.messages.filter((m:any)=>m.role==='user'&&m.id===original.id)).toHaveLength(1);
+    } finally {agent.store.close();}
+  });
+
+  it('preserves a restored admitted notification across same-task coalescing and heartbeat drop', async () => {
+    const original=fixture();const first=original.agent;first.provider={name:'fixture-provider'};
+    const input={...message('restored-routine'),content:'[system] [Task Assigned] FIX-456',
+      metadata:{schedulerClass:'routine-task',schedulerTaskKey:'FIX-456'}};
+    first.executeTurns=vi.fn().mockRejectedValue(Object.assign(new Error('fixture pause'),
+      {status:503,residencyFull:true,retryInMs:20}));
+    await first.processInboxMessage(input);first.store.close();
+    const current:any=new AgentProcess(original.config);current.registerChannel(original.channel);
+    current.store=new StateStore(path.join(original.cwd,'state.db'));current.loadEternalSession();
+    current.provider={name:'fixture-provider'};current.running=true;current.executeTurns=vi.fn(async()=>false);
+    current.registerChannel({...original.channel,id:'http-default',type:'http',ackProcessed:undefined});
+    try {
+      current.restoreProviderDeferredInputs();
+      current.inbox.push({...input,id:'new-unadmitted-hint'});
+      current.inbox.push({...message('restart-heartbeat'),source:'heartbeat',channelId:'http-default',channelType:'http'});
+      expect(current.inbox.peek().id).toBe(input.id);
+      expect(current.inbox.queued().map((row:InboundMessage)=>row.id)).toContain(input.id);
+      expect(current.inbox.queued().map((row:InboundMessage)=>row.id)).toContain('new-unadmitted-hint');
+      await current.processNextInboxMessage();
+      expect(current.executeTurns.mock.calls[0][0].id).toBe(input.id);
+      expect(original.channel.ackProcessed.mock.calls.map((call:any[])=>call[0])).toEqual([input.id]);
+      await current.processNextInboxMessage();
+      expect(current.executeTurns.mock.calls.map((call:any[])=>call[0].id)).toEqual([input.id,'restart-heartbeat']);
+      expect(current.inbox.depth).toBe(0); // only the unadmitted hint was dropped
+      expect(current.store.pendingProviderInputs(current.providerDeferralOwner())).toEqual([]);
+    } finally {current.store.close();}
+  });
+
+  it('pins a maintenance-refused admitted row and re-arms it after drain without admitting cron', async () => {
+    const {agent,channel}=fixture();agent.provider={name:'fixture-provider'};
+    agent.registerChannel({...channel,id:'http-default',type:'http',ackProcessed:undefined});
+    const original={...message('maintenance-routine'),content:'[system] [Task Assigned] FIX-789',
+      metadata:{schedulerClass:'routine-task',schedulerTaskKey:'FIX-789'}};
+    let refuse=true;
+    agent.refreshStaleFirstTurnPrewarmBeforeWork=vi.fn(async()=>{
+      if(!refuse)return true;
+      agent.store.deferProviderAdmission(agent.providerDeferralOwner(),'fixture-provider','fixture-model',
+        Date.now()+50,'residency_full');return false;
+    });
+    agent.executeTurns=vi.fn(async()=>false);
+    try {
+      await agent.processInboxMessage(original);
+      agent.inbox.push({...message('after-drain-cron'),source:'cron',channelId:'http-default',channelType:'http'});
+      const waiting=agent.processNextInboxMessage();
+      agent.armRuntimeRollDrain({requestId:'fixture-drain',targetImage:'fixture:next',leaseMs:1000});
+      await waiting;
+      expect(agent.executeTurns).not.toHaveBeenCalled();expect(channel.ackProcessed).not.toHaveBeenCalled();
+      expect(agent.store.pendingProviderInputs(agent.providerDeferralOwner())[0].messageId).toBe(original.id);
+      agent.runtimeRollDrain.dispose();refuse=false;
+      await agent.processNextInboxMessage();
+      expect(agent.executeTurns.mock.calls[0][0].id).toBe(original.id);
+      expect(channel.ackProcessed.mock.calls.map((call:any[])=>call[0])).toEqual([original.id]);
+      await agent.processNextInboxMessage();
+      expect(agent.executeTurns.mock.calls[1][0].id).toBe('after-drain-cron');
+      expect(agent.store.pendingProviderInputs(agent.providerDeferralOwner())).toEqual([]);
+    } finally {agent.store.close();}
+  });
+
   it('rehydrates exact pending input/deadline and deduplicates upstream replay in a fresh process', async () => {
     const original=fixture(); let first=original.agent;
     const input=message('restart-pending');
