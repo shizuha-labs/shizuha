@@ -23,6 +23,7 @@ import type { ToolDefinition, ToolContext } from '../tools/types.js';
 import type { PermissionMode } from '../permissions/types.js';
 import type { LLMProvider } from '../provider/types.js';
 import type { Channel, ChannelType, InboundMessage, GatewayConfig } from './types.js';
+import { typedProviderDeferral } from './provider-deferral.js';
 import { DEFAULT_FAN_OUT } from './types.js';
 import { Inbox } from './inbox.js';
 import { DeliveryQueue } from './delivery-queue.js';
@@ -1022,6 +1023,7 @@ export class AgentProcess {
   private readonly telemetryFlusher = createTelemetryFlusher(() => this.emitTelemetry());
   private readonly recentErrors: string[] = [];
   private readonly providerFailureNotices = new Map<string, number>();
+  private cancelProviderAdmissionWait: (() => void) | null = null;
   private sessionId: string | null = null;
   /** Transcript generation currently allowed to emit/persist output. */
   private sessionGeneration = 0;
@@ -1318,6 +1320,7 @@ export class AgentProcess {
   /** Reserve the next persisted model/tool-turn boundary for an image rollout. */
   armRuntimeRollDrain(request: RuntimeRollDrainRequest): RuntimeRollDrainSnapshot {
     this.runtimeRollDrain.arm(request);
+    this.cancelProviderAdmissionWait?.();
     if (!this.isBusy()) this.markRuntimeRollReadyIfIdle();
     return this.runtimeRollDrainSnapshot()!;
   }
@@ -2296,8 +2299,11 @@ export class AgentProcess {
     // (that's the point) and meters it under bulk_ttft, invisible to the
     // interactive SLO. Inbox messages accumulate during the warm-up and are
     // processed immediately after. Fail-open: any error just proceeds cold.
-    await this.prewarmPrefixCache();
-    await this.prewarmManagedGrokFallbackPrefix(this.model, 'restart');
+    this.restoreProviderDeferredInputs();
+    if (await this.waitForProviderAdmission()) {
+      await this.prewarmPrefixCache();
+      await this.prewarmManagedGrokFallbackPrefix(this.model, 'restart');
+    }
 
     // Main loop — runs forever
     while (this.running) {
@@ -2306,18 +2312,7 @@ export class AgentProcess {
           await this.waitForRuntimeRollDrainRelease();
           continue;
         }
-        const msg = await this.inbox.next();
-        this.inboxMessageAdmitted = true;
-        // Close the dequeue/arm race: a drain armed while next() resolved must
-        // retain the row, not start a new turn after the controller saw idle.
-        if (this.runtimeRollDrain.active) {
-          this.inbox.pushFront([msg]);
-          this.inboxMessageAdmitted = false;
-          this.markRuntimeRollReadyIfIdle();
-          await this.waitForRuntimeRollDrainRelease();
-          continue;
-        }
-        await this.processAdmittedInboxMessage(msg);
+        await this.processNextInboxMessage();
       } catch (err) {
         this.inboxMessageAdmitted = false;
         if (!this.running) break; // Shutdown
@@ -2326,6 +2321,59 @@ export class AgentProcess {
         this.emitTelemetry();
       }
     }
+  }
+
+  private providerDeferralOwner(): string {
+    return this.config.agentId || this.config.agentUsername || `gateway:${this.cwd}`;
+  }
+
+  private restoreProviderDeferredInputs(): void {
+    const pending = this.store.pendingProviderInputs(this.providerDeferralOwner());
+    const rows = pending.map((row: { messageId: string; payload: string }) => {
+      const message = JSON.parse(row.payload) as InboundMessage;
+      if (message.id !== row.messageId || typeof message.channelId !== 'string'
+          || typeof message.threadId !== 'string' || typeof message.timestamp !== 'number') {
+        throw new Error('Invalid deferred provider delivery checkpoint');
+      }
+      return message;
+    });
+    this.inbox.pushFront(rows);
+  }
+
+  /** Wait while idle; no admitted row, HTTP call, or model prefix is consumed. */
+  private async waitForProviderAdmission(): Promise<boolean> {
+    while (this.running && !this.runtimeRollDrain.active) {
+      const saved = this.store.providerDeferral(this.providerDeferralOwner(), this.provider?.name || 'unknown', this.model);
+      const remaining = saved ? saved.notBefore - Date.now() : 0;
+      if (!Number.isFinite(remaining)) throw new Error('Invalid provider admission deadline');
+      if (remaining <= 0) return true;
+      await new Promise<void>((resolve) => {
+        let timer: ReturnType<typeof setTimeout>;
+        const finish = () => {
+          clearTimeout(timer);
+          if (this.cancelProviderAdmissionWait === finish) this.cancelProviderAdmissionWait = null;
+          resolve();
+        };
+        // setTimeout's signed-32-bit limit is an implementation bound, not a
+        // shorter provider deadline: re-read the same absolute bound on wake.
+        timer = setTimeout(finish, Math.min(remaining, 2_147_483_647));
+        this.cancelProviderAdmissionWait = finish;
+        if (!this.running || this.runtimeRollDrain.active) finish();
+      });
+    }
+    return false;
+  }
+
+  private async processNextInboxMessage(): Promise<void> {
+    if (!await this.waitForProviderAdmission()) return;
+    const msg = await this.inbox.next();
+    if (!this.running || this.runtimeRollDrain.active) {
+      this.inbox.pushFront([msg]);
+      this.markRuntimeRollReadyIfIdle();
+      return;
+    }
+    this.inboxMessageAdmitted = true;
+    await this.processAdmittedInboxMessage(msg);
   }
 
   /** P99<=5s invariant (2026-07-14): re-prefill the restored session on the
@@ -2474,6 +2522,10 @@ export class AgentProcess {
       logger.info({ reason, ms: Date.now() - started }, 'Cortex prefix cache pre-warm complete');
       return true;
     } catch (err) {
+      const deferred = typedProviderDeferral(err);
+      if (deferred) {
+        this.store.deferProviderAdmission(this.providerDeferralOwner(), provider.name, model, deferred.notBefore, deferred.reason);
+      }
       const detail = err instanceof Error ? err.message : String(err);
       const healthError = new Error(`cortex_prefix_prewarm_failed reason=${reason}: ${detail}`);
       this.recordRecentError(healthError);
@@ -2837,6 +2889,7 @@ export class AgentProcess {
   /** Stop the agent process gracefully. */
   async stop(): Promise<void> {
     this.running = false;
+    this.cancelProviderAdmissionWait?.();
     this.activeCompactionAbort?.abort();
     this.runtimeRollDrain.dispose();
     if (this.idleHeartbeatTimer) { clearInterval(this.idleHeartbeatTimer); this.idleHeartbeatTimer = null; }
@@ -4539,6 +4592,7 @@ export class AgentProcess {
       && Boolean(this.sessionId)
       && msg.metadata?.['syntheticDigest'] !== true;
     if (processingAck && this.store.inboundProcessingCompleted(this.sessionId!, msg.id)) {
+      this.store.completeProviderInput(this.providerDeferralOwner(), msg.id);
       await channel?.ackProcessed?.(msg.id);
       logger.info({ messageId: msg.id }, 'Acknowledged already-completed Connect replay without re-execution');
       return;
@@ -4548,6 +4602,7 @@ export class AgentProcess {
     }
     const outcome = await this.processMessage(msg);
     if (outcome === false) return;
+    this.store.completeProviderInput(this.providerDeferralOwner(), msg.id);
     if (processingAck) {
       this.store.markInboundProcessingCompleted(this.sessionId!, msg.id);
       const acknowledged = await channel?.ackProcessed?.(msg.id);
@@ -4729,6 +4784,7 @@ export class AgentProcess {
     let recoveryAttemptRecorded = false;
     let runtimeRollDeferred = false;
     let compactionDeferred = false;
+    let providerDeferred = false;
     let compactionDiscarded = false;
 
     const channel = this.channels.get(msg.channelId);
@@ -4780,6 +4836,14 @@ export class AgentProcess {
       prewarmReady = await this.refreshStaleFirstTurnPrewarmBeforeWork();
     }
     if (!prewarmReady) {
+      const saved = this.store.providerDeferral(this.providerDeferralOwner(), this.provider?.name || 'unknown', this.model);
+      if (saved && saved.notBefore > Date.now()) {
+        this.store.deferProviderInput(this.providerDeferralOwner(), this.provider?.name || 'unknown', this.model,
+          saved.notBefore, saved.reason, msg.id, JSON.stringify(msg));
+        this.inbox.pushFront([msg]);
+        this.inbox.busy = false;
+        return false;
+      }
       // Never charge a failed maintenance fill to the real request. Put the
       // exact admitted row back at the head before releasing busy state; the
       // next serialized attempt will retry the freshness fence. This preserves
@@ -4981,6 +5045,25 @@ export class AgentProcess {
 
     } catch (err) {
       const errorMsg = (err as Error).message || 'Internal error';
+      const currentCompaction = !(err instanceof GatewayCompactionFailure)
+        || (err.category === 'provider' && err.generation === this.sessionGeneration && err.sessionId === this.sessionId);
+      const deferred = currentCompaction ? typedProviderDeferral(err instanceof GatewayCompactionFailure ? err.cause : err) : null;
+      if (deferred) {
+        providerDeferred = true;
+        // Commit before relinquishing the row. Connect remains unacknowledged;
+        // startup restores this exact input even if the process exits now.
+        this.store.deferProviderInput(this.providerDeferralOwner(), this.provider?.name || 'unknown', this.model,
+          deferred.notBefore, deferred.reason, msg.id, JSON.stringify(msg));
+        this.inbox.pushFront([msg]);
+        this.recordRecentError(err instanceof GatewayCompactionFailure ? err.cause : err);
+        logger.warn({ reason: deferred.reason, notBefore: deferred.notBefore, messageId: msg.id },
+          'Provider temporarily unavailable — exact input deferred without acknowledgement');
+        try {
+          await channel.sendEvent(msg.threadId, { type: 'error', error: 'Provider temporarily unavailable; input remains pending.',
+            code: deferred.reason, retryAt: deferred.notBefore, recoverable: true, terminal: false, timestamp: Date.now() } as any);
+        } catch { /* durable input survives a disconnected channel */ }
+        return false;
+      }
       if (err instanceof GatewayCompactionFailure) {
         compactionDeferred = true;
         compactionDiscarded = err.category === 'interrupted' || err.category === 'stale'
@@ -5095,13 +5178,13 @@ export class AgentProcess {
         } catch { /* swallow send errors */ }
       }
     } finally {
-      if (!runtimeRollDeferred && !compactionDeferred && recoveryEpisodeId && !recoveryAttemptRecorded) {
+      if (!runtimeRollDeferred && !compactionDeferred && !providerDeferred && recoveryEpisodeId && !recoveryAttemptRecorded) {
         await this.finishExpensiveTurnRecoveryBootstrap(recoveryEpisodeId, 'not_observed').catch((err) => {
           logger.error({ err, recoveryEpisodeId }, 'Failed to record SCLI-347 recovery attempt');
         });
       }
       // Fire MessageSent hook (agent finished responding)
-      if (!runtimeRollDeferred && !compactionDeferred && this.hookEngine?.hasHooks('MessageSent')) {
+      if (!runtimeRollDeferred && !compactionDeferred && !providerDeferred && this.hookEngine?.hasHooks('MessageSent')) {
         await this.hookEngine.runHooks('MessageSent', {
           SESSION_ID: this.sessionId ?? '',
           CHANNEL_ID: msg.channelId,
@@ -5111,11 +5194,11 @@ export class AgentProcess {
         }).catch(() => {});
       }
 
-      if (!runtimeRollDeferred && !compactionDiscarded && isSelfWakeup && msg.cronJobId && this.cronStore) {
+      if (!runtimeRollDeferred && !compactionDiscarded && !providerDeferred && isSelfWakeup && msg.cronJobId && this.cronStore) {
         await this.cronStore.markJobRun(msg.cronJobId, selfWakeupError ? 'error' : 'ok', selfWakeupError);
       }
 
-      if (isolateCronTranscript && !runtimeRollDeferred && !compactionDeferred) {
+      if (isolateCronTranscript && !runtimeRollDeferred && !compactionDeferred && !providerDeferred) {
         const trimmed = trimIsolatedCronTranscript(this.messages, cronTranscriptSnapshotCount);
         if (trimmed.length !== this.messages.length) {
           const removed = this.messages.length - trimmed.length;
@@ -5139,7 +5222,7 @@ export class AgentProcess {
       this.telemetryFlusher.now();
       // No execution_complete/ack on a rollout checkpoint. The exact row is
       // still queued locally and remains replayable upstream after replacement.
-      if (!runtimeRollDeferred && !compactionDeferred) channel.sendComplete(msg.threadId);
+      if (!runtimeRollDeferred && !compactionDeferred && !providerDeferred) channel.sendComplete(msg.threadId);
     }
   }
 
