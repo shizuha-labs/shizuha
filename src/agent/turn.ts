@@ -995,9 +995,15 @@ export async function executeTurn(
   // call arrived" is now a fact, not a prediction. (Mid-stream needs 3x the
   // evidence; providers that never emit final_text still get enforcement here.)
   // Runs after DSML salvage so a recovered invoke is not mislabeled as spin.
-  if (!outputDegeneracyReason && toolCalls.length === 0 && (finalText ?? text)) {
+  const providerRepetition = stopReason === 'repetition';
+  if (!outputDegeneracyReason && toolCalls.length === 0 && (providerRepetition || (finalText ?? text))) {
     const soup = detectScriptCollapse(finalText ?? text);
-    const finalVerdict = soup.degenerate ? soup : detectOutputDegeneracy(finalText ?? text, { workingTurn });
+    // The provider's typed terminal verdict is authoritative even for short
+    // output that cannot satisfy a text-pattern guard. Never feed it back as
+    // accepted assistant history; keep the existing rejected-generation path.
+    const finalVerdict = providerRepetition
+      ? { degenerate: true, reason: 'provider_repetition', evidence: 'provider finish_reason=repetition' }
+      : soup.degenerate ? soup : detectOutputDegeneracy(finalText ?? text, { workingTurn });
     if (finalVerdict.degenerate) {
       outputDegeneracyReason = finalVerdict.reason ?? 'repeated_output';
       outputDegeneracyEvidence = finalVerdict.evidence;

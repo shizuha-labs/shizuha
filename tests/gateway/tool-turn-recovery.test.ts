@@ -299,6 +299,107 @@ describe('gateway rejected tool-turn recovery', () => {
     expect(JSON.stringify(h.history())).not.toContain(jsonText(REASONING_ONLY));
   });
 
+  it.each(['text-deltas', 'final-text'])(
+    'rejects provider-typed repetition from %s before durable history and the next wire request', async (mode) => {
+    // Actual natural Aoi18:51 shape: a short85-character completion bypasses
+    // text-only chatter heuristics, while the provider already says repetition.
+    // Full production caller: processMessage -> executeTurns -> executeTurn ->
+    // gateway admission -> SQLite history -> following provider request.
+    const repeated = 'Heartbeat — heartbeat — heart — heart — heart — heart — heart — heart — heart — heart';
+    const h = harness();
+    const originalHistory = h.history();
+    const chunks = ResponseBuilder.textOnly(repeated).map((chunk) =>
+      chunk.type === 'stop_reason' ? { ...chunk, reason: 'repetition' } : chunk);
+    h.provider.queueResponse(mode === 'final-text'
+      ? [{ type: 'final_text', text: repeated }, ...chunks.filter((chunk) => chunk.type !== 'text')]
+      : chunks);
+    await h.run('typed-repetition');
+    const rejectedOutcome = getHeartbeatQueueDrainOutcome(h.agentId)!;
+    expect(rejectedOutcome.incompleteReason).toBe('degenerate_generation');
+    expect(shouldResetFruitlessHeartbeatSession({
+      ...rejectedOutcome, readyTaskCount: 5, consecutiveReadyNoProgressHeartbeats: 100,
+    })).toBe(false);
+    const activeAfterRejected = h.history();
+    h.provider.queueResponse(ResponseBuilder.textOnly('A legitimate final answer.'));
+    await h.run('next-independent-input', 'user');
+    // Capture all consequences before asserting, so the pristineRED proves
+    // both the durable insertion and the subsequent outbound-history replay.
+    expect({
+      persisted: JSON.stringify(activeAfterRejected).includes(repeated),
+      replayed: JSON.stringify(h.provider.capturedMessages[1]).includes(repeated),
+    }).toEqual({ persisted: false, replayed: false });
+    expect(JSON.stringify(h.history())).toContain('receipt build-42');
+    expect(h.history().slice(0, originalHistory.length)).toEqual(originalHistory);
+    expect(h.provider.callCount).toBe(2);
+    expect(h.calls).toEqual([]);
+    expect(h.provider.capturedOptions.map((o) => o.toolChoice)).toEqual([undefined, undefined]);
+  });
+
+  it.each(['stop', 'unrecognized-terminal-reason'])(
+    'preserves normal or unknown %s semantics without retrospective text filtering', async (reason) => {
+      const h = harness();
+      const text = 'Heartbeat — heartbeat — heart — heart — heart — heart — heart — heart — heart — heart';
+      h.provider.queueResponse(ResponseBuilder.textOnly(text).map((chunk) =>
+        chunk.type === 'stop_reason' ? { ...chunk, reason } : chunk));
+      await h.run('ordinary-final', 'user');
+      expect(JSON.stringify(h.history())).toContain(text);
+      h.provider.queueResponse(ResponseBuilder.textOnly('Another legitimate final.'));
+      await h.run('next-final', 'user');
+      expect(JSON.stringify(h.provider.capturedMessages[1])).toContain(text);
+      expect(h.provider.callCount).toBe(2);
+      expect(h.calls).toEqual([]);
+    },
+  );
+
+  it('keeps a real tool batch when its terminal reason says repetition', async () => {
+    const h = harness();
+    h.provider.queueResponse(tool(WORK).map((chunk) =>
+      chunk.type === 'stop_reason' ? { ...chunk, reason: 'repetition' } : chunk),
+      ResponseBuilder.textOnly('No ready work.'));
+    await h.run('real-tool-batch');
+    expect(h.calls).toEqual([WORK]);
+    expect(h.provider.callCount).toBe(2);
+    expect(JSON.stringify(h.history())).toContain(WORK);
+    expect(h.telemetry.some((t) => t.incompleteReason === 'degenerate_generation')).toBe(false);
+  });
+
+  it('retains previously stored evidence and metadata while rejecting only the new typed generation', async () => {
+    const h = harness();
+    const historical: Message = {
+      id: 'old-evidence-id', executionId: 'old-evidence-execution', role: 'assistant',
+      content: 'Heartbeat — heartbeat — heart — heart — heart — heart — heart — heart — heart — heart',
+      timestamp: 1_700_000_000_000,
+    };
+    h.agent.messages.push(historical);
+    h.agent.store.appendMessage(h.agent.sessionId, historical);
+    const originalTranscript = h.agent.store.loadTranscriptMessages(h.agent.sessionId);
+    h.provider.queueResponse(ResponseBuilder.textOnly(historical.content as string).map((chunk) =>
+      chunk.type === 'stop_reason' ? { ...chunk, reason: 'repetition' } : chunk));
+    await h.run('reject-new-only');
+    expect(h.history().filter((m) => m.content === historical.content)).toEqual([historical]);
+    expect(h.agent.store.loadTranscriptMessages(h.agent.sessionId).slice(0, originalTranscript.length)).toEqual(originalTranscript);
+    expect(h.history().find((m) => m.id === historical.id)).toEqual(historical);
+  });
+
+  it('does not re-admit a rejected repetition after process restart or retry it in place', async () => {
+    const first = harness();
+    const rejected = 'A short provider-typed failed generation.';
+    first.provider.queueResponse(ResponseBuilder.textOnly(rejected).map((chunk) =>
+      chunk.type === 'stop_reason' ? { ...chunk, reason: 'repetition' } : chunk));
+    await first.run('repetition-before-restart');
+    expect(first.provider.callCount).toBe(1);
+    await first.agent.stop();
+    agents.splice(agents.findIndex(({ agent }) => agent === first.agent), 1);
+    clearHeartbeatQueueDrainOutcomesForTests();
+    const next = harness('autonomous', first.cwd);
+    next.provider.queueResponse(ResponseBuilder.textOnly('A normal final answer.'));
+    await next.run('after-typed-restart', 'user');
+    expect(next.provider.callCount).toBe(1);
+    expect(JSON.stringify(next.provider.capturedMessages)).not.toContain(rejected);
+    expect(JSON.stringify(next.history())).not.toContain(rejected);
+    expect(JSON.stringify(next.history())).toContain('receipt build-42');
+  });
+
   it('resumes the durable accepted history and exact wire prefix after a process restart', async () => {
     const first = harness();
     first.provider.queueResponse(failedNarration());
