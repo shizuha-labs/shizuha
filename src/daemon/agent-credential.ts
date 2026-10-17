@@ -103,7 +103,13 @@ function isDogfoodPhoenixFleetSshAgent(agent: AgentInfo): boolean {
 }
 
 function isPhoenixFleetSshMountData(data: { sshDir?: string; remoteUser?: string } | undefined): boolean {
-  return data?.sshDir === '/home/phoenix/.ssh' && data?.remoteUser === 'phoenix';
+  // Optional historical audit enrichment must match a deployment-owned source,
+  // never the publisher's home or an ambient local SSH identity. This does not
+  // create grants or change their existing authority/permission checks.
+  const sshDir = process.env['SHIZUHA_LEGACY_FLEET_SSH_DIR'];
+  const remoteUser = process.env['SHIZUHA_LEGACY_FLEET_SSH_USER'];
+  return Boolean(sshDir && remoteUser && path.isAbsolute(sshDir)
+    && data?.sshDir === sshDir && data?.remoteUser === remoteUser);
 }
 
 function dogfoodPhoenixCredentialData(agent: AgentInfo, migratedAt: string): Record<string, string> {

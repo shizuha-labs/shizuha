@@ -83,6 +83,7 @@ export interface SessionTokenizerCalibration {
 }
 
 interface StoredMessageRow {
+  operational_event?: string | null;
   message_id: string | null;
   execution_id: string | null;
   role: string;
@@ -323,6 +324,22 @@ export class StateStore {
     if (!messageCols.some((c) => c.name === 'execution_id')) {
       this.db.exec('ALTER TABLE messages ADD COLUMN execution_id TEXT');
     }
+    this.db.transaction(() => {
+      for (const table of ['messages', 'session_message_transcript']) {
+        const columns = this.db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+        if (!columns.some(column => column.name === 'operational_event')) {
+          this.db.exec(`ALTER TABLE ${table} ADD COLUMN operational_event TEXT`);
+        }
+      }
+      this.db.exec(`DROP TRIGGER IF EXISTS archive_active_message_insert;
+        CREATE TRIGGER archive_active_message_insert AFTER INSERT ON messages BEGIN
+          INSERT OR IGNORE INTO session_message_transcript (
+            session_id, source_message_row_id, message_id, execution_id,
+            role, content, timestamp, provenance, operational_event
+          ) VALUES (NEW.session_id, NEW.id, NEW.message_id, NEW.execution_id,
+            NEW.role, NEW.content, NEW.timestamp, 'active_insert', NEW.operational_event);
+        END;`);
+    }).immediate();
     const checkpointCols = this.db.pragma('table_info(session_interrupt_checkpoints)') as Array<{ name: string }>;
     if (!checkpointCols.some((c) => c.name === 'kind')) {
       this.db.exec('ALTER TABLE session_interrupt_checkpoints ADD COLUMN kind TEXT');
@@ -516,8 +533,8 @@ export class StateStore {
     const content = typeof message.content === 'string' ? message.content : JSON.stringify(message.content);
     const timestamp = message.timestamp ?? Date.now();
     this.db
-      .prepare('INSERT INTO messages (session_id, message_id, execution_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(sessionId, message.id ?? null, message.executionId ?? null, message.role, content, timestamp);
+      .prepare('INSERT INTO messages (session_id, message_id, execution_id, role, content, timestamp, operational_event) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(sessionId, message.id ?? null, message.executionId ?? null, message.role, content, timestamp, message.operationalEvent ? JSON.stringify(message.operationalEvent) : null);
     this.db
       .prepare('UPDATE sessions SET updated_at = ? WHERE id = ?')
       .run(Date.now(), sessionId);
@@ -1015,7 +1032,7 @@ export class StateStore {
     // payload must be a fresh serialization (cache-breaking by nature).
     const del = this.db.prepare('DELETE FROM messages WHERE session_id = ?');
     const ins = this.db.prepare(
-      'INSERT INTO messages (session_id, message_id, execution_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT INTO messages (session_id, message_id, execution_id, role, content, timestamp, operational_event) VALUES (?, ?, ?, ?, ?, ?, ?)',
     );
     const txn = this.db.transaction(() => {
       // Prefix invalidation and projection replacement commit together. A
@@ -1024,7 +1041,7 @@ export class StateStore {
       del.run(sessionId);
       for (const msg of messages) {
         const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        ins.run(sessionId, msg.id ?? null, msg.executionId ?? null, msg.role, content, msg.timestamp ?? Date.now());
+        ins.run(sessionId, msg.id ?? null, msg.executionId ?? null, msg.role, content, msg.timestamp ?? Date.now(), msg.operationalEvent ? JSON.stringify(msg.operationalEvent) : null);
       }
     });
     txn();
@@ -1040,7 +1057,7 @@ export class StateStore {
    */
   loadTranscriptMessages(sessionId: string): Message[] {
     const rows = this.db.prepare(
-      `SELECT message_id, execution_id, role, content, timestamp
+      `SELECT message_id, execution_id, role, content, timestamp, operational_event
        FROM session_message_transcript
        WHERE session_id = ?
        ORDER BY timestamp, id`,
@@ -1204,12 +1221,12 @@ export class StateStore {
       }
       const del = this.db.prepare('DELETE FROM messages WHERE session_id = ?');
       const ins = this.db.prepare(
-        'INSERT INTO messages (session_id, message_id, execution_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO messages (session_id, message_id, execution_id, role, content, timestamp, operational_event) VALUES (?, ?, ?, ?, ?, ?, ?)',
       );
       del.run(sessionId);
       for (const msg of messages) {
         const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        ins.run(sessionId, msg.id ?? null, msg.executionId ?? null, msg.role, content, msg.timestamp ?? now);
+        ins.run(sessionId, msg.id ?? null, msg.executionId ?? null, msg.role, content, msg.timestamp ?? now, msg.operationalEvent ? JSON.stringify(msg.operationalEvent) : null);
       }
       this.db.prepare(
         `UPDATE session_recovery_heads
@@ -1354,7 +1371,7 @@ export class StateStore {
 
   private loadMessages(sessionId: string): Message[] {
     const rows = this.db
-      .prepare('SELECT message_id, execution_id, role, content, timestamp FROM messages WHERE session_id = ? ORDER BY id')
+      .prepare('SELECT message_id, execution_id, role, content, timestamp, operational_event FROM messages WHERE session_id = ? ORDER BY id')
       .all(sessionId) as StoredMessageRow[];
 
     return this.deserializeMessages(rows);
@@ -1369,9 +1386,16 @@ export class StateStore {
       } catch {
         content = r.content;
       }
+      let operationalEvent: Message['operationalEvent'];
+      try {
+        if (r.operational_event) operationalEvent = JSON.parse(r.operational_event);
+      } catch {
+        // Invalid provenance cannot classify or discard conversation content.
+      }
       return {
         ...(r.message_id ? { id: r.message_id } : {}),
         ...(r.execution_id ? { executionId: r.execution_id } : {}),
+        ...(operationalEvent ? { operationalEvent } : {}),
         role: r.role as Message['role'],
         content: content as string,
         timestamp: r.timestamp,
@@ -1485,12 +1509,12 @@ export class StateStore {
     if (!original) return null;
     const forked = this.createSession(original.model, original.cwd);
     const ins = this.db.prepare(
-      'INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)',
+      'INSERT INTO messages (session_id, role, content, timestamp, operational_event) VALUES (?, ?, ?, ?, ?)',
     );
     const txn = this.db.transaction(() => {
       for (const msg of original.messages) {
         const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        ins.run(forked.id, msg.role, content, msg.timestamp ?? Date.now());
+        ins.run(forked.id, msg.role, content, msg.timestamp ?? Date.now(), msg.operationalEvent ? JSON.stringify(msg.operationalEvent) : null);
       }
     });
     txn();

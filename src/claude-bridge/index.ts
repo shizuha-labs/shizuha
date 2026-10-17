@@ -1311,6 +1311,56 @@ export async function resolveClaudeSessionAuthoritySnapshot(
 
 // ── Bridge ──
 
+/**
+ * PLAT-10121 (revi OOM): the replay window exists solely so a late-joining
+ * TUI client can render recent thread history via `sync_history`. Resumed
+ * sessions (`--resume`) re-emit the entire prior transcript as replay events,
+ * including stringified tool_result blocks (CI logs, large diffs) — retaining
+ * all of it unbounded, and re-appending it on every invocation, grows the
+ * bridge process quadratically on review hot-path seats. Bound both the
+ * per-message size and the entry count.
+ */
+export const REPLAY_HISTORY_MAX_ENTRIES = 200;
+export const REPLAY_HISTORY_MAX_CONTENT_CHARS = 16_000;
+
+export type ReplayHistoryEntry = {
+  id?: string;
+  role: string;
+  content: string;
+  createdAt: string;
+};
+
+/**
+ * PLAT-10121: pure append into the late-joiner replay window.
+ * - Content beyond REPLAY_HISTORY_MAX_CONTENT_CHARS is clamped with an honest
+ *   marker (live clients already received the full text in real time).
+ * - Oldest entries are evicted beyond REPLAY_HISTORY_MAX_ENTRIES.
+ * Callers MUST reset the window (`window.length = 0` / assign `[]`) at every
+ * claude spawn / session-resume site so a prior invocation's entries are not
+ * re-appended on top of a fresh `--resume` replay (quadratic retention).
+ */
+export function pushReplayEntry(
+  window: ReplayHistoryEntry[],
+  entry: ReplayHistoryEntry,
+  opts: {
+    maxEntries?: number;
+    maxContentChars?: number;
+  } = {},
+): void {
+  const maxEntries = opts.maxEntries ?? REPLAY_HISTORY_MAX_ENTRIES;
+  const maxContentChars = opts.maxContentChars ?? REPLAY_HISTORY_MAX_CONTENT_CHARS;
+  const { id, role, createdAt } = entry;
+  let content = entry.content;
+  if (content.length > maxContentChars) {
+    const overflow = content.length - maxContentChars;
+    content = `${content.slice(0, maxContentChars)}\n…[replay window clamped ${overflow} chars]`;
+  }
+  window.push({ id, role, content, createdAt });
+  if (window.length > maxEntries) {
+    window.splice(0, window.length - maxEntries);
+  }
+}
+
 export class ClaudeBridge {
   private app: FastifyInstance | null = null;
   private wss: WebSocketServer | null = null;
@@ -1393,7 +1443,15 @@ export class ClaudeBridge {
   private failoverChainIndex = 0;
 
   // Replay history — collected during startup for sync responses
-  private replayHistory: Array<{ id?: string; role: string; content: string; createdAt: string }> = [];
+  private replayHistory: ReplayHistoryEntry[] = [];
+
+  /**
+   * PLAT-10121: append to the late-joiner replay window via pushReplayEntry.
+   * Callers reset `this.replayHistory = []` at every spawn site.
+   */
+  private pushReplay(entry: ReplayHistoryEntry): void {
+    pushReplayEntry(this.replayHistory, entry);
+  }
 
   // The threadId of the current active execution (claude -p is single-threaded)
   private activeThreadId: string | null = null;
@@ -2076,6 +2134,10 @@ export class ClaudeBridge {
         this.lineBuffer = '';
         this.accumulatedContent = '';
         this.pendingTools = [];
+        // PLAT-10121: the resumed-session replay below re-collects the full
+        // prior transcript; retaining the previous window would duplicate it
+        // on every --resume (quadratic retention → seat OOM).
+        this.replayHistory = [];
         this.isReplaying = true;
         await this.spawnClaude();
       },
@@ -3197,10 +3259,10 @@ export class ClaudeBridge {
     for (const line of lines) {
       // Check for replay events (from --resume/--continue) before parsing
       const rawMsg = this.tryParseJson(line) as (Record<string, any> | null);
-      if (rawMsg?.isReplay) {
+        if (rawMsg?.isReplay) {
         // Collect replay messages for sync responses but don't broadcast
         if (rawMsg.type === 'user' && rawMsg.message?.content) {
-          this.replayHistory.push({
+          this.pushReplay({
             role: 'user',
             content: typeof rawMsg.message.content === 'string' ? rawMsg.message.content : JSON.stringify(rawMsg.message.content),
             createdAt: new Date().toISOString(),
@@ -3210,7 +3272,7 @@ export class ClaudeBridge {
             ? rawMsg.message.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('')
             : typeof rawMsg.message.content === 'string' ? rawMsg.message.content : '';
           if (content) {
-            this.replayHistory.push({ role: 'assistant', content, createdAt: new Date().toISOString() });
+            this.pushReplay({ role: 'assistant', content, createdAt: new Date().toISOString() });
           }
         }
         continue; // Skip — don't forward replay events to clients
@@ -3346,7 +3408,7 @@ export class ClaudeBridge {
         if (_resultText) this.totalOutputChars += _resultText.length;
         if (this.activeThreadId) {
           if (this.accumulatedContent) {
-            this.replayHistory.push({
+            this.pushReplay({
               id: this.activeMessageId ?? crypto.randomUUID(),
               role: 'assistant',
               content: this.accumulatedContent,
@@ -3750,7 +3812,7 @@ export class ClaudeBridge {
         message_id: messageId,
       },
     });
-    this.replayHistory.push({
+    this.pushReplay({
       id: crypto.randomUUID(),
       role: 'user',
       content,
@@ -4760,6 +4822,9 @@ export class ClaudeBridge {
     this.lineBuffer = '';
     this.accumulatedContent = '';
     this.pendingTools = [];
+    // PLAT-10121: see the token-rotation spawn site — replay re-collects the
+    // full resumed transcript; a stale window here would duplicate it.
+    this.replayHistory = [];
     this.isReplaying = true;
     await this.spawnClaude();
   }

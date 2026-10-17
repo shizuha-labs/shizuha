@@ -86,15 +86,18 @@ class AgentRuntimeWorkflowParityTests(unittest.TestCase):
             self.assertIn(assignment, text)
         # Last smoked multi-arch is the overlay rootfs. Source-only SCLI must
         # not fall through to full Kaniko just because npm latest drifted.
-        self.assertIn('Last smoked multi-arch: harness-202609110337-f1f8d87', text)
+        self.assertIn('Last smoked multi-arch: harness-202610110610-20efecd', text)
         self.assertIn(
-            'OVERLAY_BASE_INDEX_DIGEST="sha256:f9a64b8169408c9128f0da3d2e7df2fc58cb6ea9185009a0fc92d6fb9ec02730"',
+            'OVERLAY_BASE_INDEX_DIGEST="sha256:f409d3aeec3b46715cea1a4ae4373d6cc6738817a9a7234825e00dc72f0f13ea"',
             text,
         )
         self.assertIn(
-            'OVERLAY_BASE_SOURCE_SHA="f1f8d87674bd27652a2d9d96bc4a5973b4d5dbd8"',
+            'OVERLAY_BASE_SOURCE_SHA="20efecdfef05505d8b446aa0b7d13c11dca304fa"',
             text,
         )
+        for key, version in (('CC', '2.1.296'), ('CODEX', '0.162.1'),
+                             ('ANTIGRAVITY', '1.3.3'), ('OPENCLAW', '2026.10.1')):
+            self.assertIn(f'OVERLAY_BASE_{key}_VER="{version}"', text)
         self.assertIn(
             'pinning harness to last smoked overlay base (npm latest drifted)',
             text,

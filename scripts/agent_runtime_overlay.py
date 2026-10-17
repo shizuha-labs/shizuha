@@ -37,13 +37,14 @@ EXPECTED_ENTRYPOINT = [
     "--",
     "/usr/local/bin/agent-runtime-entrypoint.sh",
 ]
+# Base repins must verify complete native config (especially Env), not only
+# source/harness labels; this exact contract belongs to the qualified base.
 EXPECTED_ENV = [
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "DEBIAN_FRONTEND=noninteractive",
     "NODE_MAJOR=24",
-    "NPM_CONFIG_REGISTRY=http://s1.tail.shizuha.com:30512/",
+    "NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/",
     "PIP_INDEX_URL=http://s1.tail.shizuha.com:30511/simple/",
-    "PIP_TRUSTED_HOST=s1.tail.shizuha.com",
     "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers",
     "SHIZUHA_DIST=/opt/shizuha/dist",
     "HOME=/home/agent",

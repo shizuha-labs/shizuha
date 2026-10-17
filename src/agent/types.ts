@@ -58,6 +58,12 @@ export interface Message {
   id?: string;
   /** Execution/run identity for grouping streamed assistant turns. */
   executionId?: string;
+  /** Framework failure notice retained for UI/audit, never model-authored conversation. */
+  operationalEvent?: {
+    kind: 'framework_terminal_failure';
+    id: string;
+    code: 'provider_failure' | 'context_capacity';
+  };
   role: Role;
   content: string | ContentBlock[];
   timestamp?: number;

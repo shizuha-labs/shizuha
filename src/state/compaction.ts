@@ -1,3 +1,4 @@
+import { modelConversationMessages } from '../agent/message-provenance.js';
 import * as fs from 'node:fs';
 import type { Message, ContentBlock, ToolResultContent } from '../agent/types.js';
 import type { LLMProvider, ChatMessage, ChatOptions, StreamChunk } from '../provider/types.js';
@@ -551,6 +552,7 @@ export async function compactMessages(
   maxTokens: number,
   options?: CompactionOptions,
 ): Promise<{ messages: Message[]; compacted: boolean }> {
+  messages = modelConversationMessages(messages);
   // Count total tokens in current messages (excludes base64 image data) + system/tool overhead.
   // Apply model-aware safety factor: 1.35x for Anthropic (tiktoken undercount), 1.0x for GPT/Codex.
   const safetyFactor = getSafetyFactor(model);

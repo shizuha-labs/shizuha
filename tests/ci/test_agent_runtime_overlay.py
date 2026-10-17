@@ -439,6 +439,34 @@ class OverlayIndexTests(unittest.TestCase):
         }
         return args, "amd64", child, base_manifest, base_config, candidate_manifest, candidate_config
 
+    def test_reviewed_20ef_base_environment_and_rejects_old_or_injected_environment(self):
+        # Both real native image configs from Origin8537 have this environment.
+        # Keep the fixture independent of EXPECTED_ENV so a stale repin fails.
+        reviewed_env = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "DEBIAN_FRONTEND=noninteractive",
+            "NODE_MAJOR=24",
+            "NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/",
+            "PIP_INDEX_URL=http://s1.tail.shizuha.com:30511/simple/",
+            "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers",
+            "SHIZUHA_DIST=/opt/shizuha/dist",
+            "HOME=/home/agent",
+        ]
+        args, _, _, _, config, _, _ = self._candidate_fixture()
+        for arch in ("amd64", "arm64"):
+            with self.subTest(architecture=arch):
+                actual = json.loads(json.dumps(config))
+                actual["architecture"] = arch
+                actual["config"]["Env"] = reviewed_env.copy()
+                overlay._assert_base_config(args, arch, actual)
+                old_env = reviewed_env.copy()
+                old_env[3] = "NPM_CONFIG_REGISTRY=http://s1.tail.shizuha.com:30512/"
+                old_env.insert(5, "PIP_TRUSTED_HOST=s1.tail.shizuha.com")
+                for invalid_env in (old_env, [*reviewed_env, "NODE_OPTIONS=--require=/tmp/injected.js"]):
+                    actual["config"]["Env"] = invalid_env
+                    with self.assertRaisesRegex(overlay.OverlayError, "environment contract mismatch"):
+                        overlay._assert_base_config(args, arch, actual)
+
     def test_candidate_preserves_exact_layers_diffids_config_history_and_labels(self):
         fixture = self._candidate_fixture()
         result, diff_ids = overlay._assert_candidate(*fixture)

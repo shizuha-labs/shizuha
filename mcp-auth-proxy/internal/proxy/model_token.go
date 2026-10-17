@@ -204,10 +204,15 @@ func (s *Server) handleModelToken(w http.ResponseWriter, r *http.Request) {
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
 
 	// --- fetch from coordinator ---
+	bearer, err := s.coordinatorBearer(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "model token unavailable"})
+		return
+	}
 	result, err := fetchModelTokenFromCoordinator(
 		r.Context(),
 		s.cfg.CoordinatorURL,
-		s.cfg.CoordinatorBearerToken,
+		bearer,
 		provider,
 		forceRefresh,
 		preferredEntryID,
@@ -301,7 +306,12 @@ func (s *Server) handleModelTokenReportStatus(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := reportModelTokenStatusToCoordinator(r.Context(), s.cfg.CoordinatorURL, s.cfg.CoordinatorBearerToken, status); err != nil {
+	bearer, err := s.coordinatorBearer(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "model token report unavailable"})
+		return
+	}
+	if err := reportModelTokenStatusToCoordinator(r.Context(), s.cfg.CoordinatorURL, bearer, status); err != nil {
 		s.audit.Emit("model-token-report-refused", map[string]any{
 			"failure_class": "coordinator_error",
 			"uid":           peer.UID,

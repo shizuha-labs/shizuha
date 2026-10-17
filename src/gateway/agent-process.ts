@@ -2317,11 +2317,7 @@ export class AgentProcess {
           await this.waitForRuntimeRollDrainRelease();
           continue;
         }
-        try {
-          await this.processInboxMessage(msg);
-        } finally {
-          this.inboxMessageAdmitted = false;
-        }
+        await this.processAdmittedInboxMessage(msg);
       } catch (err) {
         this.inboxMessageAdmitted = false;
         if (!this.running) break; // Shutdown
@@ -4524,6 +4520,18 @@ export class AgentProcess {
    * and startup re-enqueues it; a completed row increments the forensic counter
    * exactly once.
    */
+  private async processAdmittedInboxMessage(msg: InboundMessage): Promise<void> {
+    try {
+      await this.processInboxMessage(msg);
+    } finally {
+      this.inboxMessageAdmitted = false;
+      // Publish only after the admission latch clears, before another row is
+      // dequeued. now() cancels pending debounce and snapshots current state;
+      // no delayed idle payload can overwrite the next working turn.
+      this.telemetryFlusher.now();
+    }
+  }
+
   private async processInboxMessage(msg: InboundMessage): Promise<void> {
     const channel = this.channels.get(msg.channelId);
     const processingAck = channel?.type === 'connect'
@@ -5045,6 +5053,7 @@ export class AgentProcess {
         const terminalMsg: Message = {
           role: 'assistant',
           content: terminalError,
+          operationalEvent: { kind: 'framework_terminal_failure', id: crypto.randomUUID(), code: 'provider_failure' },
           timestamp: Date.now(),
           executionId: msg.threadId,
         };
@@ -5127,6 +5136,7 @@ export class AgentProcess {
       }
 
       this.inbox.busy = false;
+      this.telemetryFlusher.now();
       // No execution_complete/ack on a rollout checkpoint. The exact row is
       // still queued locally and remains replayable upstream after replacement.
       if (!runtimeRollDeferred && !compactionDeferred) channel.sendComplete(msg.threadId);
@@ -5680,7 +5690,8 @@ export class AgentProcess {
           }
 
           const terminalText = `🔴 ANDON: context window is still too small after semantic compaction (max_context=${this.maxContextTokens}). Stopping this turn with history preserved.`;
-          const terminalMsg: Message = { role: 'assistant', content: terminalText, timestamp: Date.now() };
+          const terminalMsg: Message = { role: 'assistant', content: terminalText, timestamp: Date.now(),
+            operationalEvent: { kind: 'framework_terminal_failure', id: crypto.randomUUID(), code: 'context_capacity' } };
           this.messages.push(terminalMsg);
           this.store.appendMessage(this.sessionId, terminalMsg);
           try {

@@ -28,6 +28,10 @@ on:
         description: "Version string for the artifact (default: package.json version + CI build id)"
         required: false
         default: ""
+      expected_source_sha:
+        description: "Optional exact 40-character source SHA fence for a reviewed release dispatch"
+        required: false
+        default: ""
   push:
     branches: [main, master]
     tags:
@@ -46,6 +50,29 @@ jobs:
     # test traffic cannot starve a fleet release after its runtime image is ready.
     runs-on: deploy-lane
     steps:
+      - name: Validate stable release policy and source fence
+        id: release-policy
+        env:
+          STABLE_RELEASE_HOLD: ${{ vars.SCLI_STABLE_RELEASE_HOLD }}
+          SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_SOURCE_SHA: ${{ github.event.inputs.expected_source_sha }}
+        run: |
+          set -euo pipefail
+          # BEGIN SCLI stable release policy
+          case "${STABLE_RELEASE_HOLD:-}" in
+            ''|false) held=false ;;
+            true) held=true ;;
+            *) echo '::error::SCLI_STABLE_RELEASE_HOLD must be empty, false, or true' >&2; exit 1 ;;
+          esac
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::invalid source SHA' >&2; exit 1; }
+          if [ -n "${EXPECTED_SOURCE_SHA:-}" ]; then
+            [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] && [ "$EXPECTED_SOURCE_SHA" = "$SOURCE_SHA" ] || {
+              echo '::error::expected source SHA differs from triggering revision' >&2; exit 1;
+            }
+          fi
+          printf 'held=%s\n' "$held" >> "$GITHUB_OUTPUT"
+          # END SCLI stable release policy
+
       - name: Install kubectl + cluster access
         env:
           # Bound through env rather than interpolated into the shell body
@@ -74,6 +101,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           SOURCE_REF: ${{ github.ref }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          STABLE_RELEASE_HOLD: ${{ steps.release-policy.outputs.held }}
         run: |
           set -euo pipefail
           # Env-binding stops the value reaching the shell parser, but this one is
@@ -368,10 +396,12 @@ jobs:
                         valueFrom: { secretKeyRef: { name: scli-forgejo-token, key: token } }
                       - { name: CI_SOURCE_SHA, value: "${SOURCE_SHA}" }
                       - { name: RELEASE_ID, value: "${RELEASE_ID}" }
+                      - { name: STABLE_RELEASE_HOLD, value: "${STABLE_RELEASE_HOLD}" }
                     command: ["/bin/sh", "-c"]
                     args:
                       - |
                         set -eu
+                        case "\${STABLE_RELEASE_HOLD}" in true|false) ;; *) echo 'invalid stable release policy' >&2; exit 1 ;; esac
                         sed -i "s#https://dl-cdn.alpinelinux.org#http://apk-cache.registry.svc.cluster.local#g" /etc/apk/repositories 2>/dev/null || true
                         apk add --no-cache curl jq coreutils >/dev/null
                         ROOT="http://forgejo-http.origin.svc.cluster.local:80/api/packages/shizuha-labs/generic/scli-builds"
@@ -410,6 +440,13 @@ jobs:
                             "darwin-x64": \$darwinX64[0]
                           }
                           }' > "\${tmp}/release.json"
+                        # The immutable run receipt is qualified even while stable
+                        # release publication is held. Never alter latest in that case.
+                        curl -fsS -X PUT -H "\${AUTH}" -T "\${tmp}/release.json" "\${STAGE}/release.json"
+                        if [ "\${STABLE_RELEASE_HOLD}" = true ]; then
+                          echo "QUALIFIED_CANDIDATE releaseId=\${RELEASE_ID} sourceSha=\${CI_SOURCE_SHA} stableHeld=true"
+                          exit 0
+                        fi
                         for platform in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
                           artifact="\$(basename "\$(jq -r .url "\${tmp}/\${platform}.json")")"
                           for file in "\${artifact}" "\${platform}.json"; do
@@ -430,7 +467,7 @@ jobs:
           kubectl logs -n build "job/${FINALIZE_JOB}" --all-containers=true
 
       - name: Trigger publisher + indexer (singleton)
-        if: success()
+        if: success() && steps.release-policy.outputs.held == 'false'
         run: |
           # PLAT-6172: Origin is the only trigger. CronJobs are suspended.
           # At most one in-flight Job per kind (never delete a Pending/Running Job).

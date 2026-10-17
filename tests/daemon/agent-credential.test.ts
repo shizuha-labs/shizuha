@@ -139,12 +139,12 @@ describe('PLAT-194 host-plane fleet-ssh grant by role', () => {
     const base = makeAgent({ skills: ['devops'] });
     const stale = createHostPlaneFleetSshCredentialGrant(base);
     stale.credentialData.sshDir = '~/.ssh';
-    stale.credentialData.remoteUser = 'phoenix';
+    stale.credentialData.remoteUser = 'fleet-owner';
     stale.credentialData.keyFiles = JSON.stringify(['id_ed25519_custom']);
     const creds = materializeMissingFleetSshCredentialGrantFromLegacySshKeys({ ...base, credentials: [stale] });
     const fleet = (creds ?? []).find((c) => c.scope === 'fleet-ssh');
     expect(fleet?.credentialData.sshDir).toBe(hostPlaneFleetSshSourceDir(base));
-    expect(fleet?.credentialData.remoteUser).toBe('phoenix');
+    expect(fleet?.credentialData.remoteUser).toBe('fleet-owner');
     expect(fleet?.credentialData.keyFiles).toBe(JSON.stringify(['id_ed25519_custom']));
   });
 
@@ -181,6 +181,7 @@ describe('AgentCredential schema migration', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it('normalizes legacy service credentials into scoped grants', () => {
@@ -230,25 +231,39 @@ describe('AgentCredential schema migration', () => {
     expect(result.agents[1]!.credentials).toBeUndefined();
   });
 
+  it('does not infer a legacy owner from an unconfigured personal-looking mount', () => {
+    vi.stubEnv('SHIZUHA_LEGACY_FLEET_SSH_DIR', '');
+    vi.stubEnv('SHIZUHA_LEGACY_FLEET_SSH_USER', '');
+    const result = migrateAgentCredentialGrants([makeAgent({
+      id: 'kai-agent', username: 'kai',
+      sshKeys: { enabled: true, sshDir: '/home/fleet-owner/.ssh', remoteUser: 'fleet-owner' },
+    })], new Set(['kai-agent']));
+    expect(result.insertedFleetSshGrants).toBe(1);
+    expect(result.dogfoodPhoenixFleetSshGrants).toBe(0);
+    expect(result.agents[0]!.credentials![0]!.credentialData.auditMigrationTask).toBeUndefined();
+  });
+
   it('marks Kai/Ichi/Ni phoenix fleet SSH grants as record-only dogfood migrations', () => {
+    vi.stubEnv('SHIZUHA_LEGACY_FLEET_SSH_DIR', '/home/fleet-owner/.ssh');
+    vi.stubEnv('SHIZUHA_LEGACY_FLEET_SSH_USER', 'fleet-owner');
     const agents = [
       makeAgent({
         id: 'kai-agent',
         username: 'kai',
         email: 'kai@shizuha.com',
-        sshKeys: { enabled: true, sshDir: '/home/phoenix/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'phoenix' },
+        sshKeys: { enabled: true, sshDir: '/home/fleet-owner/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'fleet-owner' },
       }),
       makeAgent({
         id: 'ichi-agent',
         username: 'ichi',
         email: 'ichi@shizuha.com',
-        sshKeys: { enabled: true, sshDir: '/home/phoenix/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'phoenix' },
+        sshKeys: { enabled: true, sshDir: '/home/fleet-owner/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'fleet-owner' },
       }),
       makeAgent({
         id: 'ryo-agent',
         username: 'ryo',
         email: 'ryo@shizuha.com',
-        sshKeys: { enabled: true, sshDir: '/home/phoenix/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'phoenix' },
+        sshKeys: { enabled: true, sshDir: '/home/fleet-owner/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'fleet-owner' },
       }),
     ];
 
@@ -261,9 +276,9 @@ describe('AgentCredential schema migration', () => {
     expect(result.insertedFleetSshGrants).toBe(3);
     expect(result.dogfoodPhoenixFleetSshGrants).toBe(2);
     expect(result.agents[0]!.credentials![0]!.credentialData).toMatchObject({
-      sshDir: '/home/phoenix/.ssh',
+      sshDir: '/home/fleet-owner/.ssh',
       keyFiles: '["id_ed25519"]',
-      remoteUser: 'phoenix',
+      remoteUser: 'fleet-owner',
       auditMigrationTask: 'PLAT-111',
       auditMigrationKind: 'record-only-dogfood',
       auditMigrationSubject: 'phoenix-mounted-fleet-ssh',
@@ -276,6 +291,8 @@ describe('AgentCredential schema migration', () => {
   });
 
   it('does not dogfood-mark Kai/Ichi/Ni fleet SSH grants that are not phoenix-mounted', () => {
+    vi.stubEnv('SHIZUHA_LEGACY_FLEET_SSH_DIR', '/home/fleet-owner/.ssh');
+    vi.stubEnv('SHIZUHA_LEGACY_FLEET_SSH_USER', 'fleet-owner');
     const result = migrateAgentCredentialGrants(
       [makeAgent({
         id: 'kai-agent',
@@ -293,11 +310,13 @@ describe('AgentCredential schema migration', () => {
   });
 
   it('retro-marks existing Kai/Ichi/Ni fleet SSH grants without duplicating or rotating them', () => {
+    vi.stubEnv('SHIZUHA_LEGACY_FLEET_SSH_DIR', '/home/fleet-owner/.ssh');
+    vi.stubEnv('SHIZUHA_LEGACY_FLEET_SSH_USER', 'fleet-owner');
     const agent = makeAgent({
       id: 'ni-agent',
       username: 'ni',
       email: 'ni@shizuha.com',
-      sshKeys: { enabled: true, sshDir: '/home/phoenix/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'phoenix' },
+      sshKeys: { enabled: true, sshDir: '/home/fleet-owner/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'fleet-owner' },
       credentials: [{
         id: 'existing-fleet-grant',
         grantId: 'existing-fleet-grant',
@@ -306,9 +325,9 @@ describe('AgentCredential schema migration', () => {
         service: 'fleet-ssh',
         label: 'Fleet SSH',
         credentialData: {
-          sshDir: '/home/phoenix/.ssh',
+          sshDir: '/home/fleet-owner/.ssh',
           keyFiles: JSON.stringify(['id_ed25519']),
-          remoteUser: 'phoenix',
+          remoteUser: 'fleet-owner',
         },
         injectAsEnv: false,
         isActive: true,
@@ -329,9 +348,9 @@ describe('AgentCredential schema migration', () => {
       id: 'existing-fleet-grant',
       grantId: 'existing-fleet-grant',
       credentialData: {
-        sshDir: '/home/phoenix/.ssh',
+        sshDir: '/home/fleet-owner/.ssh',
         keyFiles: JSON.stringify(['id_ed25519']),
-        remoteUser: 'phoenix',
+        remoteUser: 'fleet-owner',
         auditMigrationTask: 'PLAT-111',
         auditMigrationKind: 'record-only-dogfood',
         auditMigrationAgent: 'ni',
@@ -345,7 +364,7 @@ describe('AgentCredential schema migration', () => {
       id: 'kai-agent',
       username: 'kai',
       email: 'kai@shizuha.com',
-      sshKeys: { enabled: true, sshDir: '/home/phoenix/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'phoenix' },
+      sshKeys: { enabled: true, sshDir: '/home/fleet-owner/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'fleet-owner' },
       credentials: [{
         id: 'existing-fleet-grant',
         grantId: 'existing-fleet-grant',
@@ -354,9 +373,9 @@ describe('AgentCredential schema migration', () => {
         service: 'fleet-ssh',
         label: 'Fleet SSH',
         credentialData: {
-          sshDir: '/home/phoenix/.ssh',
+          sshDir: '/home/fleet-owner/.ssh',
           keyFiles: JSON.stringify(['id_ed25519']),
-          remoteUser: 'phoenix',
+          remoteUser: 'fleet-owner',
           auditMigrationTask: 'PLAT-111',
           auditMigrationKind: 'record-only-dogfood',
           auditMigrationSubject: 'phoenix-mounted-fleet-ssh',
@@ -386,7 +405,7 @@ describe('AgentCredential schema migration', () => {
       id: 'kai-agent',
       username: 'kai',
       email: 'kai@shizuha.com',
-      sshKeys: { enabled: true, sshDir: '/home/phoenix/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'phoenix' },
+      sshKeys: { enabled: true, sshDir: '/home/fleet-owner/.ssh', keyFiles: ['id_ed25519'], remoteUser: 'fleet-owner' },
       credentials: [{
         id: 'existing-non-phoenix-grant',
         grantId: 'existing-non-phoenix-grant',

@@ -10,6 +10,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Agent runtime workflow parity
         run: python3 -m unittest -v tests.ci.test_agent_runtime_workflow_parity
+      - name: Native Hive broker source publication contract
+        run: python3 -m unittest -v tests.ci.test_hive_broker_pin_publication
+      - name: Stable CLI release hold and immutable candidate contract
+        run: python3 -m unittest -v tests.ci.test_scli_stable_release_hold
       - name: "No github/secrets context in run bodies (PLAT-4734)"
         run: |
           set -euo pipefail
@@ -43,5 +47,7 @@ jobs:
           cache: npm
       - name: Install Node dependencies
         run: npm ci
+      - name: Broker qualification and publication workflow
+        run: node --test tests/ci/mcp-auth-workflow.test.mjs
       - name: Gateway rate-limit key isolation (PLAT-4654)
         run: npx vitest run tests/gateway/rate-limiter.test.ts

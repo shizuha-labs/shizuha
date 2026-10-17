@@ -276,6 +276,8 @@ export class ProjectionAuthority {
   private refreshTimer: NodeJS.Timeout | null = null;
   private refreshInFlight: Promise<void> | null = null;
   private stopped = false;
+  private lifecycle = 0;
+  private highWaterLoaded = false;
 
   constructor(private readonly options: {
     agentAudience: string;
@@ -302,13 +304,22 @@ export class ProjectionAuthority {
   }
 
   async start(): Promise<void> {
+    const lifecycle = ++this.lifecycle;
     this.stopped = false;
+    this.highWaterLoaded = false;
+    this.cancelRefreshTimer();
+    this.clear('unverified', 'starting');
+    // A stopped lifecycle may still have a transport response in flight. It
+    // cannot authorize this new lifecycle or overlap its first challenge.
+    if (this.refreshInFlight) await this.refreshInFlight.catch(() => {});
+    if (this.stopped || lifecycle !== this.lifecycle) return;
     try {
       this.highestGeneration = this.options.loadHighWater?.() ?? loadProjectionHighWater();
     } catch (err) {
       this.clear('fenced', (err as Error).message);
       throw err;
     }
+    this.highWaterLoaded = true;
     await this.refresh();
   }
 
@@ -321,8 +332,9 @@ export class ProjectionAuthority {
 
   stop(): void {
     this.stopped = true;
-    if (this.refreshTimer) clearTimeout(this.refreshTimer);
-    this.refreshTimer = null;
+    ++this.lifecycle;
+    this.highWaterLoaded = false;
+    this.cancelRefreshTimer();
     this.clear('fenced', 'authority_stopped');
   }
 
@@ -335,15 +347,24 @@ export class ProjectionAuthority {
 
   private clear(state: ProjectionAuthorityState, reason: string): void {
     this.snapshotValue = { state, reason, verified: null };
+  }
+
+  private cancelRefreshTimer(): void {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     this.refreshTimer = null;
   }
 
   private async doRefresh(): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || !this.highWaterLoaded) return;
+    const lifecycle = this.lifecycle;
+    this.cancelRefreshTimer();
+    // Refusal fences access, not the authenticated challenge loop. Reuse its
+    // existing refresh margin; this neither renews nor extends any authority.
+    let delay = Math.max(1, this.options.refreshMarginMs ?? MCP_PROJECTION_REFRESH_MARGIN_MS);
     const nonce = crypto.randomBytes(32);
     try {
       const raw = await this.options.fetchEnvelope(nonce);
+      if (this.stopped || lifecycle !== this.lifecycle) return;
       const clock = this.clock();
       // v10: capture the pair exactly once after the authentic response arrives.
       const wallNowMs = clock.wallNowMs();
@@ -367,12 +388,20 @@ export class ProjectionAuthority {
         verified.monoDeadlineMs - monoNowMs - 1,
         this.options.refreshMarginMs ?? MCP_PROJECTION_REFRESH_MARGIN_MS,
       ));
-      const delay = Math.max(1, verified.monoDeadlineMs - monoNowMs - margin);
-      this.refreshTimer = setTimeout(() => { void this.refresh(); }, delay);
-      this.refreshTimer.unref?.();
+      delay = Math.max(1, verified.monoDeadlineMs - monoNowMs - margin);
     } catch (err) {
-      this.clear('fenced', (err as Error).message);
+      if (!this.stopped && lifecycle === this.lifecycle) this.clear('fenced', (err as Error).message);
       throw err;
+    } finally {
+      if (!this.stopped && this.highWaterLoaded && lifecycle === this.lifecycle) {
+        this.refreshTimer = setTimeout(() => {
+          this.refreshTimer = null;
+          // doRefresh records the refusal and rearms. Timer callbacks must
+          // consume rejection rather than terminate the multiplexer process.
+          void this.refresh().catch(() => {});
+        }, delay);
+        this.refreshTimer.unref?.();
+      }
     }
   }
 }

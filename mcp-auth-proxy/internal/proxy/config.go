@@ -34,8 +34,12 @@ type Config struct {
 	// HIVE-146: coordinator model-token path. When set, the broker fetches the
 	// provider model token from the coordinator and serves it at GET /model-token.
 	// CoordinatorBearerToken must carry aud=hive-coordinator + scope=coordinator:model-token.
-	CoordinatorURL         string
-	CoordinatorBearerToken string
+	CoordinatorURL               string
+	CoordinatorBearerToken       string
+	CoordinatorOAuthTokenURL     string
+	CoordinatorOAuthClientID     string
+	CoordinatorOAuthClientSecret string
+	CoordinatorOAuthScope        string
 	// PLAT-5275: nonce-bound, signed MCP projection producer. This endpoint is
 	// separate from model-token because it has a different response contract,
 	// timeout, and no provider-token material.
@@ -57,30 +61,34 @@ func (c Config) PasswordMintEnabled() bool {
 
 func LoadConfig() (Config, error) {
 	cfg := Config{
-		SocketPath:             getenv("MCP_AUTH_PROXY_SOCKET", "/run/shizuha/mcp-auth-proxy/proxy.sock"),
-		TokenAudience:          getenv("MCP_AUTH_PROXY_TOKEN_AUDIENCE", "shizuha-mcp-auth-proxy"),
-		KubeAPIServer:          kubeAPIServer(),
-		KubeBearerTokenPath:    getenv("MCP_AUTH_PROXY_KUBE_BEARER_TOKEN", "/var/run/secrets/kubernetes.io/serviceaccount/token"),
-		KubeCACertPath:         getenv("MCP_AUTH_PROXY_KUBE_CA_CERT", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"),
-		TokenReviewMode:        os.Getenv("MCP_AUTH_PROXY_TOKENREVIEW_MODE"),
-		StubTokenReviewAllow:   getenvBool("MCP_AUTH_PROXY_STUB_TOKENREVIEW_ALLOW"),
-		MintURL:                os.Getenv("MCP_AUTH_PROXY_MINT_URL"),
-		MintMode:               os.Getenv("MCP_AUTH_PROXY_MINT_MODE"),
-		StubMintAllow:          getenvBool("MCP_AUTH_PROXY_STUB_MINT_ALLOW"),
-		AgentUsername:          getenv("AGENT_USERNAME", os.Getenv("MCP_AUTH_PROXY_AGENT_USERNAME")),
-		AgentPassword:          os.Getenv("AGENT_PASSWORD"),
-		IDLoginURL:             idAuthURL("MCP_AUTH_PROXY_ID_LOGIN_URL", "/id/api/auth/login/"),
-		IDRefreshURL:           idAuthURL("MCP_AUTH_PROXY_ID_REFRESH_URL", "/id/api/auth/refresh/"),
-		CoordinatorURL:         os.Getenv("MCP_AUTH_PROXY_COORDINATOR_URL"),
-		CoordinatorBearerToken: os.Getenv("MCP_AUTH_PROXY_COORDINATOR_TOKEN"),
-		ProjectionURL:           os.Getenv("MCP_AUTH_PROXY_PROJECTION_URL"),
-		AgentID:                 os.Getenv("AGENT_ID"),
-		BootstrapRetryEnabled:  getenvBoolDefault("MCP_AUTH_PROXY_BOOTSTRAP_RETRY", true),
-		BootstrapRetryBase:     time.Duration(getenvInt("MCP_AUTH_PROXY_BOOTSTRAP_RETRY_BASE_MS", 2000)) * time.Millisecond,
-		BootstrapRetryMax:      time.Duration(getenvInt("MCP_AUTH_PROXY_BOOTSTRAP_RETRY_MAX_MS", 120000)) * time.Millisecond,
-		Upstreams:              splitCSV(os.Getenv("MCP_AUTH_PROXY_UPSTREAMS")),
-		ReconnectMaxAttempts:   getenvInt("MCP_AUTH_PROXY_RECONNECT_MAX_ATTEMPTS", 3),
-		ReconnectBaseBackoff:   time.Duration(getenvInt("MCP_AUTH_PROXY_RECONNECT_BASE_MS", 250)) * time.Millisecond,
+		SocketPath:                   getenv("MCP_AUTH_PROXY_SOCKET", "/run/shizuha/mcp-auth-proxy/proxy.sock"),
+		TokenAudience:                getenv("MCP_AUTH_PROXY_TOKEN_AUDIENCE", "shizuha-mcp-auth-proxy"),
+		KubeAPIServer:                kubeAPIServer(),
+		KubeBearerTokenPath:          getenv("MCP_AUTH_PROXY_KUBE_BEARER_TOKEN", "/var/run/secrets/kubernetes.io/serviceaccount/token"),
+		KubeCACertPath:               getenv("MCP_AUTH_PROXY_KUBE_CA_CERT", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"),
+		TokenReviewMode:              os.Getenv("MCP_AUTH_PROXY_TOKENREVIEW_MODE"),
+		StubTokenReviewAllow:         getenvBool("MCP_AUTH_PROXY_STUB_TOKENREVIEW_ALLOW"),
+		MintURL:                      os.Getenv("MCP_AUTH_PROXY_MINT_URL"),
+		MintMode:                     os.Getenv("MCP_AUTH_PROXY_MINT_MODE"),
+		StubMintAllow:                getenvBool("MCP_AUTH_PROXY_STUB_MINT_ALLOW"),
+		AgentUsername:                getenv("AGENT_USERNAME", os.Getenv("MCP_AUTH_PROXY_AGENT_USERNAME")),
+		AgentPassword:                os.Getenv("AGENT_PASSWORD"),
+		IDLoginURL:                   idAuthURL("MCP_AUTH_PROXY_ID_LOGIN_URL", "/id/api/auth/login/"),
+		IDRefreshURL:                 idAuthURL("MCP_AUTH_PROXY_ID_REFRESH_URL", "/id/api/auth/refresh/"),
+		CoordinatorURL:               os.Getenv("MCP_AUTH_PROXY_COORDINATOR_URL"),
+		CoordinatorBearerToken:       os.Getenv("MCP_AUTH_PROXY_COORDINATOR_TOKEN"),
+		CoordinatorOAuthTokenURL:     os.Getenv("MCP_AUTH_PROXY_COORDINATOR_OAUTH_TOKEN_URL"),
+		CoordinatorOAuthClientID:     os.Getenv("MCP_AUTH_PROXY_COORDINATOR_OAUTH_CLIENT_ID"),
+		CoordinatorOAuthClientSecret: os.Getenv("MCP_AUTH_PROXY_COORDINATOR_OAUTH_CLIENT_SECRET"),
+		CoordinatorOAuthScope:        os.Getenv("MCP_AUTH_PROXY_COORDINATOR_OAUTH_SCOPE"),
+		ProjectionURL:                os.Getenv("MCP_AUTH_PROXY_PROJECTION_URL"),
+		AgentID:                      os.Getenv("AGENT_ID"),
+		BootstrapRetryEnabled:        getenvBoolDefault("MCP_AUTH_PROXY_BOOTSTRAP_RETRY", true),
+		BootstrapRetryBase:           time.Duration(getenvInt("MCP_AUTH_PROXY_BOOTSTRAP_RETRY_BASE_MS", 2000)) * time.Millisecond,
+		BootstrapRetryMax:            time.Duration(getenvInt("MCP_AUTH_PROXY_BOOTSTRAP_RETRY_MAX_MS", 120000)) * time.Millisecond,
+		Upstreams:                    splitCSV(os.Getenv("MCP_AUTH_PROXY_UPSTREAMS")),
+		ReconnectMaxAttempts:         getenvInt("MCP_AUTH_PROXY_RECONNECT_MAX_ATTEMPTS", 3),
+		ReconnectBaseBackoff:         time.Duration(getenvInt("MCP_AUTH_PROXY_RECONNECT_BASE_MS", 250)) * time.Millisecond,
 	}
 	// A present-but-unparseable expected-UID must fail closed: the operator
 	// explicitly tried to enable the tier-1 peer-UID check, so silently leaving
@@ -94,6 +102,9 @@ func LoadConfig() (Config, error) {
 		}
 		v := uint32(n)
 		cfg.ExpectedAgentUID = &v
+	}
+	if err := cfg.validateCoordinatorOAuth(); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
 }
