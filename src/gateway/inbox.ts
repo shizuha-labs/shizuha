@@ -86,6 +86,8 @@ function gatewayInboxPriority(message: InboundMessage): number {
 
 export class Inbox implements InboxInterface {
   private queue: InboundMessage[] = [];
+  // An admitted row is delivery state, not an unadmitted scheduler hint.
+  private admittedContinuations = new WeakSet<InboundMessage>();
   private resolver: ((msg: InboundMessage) => void) | null = null;
   private arrivalSequence = new WeakMap<InboundMessage, number>();
   private nextArrivalSequence = 0;
@@ -172,7 +174,8 @@ export class Inbox implements InboxInterface {
   private enqueueMessage(msg: InboundMessage): void {
     const taskKey = gatewayTaskNotificationKey(msg);
     if (taskKey) {
-      const duplicateIndex = this.queue.findIndex((queued) => gatewayTaskNotificationKey(queued) === taskKey);
+      const duplicateIndex = this.queue.findIndex((queued) => !this.admittedContinuations.has(queued)
+        && gatewayTaskNotificationKey(queued) === taskKey);
       if (duplicateIndex >= 0) {
         // The task event is only a wake hint; retain its stable queue position
         // but replace stale detail with the newest canonical-state hint.
@@ -194,7 +197,7 @@ export class Inbox implements InboxInterface {
     const kept: InboundMessage[] = [];
     let dropped = 0;
     for (const row of this.queue) {
-      if (isWorkingDeferredTaskNotification(row)) dropped += 1;
+      if (isWorkingDeferredTaskNotification(row) && !this.admittedContinuations.has(row)) dropped += 1;
       else kept.push(row);
     }
     if (dropped > 0) {
@@ -207,6 +210,7 @@ export class Inbox implements InboxInterface {
   private takeWorkingDeferredAdmission(): InboundMessage | null {
     const held = this.queue.filter((row) => (
       isWorkingDeferredTaskNotification(row)
+      && !this.admittedContinuations.has(row)
       && !isConnectAlertNotificationContent(row.content)
     ));
     if (held.length === 0) return null;
@@ -236,6 +240,14 @@ export class Inbox implements InboxInterface {
   }
 
   private takeAdmissible(): InboundMessage | null {
+    // Resume the exact admitted delivery before selecting any new work. Ordinary
+    // priority, parked-notification and heartbeat rules apply only afterward.
+    const continuationIndex = this.queue.findIndex((row) => this.admittedContinuations.has(row));
+    if (continuationIndex >= 0) {
+      const [row] = this.queue.splice(continuationIndex, 1);
+      this.admittedContinuations.delete(row!);
+      return row!;
+    }
     // Queue is already priority-sorted (direct-control, heartbeat, cron, routine).
     for (let i = 0; i < this.queue.length; i++) {
       const row = this.queue[i]!;
@@ -264,6 +276,12 @@ export class Inbox implements InboxInterface {
 
   hasClass(messageClass: GatewayInboxClass): boolean {
     return this.queue.some((message) => gatewayInboxClass(message) === messageClass);
+  }
+
+  /** Resume provider-deferred delivery without reclassifying it as a new hint. */
+  resumeAdmitted(messages: readonly InboundMessage[]): void {
+    for (const message of messages) this.admittedContinuations.add(message);
+    this.pushFront(messages);
   }
 
   /**
@@ -326,7 +344,7 @@ export class Inbox implements InboxInterface {
 
   /** Peek at the next message without removing it. */
   peek(): InboundMessage | null {
-    return this.queue[0] ?? null;
+    return this.queue.find((row) => this.admittedContinuations.has(row)) ?? this.queue[0] ?? null;
   }
 
   /** Get all queued messages (for inspection, e.g. showing queue to user). */

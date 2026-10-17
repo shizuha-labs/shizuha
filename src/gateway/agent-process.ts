@@ -2337,7 +2337,7 @@ export class AgentProcess {
       }
       return message;
     });
-    this.inbox.pushFront(rows);
+    this.inbox.resumeAdmitted(rows);
   }
 
   /** Wait while idle; no admitted row, HTTP call, or model prefix is consumed. */
@@ -4840,7 +4840,7 @@ export class AgentProcess {
       if (saved && saved.notBefore > Date.now()) {
         this.store.deferProviderInput(this.providerDeferralOwner(), this.provider?.name || 'unknown', this.model,
           saved.notBefore, saved.reason, msg.id, JSON.stringify(msg));
-        this.inbox.pushFront([msg]);
+        this.inbox.resumeAdmitted([msg]);
         this.inbox.busy = false;
         return false;
       }
@@ -5054,7 +5054,7 @@ export class AgentProcess {
         // startup restores this exact input even if the process exits now.
         this.store.deferProviderInput(this.providerDeferralOwner(), this.provider?.name || 'unknown', this.model,
           deferred.notBefore, deferred.reason, msg.id, JSON.stringify(msg));
-        this.inbox.pushFront([msg]);
+        this.inbox.resumeAdmitted([msg]);
         this.recordRecentError(err instanceof GatewayCompactionFailure ? err.cause : err);
         logger.warn({ reason: deferred.reason, notBefore: deferred.notBefore, messageId: msg.id },
           'Provider temporarily unavailable — exact input deferred without acknowledgement');
