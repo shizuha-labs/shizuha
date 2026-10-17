@@ -108,8 +108,9 @@ describe('provider failure terminal outcome idempotency (PLAT-4616)', () => {
       let body = ''; for await (const chunk of request) body += chunk;
       posted.push(JSON.parse(body));
       if (fail) {
-        response.writeHead(503, { 'content-type': 'application/json' });
-        response.end(JSON.stringify({ error: { code: 'provider_pool_dry', message: 'fixture dry pool', retryable: true } }));
+        // This regression needs a terminal failure; typed temporary503s now retain input.
+        response.writeHead(400, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { code: 'invalid_request_error', message: 'fixture rejected request' } }));
       } else {
         response.writeHead(200, { 'content-type': 'text/event-stream' });
         response.end('data: ' + JSON.stringify({ choices: [{ delta: { content: summary ? summaryText : 'healthy response' }, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n');

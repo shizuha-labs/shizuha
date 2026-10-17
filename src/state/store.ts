@@ -244,6 +244,16 @@ export class StateStore {
         replayed_at INTEGER,
         UNIQUE(session_id, episode_id, message_id)
       );
+      CREATE TABLE IF NOT EXISTS gateway_provider_deferrals (
+        owner TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        not_before INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        message_id TEXT,
+        payload TEXT,
+        PRIMARY KEY (owner, provider, model)
+      );
       CREATE TABLE IF NOT EXISTS session_inbound_processing (
         message_id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -431,6 +441,60 @@ export class StateStore {
     } finally {
       if (db) db.close();
     }
+  }
+
+  /** Maintenance can observe a refusal before any inbox input is admitted. */
+  deferProviderAdmission(owner: string, provider: string, model: string, notBefore: number, reason: string): void {
+    if (!owner || !provider || !model || !Number.isSafeInteger(notBefore)) {
+      throw new Error('Invalid provider admission checkpoint');
+    }
+    this.db.prepare(`INSERT INTO gateway_provider_deferrals (owner, provider, model, not_before, reason)
+      VALUES (?, ?, ?, ?, ?) ON CONFLICT(owner, provider, model) DO UPDATE SET
+      not_before = MAX(gateway_provider_deferrals.not_before, excluded.not_before), reason = excluded.reason`
+    ).run(owner, provider, model, notBefore, reason);
+  }
+
+  /** Persist provider authority and pending delivery together, before releasing admission. */
+  deferProviderInput(owner: string, provider: string, model: string, notBefore: number,
+    reason: string, messageId: string, payload: string): void {
+    if (!owner || !provider || !model || !messageId || !payload || !Number.isSafeInteger(notBefore)) {
+      throw new Error('Invalid provider deferral checkpoint');
+    }
+    const save = this.db.transaction(() => {
+      const current = this.providerDeferral(owner, provider, model);
+      if (current?.messageId && current.messageId !== messageId) {
+        throw new Error('Another provider input remains pending');
+      }
+      this.db.prepare(`INSERT INTO gateway_provider_deferrals
+        (owner, provider, model, not_before, reason, message_id, payload)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(owner, provider, model) DO UPDATE SET
+          not_before = MAX(gateway_provider_deferrals.not_before, excluded.not_before),
+          reason = excluded.reason, message_id = excluded.message_id, payload = excluded.payload`
+      ).run(owner, provider, model, notBefore, reason, messageId, payload);
+    });
+    save.immediate();
+  }
+
+  providerDeferral(owner: string, provider: string, model: string):
+    { notBefore: number; reason: string; messageId: string | null; payload: string | null } | null {
+    return this.db.prepare(`SELECT not_before AS notBefore, reason,
+      message_id AS messageId, payload FROM gateway_provider_deferrals
+      WHERE owner = ? AND provider = ? AND model = ?`).get(owner, provider, model) as
+        { notBefore: number; reason: string; messageId: string | null; payload: string | null } | undefined ?? null;
+  }
+
+  pendingProviderInputs(owner: string): Array<{ messageId: string; payload: string }> {
+    return this.db.prepare(`SELECT message_id AS messageId, payload
+      FROM gateway_provider_deferrals WHERE owner = ? AND payload IS NOT NULL
+      ORDER BY not_before, message_id`).all(owner) as Array<{ messageId: string; payload: string }>;
+  }
+
+  completeProviderInput(owner: string, messageId: string): void {
+    // Deadline survives completion: another queued row cannot invalidate the
+    // provider's advertised bound. Expired records are harmless and reused.
+    this.db.prepare(`UPDATE gateway_provider_deferrals SET message_id = NULL, payload = NULL
+      WHERE owner = ? AND message_id = ?`).run(owner, messageId);
   }
 
   inboundProcessingCompleted(_sessionId: string, messageId: string): boolean {

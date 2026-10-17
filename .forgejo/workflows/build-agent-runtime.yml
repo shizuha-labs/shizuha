@@ -355,6 +355,10 @@ jobs:
           OVERLAY_BASE_ANTIGRAVITY_VER="1.3.3"
           OVERLAY_BASE_OPENCLAW_VER="2026.10.1"
           OVERLAY_ELIGIBLE=false
+          FULL_BUILD_CC_VER="$CC_VER"
+          FULL_BUILD_CODEX_VER="$CODEX_VER"
+          FULL_BUILD_ANTIGRAVITY_VER="$ANTIGRAVITY_VER"
+          FULL_BUILD_OPENCLAW_VER="$OPENCLAW_VER"
           overlay_eligible_with() {
             python3 scripts/agent_runtime_overlay.py eligible \
               --repo-root . \
@@ -406,6 +410,13 @@ jobs:
             if [ "$BASE_STATUS" != "200" ]; then
               echo "::notice::pinned overlay base ${OVERLAY_BASE_INDEX_DIGEST} not resolvable in registry (HTTP ${BASE_STATUS}); falling back to full native runtime build"
               OVERLAY_ELIGIBLE=false
+              # The old harness set belongs to the existing overlay rootfs.
+              # A full rebuild must use the validated release intent resolved
+              # above, including the current official Antigravity channel.
+              CC_VER="$FULL_BUILD_CC_VER"
+              CODEX_VER="$FULL_BUILD_CODEX_VER"
+              ANTIGRAVITY_VER="$FULL_BUILD_ANTIGRAVITY_VER"
+              OPENCLAW_VER="$FULL_BUILD_OPENCLAW_VER"
             fi
           fi
 

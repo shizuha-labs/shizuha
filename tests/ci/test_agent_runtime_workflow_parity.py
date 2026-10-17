@@ -15,6 +15,56 @@ DOCKERFILE = ROOT / "Dockerfile.agent-runtime"
 
 
 class AgentRuntimeWorkflowParityTests(unittest.TestCase):
+    def _actual_overlay_selection(self, registry_status, explicit=False):
+        text = WORKFLOW.read_text()
+        start = text.index('          OVERLAY_ELIGIBLE=false')
+        end = text.index('\n          render_overlay_job() {', start)
+        selection = textwrap.dedent(text[start:end])
+        env = os.environ | {
+            'CC_VER': '2.1.302', 'CODEX_VER': '0.163.0',
+            'ANTIGRAVITY_VER': '1.4.0', 'OPENCLAW_VER': '2026.10.4',
+            'OVERLAY_BASE_CC_VER': '2.1.296', 'OVERLAY_BASE_CODEX_VER': '0.162.1',
+            'OVERLAY_BASE_ANTIGRAVITY_VER': '1.3.3',
+            'OVERLAY_BASE_OPENCLAW_VER': '2026.10.1',
+            'OVERLAY_BASE_SOURCE_SHA': 'a' * 40, 'SOURCE_SHA': 'b' * 40,
+            'OVERLAY_BASE_INDEX_DIGEST': 'sha256:' + 'c' * 64,
+            'SOURCE_BRANCH': 'master', 'REG': 'registry.invalid', 'IMG': 'runtime',
+            'REGISTRY_STATUS': registry_status,
+            'INPUT_CLAUDE_CODE_VERSION': '', 'INPUT_CODEX_VERSION': '',
+            'INPUT_ANTIGRAVITY_VERSION': '1.4.0' if explicit else '',
+            'INPUT_OPENCLAW_VERSION': '',
+        }
+        # Execute the actual source decision, isolating only its network and
+        # source-eligibility instruments. No build, fetch or registry write.
+        instruments = '''set -euo pipefail
+git() { return 0; }
+curl() { printf '%s' "$REGISTRY_STATUS"; }
+python3() {
+  case " $* " in
+    *" --claude-code 2.1.296 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+'''
+        result = subprocess.check_output(['bash', '-c', instruments + selection +
+            '\nprintf "SELECTION=%s|%s|%s|%s|%s\\n" "$OVERLAY_ELIGIBLE" '
+            '"$CC_VER" "$CODEX_VER" "$ANTIGRAVITY_VER" "$OPENCLAW_VER"'],
+            text=True, env=env)
+        return next(line.removeprefix('SELECTION=') for line in result.splitlines()
+                    if line.startswith('SELECTION='))
+
+    def test_missing_overlay_base_restores_resolved_full_build_versions(self):
+        self.assertEqual(self._actual_overlay_selection('404'),
+                         'false|2.1.302|0.163.0|1.4.0|2026.10.4')
+
+    def test_available_overlay_base_keeps_its_smoked_harness_versions(self):
+        self.assertEqual(self._actual_overlay_selection('200'),
+                         'true|2.1.296|0.162.1|1.3.3|2026.10.1')
+
+    def test_explicit_harness_intent_is_preserved_when_overlay_is_ineligible(self):
+        self.assertEqual(self._actual_overlay_selection('404', explicit=True),
+                         'false|2.1.302|0.163.0|1.4.0|2026.10.4')
+
     def test_actual_native_builder_render_allows_repaired_i9_path(self):
         from tests.ci._mini_yaml import loads
         text = WORKFLOW.read_text()
