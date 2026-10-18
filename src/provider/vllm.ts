@@ -17,7 +17,9 @@
 
 import type { LLMProvider, ChatMessage, ChatOptions, StreamChunk, ChatContentBlock } from './types.js';
 import { holdDsmlStreamDelta, stripDsmlMarkup } from '../agent/dsml-salvage.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { Agent } from 'undici';
 import { logger } from '../utils/logger.js';
 import { getModelProfile, resolveReasoningEffortForRequest, shouldEnableThinkingForRequest } from './model-profile.js';
@@ -3611,22 +3613,28 @@ export class VLlmProvider implements LLMProvider {
                   } else {
                     try {
                       const fs = await import('node:fs');
-                      const dir = '/workspace/.shizuha-repro';
-                      fs.mkdirSync(dir, { recursive: true });
+                      const dir = join(homedir(), '.shizuha', 'repro');
+                      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+                      const directory = fs.lstatSync(dir);
+                      if (!directory.isDirectory() || (directory.mode & 0o077) !== 0) {
+                        throw new Error('Private diagnostic directory required');
+                      }
                       // SCLI-57b: bound the repro dir — each dump can be ~500KB and a
                       // recurring corruption used to freeze EVERY occurrence (54 files /
                       // ~25MB on one agent in a day). Keep at most 3 repros per tool;
                       // the first few instances carry all the diagnostic value.
-                      const toolSlug = tc.name.replace(/[^a-z0-9_]/gi, '_');
+                      const toolHash = createHash('sha256').update(tc.name).digest('hex');
+                      const toolSlug = `${tc.name.replace(/[^a-z0-9_]/gi, '_').slice(0, 64)}-${toolHash}`;
                       const existing = fs.readdirSync(dir).filter((f) => f.startsWith(`corrupt-${toolSlug}-`));
                       if (existing.length < 3) {
-                        fs.writeFileSync(`${dir}/corrupt-${toolSlug}-${Date.now()}.json`,
-                          JSON.stringify({ tool: tc.name, corruptArgs: tc.args, accContent, accReasoning, request: JSON.parse(requestBody) }, null, 2));
-                        logger.warn({ tool: tc.name, corruptArgs: (tc.args || '').slice(0, 160) }, 'SCLI-57: FROZE corrupt-arg repro case (request + output)');
+                        fs.writeFileSync(join(dir, `corrupt-${toolSlug}-${Date.now()}-${randomUUID()}.json`),
+                          JSON.stringify({ tool: tc.name, corruptArgs: tc.args, accContent, accReasoning, request: JSON.parse(requestBody) }, null, 2),
+                          { mode: 0o600, flag: 'wx' });
+                        logger.warn({ toolHash, argumentBytes: Buffer.byteLength(tc.args || '') }, 'SCLI-57: FROZE corrupt-arg repro case (request + output)');
                       } else {
-                        logger.warn({ tool: tc.name, corruptArgs: (tc.args || '').slice(0, 160) }, 'SCLI-57: corrupt args (repro cap reached, not re-freezing)');
+                        logger.warn({ toolHash, argumentBytes: Buffer.byteLength(tc.args || '') }, 'SCLI-57: corrupt args (repro cap reached, not re-freezing)');
                       }
-                    } catch (e) { logger.warn({ err: (e as Error).message }, 'SCLI-57 repro dump failed'); }
+                    } catch (e) { logger.warn({ code: (e as NodeJS.ErrnoException).code ?? 'DIAGNOSTIC_WRITE_FAILED' }, 'SCLI-57 repro dump failed'); }
                   }
                 }
                 yield { type: 'tool_use_end', id: tc.id, input: parsedInput };
