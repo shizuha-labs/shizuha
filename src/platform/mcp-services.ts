@@ -53,6 +53,13 @@ export const PLATFORM_MCP_SERVICES: PlatformMcpService[] = [
   // jobs. Sidecar-in-backend like pulse/wiki: MCP served by the shizuha-scs
   // pod itself on 18115 (the retired hr/time ports stay untouched).
   { name: 'scs',       port: 18115 },
+  // Shizuha Build (BUILD-5) — published-apps estate read API as MCP tools:
+  // build_list_published_apps, build_list_publisher_store, build_read_app_blueprint.
+  // Stateless streamable-HTTP thin client over the SCS public endpoints; served
+  // by the shizuha-scs pod on 18116 (chart registration buildMcpPort), reached
+  // via the nginx MCP route `build` (deploy#1592, merge b6c9c34ca249, live 10-01).
+  // Hive-side grant: fleet_capabilitydefinition `shizuha-build-access` (BUILD-25).
+  { name: 'build',     port: 18116 },
 ];
 
 const RETIRED_PLATFORM_MCP_KEYS = new Set([

@@ -97,6 +97,12 @@ export const MCP_ACCESS_MATRIX: McpAccessMatrix = {
     aya: { add: ['hive'] },
     yuna: { add: ['hive'] },
     ena: { add: ['hive'] },
+    // sara: Shizuha Build MCP tools (BUILD-5/BUILD-25) — published-apps estate
+    // read API (build_list_published_apps / build_list_publisher_store /
+    // build_read_app_blueprint) via nginx /mcp/build -> shizuha-scs :18116.
+    // Scoped per-agent (not base) to match the Hive-side grant
+    // `shizuha-build-access` + AgentCapabilityOverride (CoS ruling 2026-10-23).
+    sara: { add: ['build'] },
   },
 };
 
