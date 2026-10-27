@@ -35,6 +35,15 @@ export type EnsureAgentAccountDiag = {
 };
 
 let lastEnsureAgentAccountDiag: EnsureAgentAccountDiag | null = null;
+/** Last HTTP status from the reconcile leg that just failed. 0 = transport/timeout (no response). */
+let lastReconcileHttpStatus: number | undefined;
+/** Why the last reconcile leg returned null. Kept so a transport failure is not a blank status=. */
+let lastReconcileFailureReason: string | undefined;
+
+function recordReconcileHttpStatus(status: number | undefined, reason?: string): void {
+  if (status !== undefined) lastReconcileHttpStatus = status;
+  if (reason) lastReconcileFailureReason = reason;
+}
 
 export function consumeEnsureAgentAccountDiag(): EnsureAgentAccountDiag | null {
   const diag = lastEnsureAgentAccountDiag;
@@ -381,7 +390,10 @@ async function reconcileCanonicalAccountPassword(opts: {
   } else {
     // The operator-admin set_password path DOES need a concrete userId.
     if (opts.userId <= 0) {
-      logger.error({ agent: opts.agentUsername }, 'Agent account: cannot reconcile canonical password via admin path without userId (no fleet-provisioner token mounted)');
+      // No HTTP call is possible. Status 0 matches the transport sentinel so the
+      // ANDON is not `status=` blank, and the reason names the missing inputs.
+      recordReconcileHttpStatus(0, 'no_user_id_without_fleet_token');
+      logger.error({ agent: opts.agentUsername, status: 0 }, 'Agent account: cannot reconcile canonical password via admin path without userId (no fleet-provisioner token mounted)');
       return null;
     }
     const passwordSet = await setAgentPassword(opts.baseUrl, opts.admin, opts.userId, opts.canonicalPassword);
@@ -393,7 +405,14 @@ async function reconcileCanonicalAccountPassword(opts: {
   // token (post-set-password) is what is stored + handed to the broker.
   const loginResult = await loginAgent(opts.baseUrl, opts.agentUsername, opts.canonicalPassword);
   if (loginResult.kind !== 'success') {
-    logger.error({ agent: opts.agentUsername, userId: opts.userId, outcome: loginResult.kind }, 'Agent account: canonical password set but login failed');
+    recordReconcileHttpStatus(
+      'status' in loginResult ? loginResult.status : 0,
+      loginResult.reason,
+    );
+    logger.error(
+      { agent: opts.agentUsername, userId: opts.userId, outcome: loginResult.kind, status: 'status' in loginResult ? loginResult.status : undefined },
+      'Agent account: canonical password set but login failed',
+    );
     return null;
   }
   logger.info({ agent: opts.agentUsername, userId: loginResult.userId }, 'Agent account: reconciled canonical account password');
@@ -461,6 +480,8 @@ export async function ensureAgentAccount(opts: {
   // approve + set-password calls; on a mid-provision revocation it re-mints
   // once and the fresh token propagates to the remaining calls.
   const admin: AdminTokenHolder = { value: adminToken, remint: opts.remintAdminToken };
+  lastReconcileHttpStatus = undefined;
+  lastReconcileFailureReason = undefined;
 
   const stored = loadCredentials(agentUsername);
 
@@ -562,7 +583,8 @@ export async function ensureAgentAccount(opts: {
       agent: agentUsername,
       phase: 'fully_drifted_reconcile_failed',
       kind: 'reconcile-failed',
-      reason: 'admin_set_password_or_login_failed',
+      reason: lastReconcileFailureReason || 'admin_set_password_or_login_failed',
+      status: lastReconcileHttpStatus,
     });
   }
 
@@ -722,6 +744,7 @@ async function provisionViaFleetEndpoint(
         if (!resp.ok) data = await resp.json().catch(() => data) as Record<string, unknown>;
       }
       if (!resp.ok) {
+        recordReconcileHttpStatus(resp.status, String(data['reason'] ?? data['error'] ?? 'fleet_provision_rejected'));
         logger.error(
           { agent: opts.username, status: resp.status, reason: data['reason'] ?? data['error'] },
           'Agent account: fleet-provisioner endpoint rejected provisioning',
@@ -736,7 +759,8 @@ async function provisionViaFleetEndpoint(
     );
     return { userId: data.user_id, action: data.action };
   } catch (err) {
-    logger.warn({ agent: opts.username, err: (err as Error).message }, 'Agent account: fleet-provisioner fetch error');
+    recordReconcileHttpStatus(0, (err as Error).message || 'fleet_provision_fetch_error');
+    logger.warn({ agent: opts.username, err: (err as Error).message, status: 0 }, 'Agent account: fleet-provisioner fetch error');
     return null;
   }
 }
@@ -1050,10 +1074,12 @@ async function setAgentPassword(
         return setAgentPassword(baseUrl, admin, userId, password, true);
       }
     }
+    recordReconcileHttpStatus(resp.status, String(data['error'] ?? data['reason'] ?? 'set_password_failed'));
     logger.warn({ userId, status: resp.status, error: data }, 'Agent account: set-password failed');
     return false;
   } catch (err) {
-    logger.warn({ userId, err: (err as Error).message }, 'Agent account: set-password error');
+    recordReconcileHttpStatus(0, (err as Error).message || 'set_password_fetch_error');
+    logger.warn({ userId, err: (err as Error).message, status: 0 }, 'Agent account: set-password error');
     return false;
   }
 }
