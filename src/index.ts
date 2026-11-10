@@ -7,6 +7,8 @@ import { runAgent, createTurnTelemetrySink, setActiveTelemetryWindow } from './a
 import { TurnTelemetryWindow, recordTurnTelemetry } from './telemetry/turn-telemetry.js';
 import {
   classifyPromptSource,
+  applyHeartbeatHardBudgetTrim,
+  HeartbeatOverBudgetError,
   classifyPromptText,
   estimatePromptTokenBudget,
   heartbeatBudgetConfig,
@@ -3138,6 +3140,48 @@ async function* runAgentWithPrompt(
           model,
           sourceKind: promptBudget.sourceKind,
         });
+      }
+      // PLAT-9203: shared hard-budget reset (see applyHeartbeatHardBudgetTrim)
+      // — one implementation for both turn paths.
+      {
+        const estimate = (candidate: typeof messages) => estimatePromptTokenBudget({
+          messages: candidate,
+          systemPrompt,
+          toolDefs,
+          model,
+          sourceKind: 'heartbeat',
+        }).promptTokenEstimate;
+        const { trimmed } = applyHeartbeatHardBudgetTrim({
+          messages,
+          sessionId: session.id,
+          sourceKind: promptBudget.sourceKind,
+          hardBudgetTokens: hbBudget.hardBudgetTokens,
+          estimate,
+          replaceMessages: (sid, next) => store.replaceMessages(sid, next),
+          turnIndex,
+        });
+        if (trimmed) {
+          lastReportedPromptTokens = 0;
+          lastProviderPromptEstimate = 0;
+          effectiveReportedPromptTokens = 0;
+          promptBudget = estimatePromptTokenBudget({
+            messages,
+            systemPrompt,
+            toolDefs,
+            model,
+            sourceKind: 'heartbeat',
+          });
+          compactionAction = 'compact';
+          // PLAT-9203 idle-poll hard stop: still over the hard budget after
+          // trim/compaction — do not ship the turn (cached tokens are real
+          // cost; no-op compaction never self-heals). Heartbeat-only branch.
+          if (promptBudget.promptTokenEstimate > hbBudget.hardBudgetTokens) {
+            throw new HeartbeatOverBudgetError(
+              promptBudget.promptTokenEstimate,
+              hbBudget.hardBudgetTokens,
+            );
+          }
+        }
       }
 
       // Stream content/reasoning live while buffering the remaining events so

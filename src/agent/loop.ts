@@ -18,6 +18,8 @@ import {
   classifyPromptSource,
   estimatePromptTokenBudget,
   heartbeatBudgetConfig,
+  HeartbeatOverBudgetError,
+  applyHeartbeatHardBudgetTrim,
   type HeartbeatCompactionAction,
 } from './heartbeat-hygiene.js';
 import { resolveDynamicCompactionWindow, resolveEffectiveContextWindow, type CompactionWindowMode } from '../provider/context-window.js';
@@ -602,6 +604,57 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
             },
             'Heartbeat proceeding after compaction left a large prompt',
           );
+        }
+      }
+
+      // PLAT-9203: hard budget was computed and never applied, so a failed
+      // summarize still shipped 170k–299k prompts. Shared reset (see
+      // applyHeartbeatHardBudgetTrim): trim oldest messages to the ceiling,
+      // persist, and tag the rewrite as a compaction for attribution.
+      {
+        const estimate = (candidate: typeof messages) => estimatePromptTokenBudget({
+          messages: candidate,
+          systemPrompt,
+          toolDefs,
+          model,
+          sourceKind: 'heartbeat',
+        }).promptTokenEstimate;
+        const { trimmed } = applyHeartbeatHardBudgetTrim({
+          messages,
+          sessionId: session.id,
+          sourceKind: promptBudget.sourceKind,
+          hardBudgetTokens: hbBudget.hardBudgetTokens,
+          estimate,
+          replaceMessages: (sid, next) => store.replaceMessages(sid, next),
+          turnIndex,
+        });
+        if (trimmed) {
+          compactionAction = 'compact';
+          lastReportedPromptTokens = 0;
+          lastProviderPromptEstimate = 0;
+          promptBudget = estimatePromptTokenBudget({
+            messages,
+            systemPrompt,
+            toolDefs,
+            model,
+            sourceKind: 'heartbeat',
+          });
+          // PLAT-9203 re-review note: if this fires repeatedly on the same
+          // transcript, the nudge itself exceeds hardBudget —
+          // trimMessagesToTokenBudget pins the nudge even when over-budget
+          // (it is the only instruction for the turn), so the reset re-fires
+          // every beat. Diagnose nudge size first, never the trim loop.
+          // PLAT-9203 idle-poll hard stop: even after the trim above, a
+          // transcript over the hard budget must not ship as an idle Pulse
+          // poll turn — cached tokens are real cost and a no-op compaction
+          // (hina 101637→101637) never self-heals. Interactive turns are
+          // unaffected (this branch is sourceKind === 'heartbeat' only).
+          if (promptBudget.promptTokenEstimate > hbBudget.hardBudgetTokens) {
+            throw new HeartbeatOverBudgetError(
+              promptBudget.promptTokenEstimate,
+              hbBudget.hardBudgetTokens,
+            );
+          }
         }
       }
 

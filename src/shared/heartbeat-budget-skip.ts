@@ -18,7 +18,11 @@ export type HeartbeatBudgetSkipReason =
   | 'queue_empty'          // Pulse preflight confirmed no ready work
   | 'no_token'             // preflight had no usable Pulse token / emails
   | 'preflight_http_error' // preflight HTTP failure (fail-closed)
-  | 'preflight_exception'; // preflight threw (fail-closed)
+  | 'preflight_exception'  // preflight threw (fail-closed)
+  | 'context_over_budget'; // PLAT-9203: transcript still over the hard
+                           // budget after compaction/trim — idle poll must
+                           // not ship a ~200k uncached prompt (hritik
+                           // directive, supersedes never-skip for idle polls)
 
 export interface HeartbeatBudgetSkipRecord {
   agentId: string;

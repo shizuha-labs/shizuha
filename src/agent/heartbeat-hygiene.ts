@@ -1,6 +1,7 @@
 import type { Message } from './types.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { countTokens } from '../utils/tokens.js';
+import { logger } from '../utils/logger.js';
 import { effectiveContextTokens, estimateTokens, getSafetyFactor } from '../prompt/context.js';
 
 export type PromptSourceKind = 'heartbeat' | 'scheduled' | 'user' | 'unknown';
@@ -145,6 +146,29 @@ function messageText(message: Message): string {
 }
 
 /**
+ * PLAT-9203 (hritik directive): typed hard stop for idle Pulse polls whose
+ * transcript is STILL over the hard budget after compaction/trim. Supersedes
+ * the 2026-08-17 never-skip rule for idle polls only — a ~200k uncached
+ * prompt costs real money (cached tokens count), and hina's live
+ * 101637→101637 no-op compaction shows the ratchet does not self-heal.
+ * Never thrown for interactive turns.
+ */
+export class HeartbeatOverBudgetError extends Error {
+  readonly promptTokenEstimate: number;
+  readonly hardBudgetTokens: number;
+
+  constructor(promptTokenEstimate: number, hardBudgetTokens: number) {
+    super(
+      `heartbeat transcript still over hard budget after compaction/trim: `
+      + `estimate=${promptTokenEstimate} hard=${hardBudgetTokens} — idle poll hard stop (PLAT-9203)`,
+    );
+    this.name = 'HeartbeatOverBudgetError';
+    this.promptTokenEstimate = promptTokenEstimate;
+    this.hardBudgetTokens = hardBudgetTokens;
+  }
+}
+
+/**
  * Optional lean-head helper. Heartbeats must still run at high ctx;
  * do not use this as a skip substitute.
  */
@@ -153,6 +177,115 @@ export function keepHeartbeatNudgeOnly(messages: Message[]): Message[] {
   if (!last || last.role !== 'user') return [];
   if (classifyPromptSource([last]) !== 'heartbeat') return [];
   return [last];
+}
+
+/**
+ * Pair-completeness predicate (PLAT-9203 re-review, ren CR): a message whose
+ * content blocks include a tool_result. Extracted from the private copy in
+ * src/state/compaction.ts so the trim loop and compaction share one
+ * definition of "orphanable head".
+ */
+export function isToolResultMessage(message: Message | undefined): boolean {
+  return Boolean(message
+    && Array.isArray(message.content)
+    && (message.content as { type: string }[]).some((block) => block.type === 'tool_result'));
+}
+
+/**
+ * PLAT-9203: the hard budget is a ceiling, not a log line.
+ *
+ * Semantic compaction is best-effort and the never-skip rule still sends the
+ * turn. Without this trim, a heartbeat whose summary did not land under the
+ * hard budget re-ships the whole transcript (live: agent-aoi max 299751 with
+ * only 4 drops to ≤80k). Drop oldest messages until the estimate fits. If one
+ * message is still over, keep the heartbeat nudge when that is what the tail
+ * is; otherwise keep the tail message so a non-heartbeat transcript is not
+ * wiped to empty.
+ */
+export function trimMessagesToTokenBudget(
+  messages: Message[],
+  budgetTokens: number,
+  estimate: (candidate: Message[]) => number,
+): { messages: Message[]; trimmed: boolean } {
+  if (budgetTokens <= 0 || estimate(messages) <= budgetTokens) {
+    return { messages, trimmed: false };
+  }
+  // PLAT-9203 re-review (rv @7285ffce, full-suite run 8936): when a hard
+  // budget reset fires on a heartbeat transcript, the nudge is the operative
+  // instruction for the turn being sent — pin it as the head (nudge-only
+  // reset) instead of leaving stale filler ahead of it. The already-fits
+  // path above never reaches this, so fitting transcripts are not
+  // over-trimmed; a nudge that itself exceeds the budget falls through to
+  // the generic oldest-first loop below.
+  const pinnedNudge = keepHeartbeatNudgeOnly(messages);
+  if (pinnedNudge.length > 0 && estimate(pinnedNudge) <= budgetTokens) {
+    return { messages: pinnedNudge, trimmed: true };
+  }
+  const kept = messages.slice();
+  while (kept.length > 1 && estimate(kept) > budgetTokens) {
+    kept.shift();
+  }
+  // PLAT-9203 re-review (ren CR): the oldest-first loop stops on a token
+  // boundary, not a tool-pair boundary — it can leave an orphaned tool_result
+  // whose tool_use was shifted away, which Anthropic-style providers reject
+  // with a 400. Mirror selectCompactionPrefix (src/state/compaction.ts):
+  // after shifting, drop kept-head messages that carry tool_result so the
+  // kept head is always pair-complete.
+  while (kept.length > 0 && isToolResultMessage(kept[0])) {
+    kept.shift();
+  }
+  if (kept.length === 0) {
+    const nudge = keepHeartbeatNudgeOnly(messages);
+    if (nudge.length > 0) return { messages: nudge, trimmed: true };
+    return { messages: messages.slice(-1), trimmed: true };
+  }
+  if (estimate(kept) <= budgetTokens) {
+    return { messages: kept, trimmed: true };
+  }
+  const nudge = keepHeartbeatNudgeOnly(messages);
+  if (nudge.length > 0) return { messages: nudge, trimmed: true };
+  return { messages: kept.slice(-1), trimmed: true };
+}
+
+/**
+ * PLAT-9203 re-review (hritik): shared hard-budget reset used by BOTH
+ * heartbeat turn paths (src/agent/loop.ts and src/index.ts). Previously the
+ * two sites duplicated the trim block and diverged — only index.ts tagged the
+ * rewrite as compactionAction='compact', so Cortex attribution and telemetry
+ * disagreed between the two paths. Callers set compactionAction from
+ * `trimmed` themselves (it is a caller-local discriminator), which makes the
+ * two paths behave identically.
+ */
+export function applyHeartbeatHardBudgetTrim(args: {
+  messages: Message[];
+  sessionId: string;
+  sourceKind: PromptSourceKind;
+  hardBudgetTokens: number;
+  estimate: (candidate: Message[]) => number;
+  replaceMessages: (sessionId: string, next: Message[]) => void;
+  turnIndex?: number;
+}): { trimmed: boolean } {
+  if (args.sourceKind !== 'heartbeat') return { trimmed: false };
+  if (args.estimate(args.messages) <= args.hardBudgetTokens) return { trimmed: false };
+  const trimmed = trimMessagesToTokenBudget(args.messages, args.hardBudgetTokens, args.estimate);
+  if (!trimmed.trimmed) return { trimmed: false };
+  // In-place on purpose: `messages` is the live turn array captured by
+  // closures further down the turn (provider call, telemetry, tool loop).
+  // Reassigning a local copy would desynchronize those views; length=0 +
+  // push keeps every existing reference pointed at the trimmed transcript.
+  args.messages.length = 0;
+  args.messages.push(...trimmed.messages);
+  args.replaceMessages(args.sessionId, args.messages);
+  logger.warn(
+    {
+      turnIndex: args.turnIndex,
+      sessionId: args.sessionId,
+      hardBudgetTokens: args.hardBudgetTokens,
+      keptMessages: args.messages.length,
+    },
+    'Heartbeat hard-budget trim applied',
+  );
+  return { trimmed: true };
 }
 
 export function classifyPromptSource(messages: Message[], initialPrompt?: string): PromptSourceKind {
