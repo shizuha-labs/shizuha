@@ -12,8 +12,15 @@
  */
 import { Registry, Gauge, Counter, Histogram } from 'prom-client';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { getAllTelemetryWindows } from '../agent/loop.js';
 import type { TurnTelemetryRecord } from '../telemetry/turn-telemetry.js';
+import {
+  MCP_RECONNECT_REASON_CLASSES,
+  MCP_RECONNECT_SNAPSHOT_MAX_AGE_MS,
+  mcpReconnectStateDir,
+  type McpReconnectSnapshot,
+} from '../mcp-proxy/reconnect-state.js';
 
 export const metricsRegistry = new Registry();
 
@@ -152,6 +159,52 @@ export function recordMcpReconnectFailure(server: string, reasonClass: McpReconn
 export function recordMcpReconnectSuccess(server: string): void {
   const agent = process.env['AGENT_USERNAME'] || process.env['AGENT_NAME'] || 'unknown';
   mcpReconnectConnectSuccesses.inc({ agent, server });
+}
+
+/**
+ * PLAT-11763: merge cross-process mcp-proxy reconnect snapshots (written by
+ * mcp-proxy children, see src/mcp-proxy/reconnect-state.ts) into the registered
+ * PLAT-4112/PLAT-8689 families so the gateway's :9103 endpoint — served by the
+ * parent, which no longer dials upstream — keeps them sampled fleet-wide.
+ * Snapshots older than MCP_RECONNECT_SNAPSHOT_MAX_AGE_MS are treated as dead
+ * children and skipped (an immortal frozen series would page forever on a seat
+ * whose MCP config was removed).
+ */
+function mergeMcpReconnectSnapshots(): void {
+  let snapshots: McpReconnectSnapshot[];
+  try {
+    const dir = mcpReconnectStateDir();
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+    const now = Date.now();
+    snapshots = files
+      .map((f) => {
+        try {
+          return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8')) as McpReconnectSnapshot;
+        } catch {
+          return null;
+        }
+      })
+      .filter((s): s is McpReconnectSnapshot =>
+        !!s && typeof s.server === 'string' && now - (Number(s.updated_at) || 0) < MCP_RECONNECT_SNAPSHOT_MAX_AGE_MS);
+  } catch {
+    return; // no state dir (e.g. non-gateway modes) — nothing to merge
+  }
+  const reasonClasses: readonly string[] = MCP_RECONNECT_REASON_CLASSES;
+  mcpReconnectConsecutiveFailures.reset();
+  mcpReconnectFailures.reset();
+  mcpReconnectConnectSuccesses.reset();
+  for (const s of snapshots) {
+    const agent = s.agent || 'unknown';
+    const reasonClass = reasonClasses.includes(s.last_reason_class) ? s.last_reason_class : 'other';
+    mcpReconnectConsecutiveFailures.set(
+      { agent, server: s.server },
+      Math.max(0, Number(s.consecutive_failures) || 0),
+    );
+    const failures = Math.max(0, Number(s.failures_total) || 0);
+    const successes = Math.max(0, Number(s.success_total) || 0);
+    if (failures > 0) mcpReconnectFailures.inc({ agent, server: s.server, reason_class: reasonClass }, failures);
+    if (successes > 0) mcpReconnectConnectSuccesses.inc({ agent, server: s.server }, successes);
+  }
 }
 
 // CTX-123: provider timeout counter — incremented by vllm.ts on non-streaming response timeouts.
@@ -415,6 +468,18 @@ export async function renderMetrics(): Promise<string> {
   for (const win of getAllTelemetryWindows()) {
     accumulateRecords(win.query());
   }
+
+  // PLAT-11763: platform MCP connections moved into per-server mcp-proxy child
+  // processes (generation 53), each with its own prom-client registry that is
+  // NOT exposed on :9103. The children persist reconnect snapshots cross-process
+  // (src/mcp-proxy/reconnect-state.ts); materialize them into the registered
+  // families here so the PLAT-4112/PLAT-8689 series stay sampled fleet-wide and
+  // the reconnect-wedge alert lane stays loud. Snapshots are authoritative
+  // (children rewrite them on every state change + liveness tick), so
+  // reset-and-set per render is correct. NOTE: if the in-process manager ever
+  // reconnects platform MCP again, its live counters would be overridden by the
+  // snapshot merge — reconcile the two paths before re-enabling both.
+  mergeMcpReconnectSnapshots();
 
   return metricsRegistry.metrics();
 }

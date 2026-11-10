@@ -207,3 +207,49 @@ describe('PLAT-5335 runtime-roll deferral metric', () => {
   });
 });
 
+
+describe('PLAT-11763: mcp-proxy snapshot merge in renderMetrics()', () => {
+  it('restores the reconnect families from cross-process snapshots and skips stale children', async () => {
+    const { persistMcpReconnectState } = await import('../src/mcp-proxy/reconnect-state.js');
+    const { renderMetrics } = await import('../src/metrics/registry.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-reconnect-merge-'));
+    // Point the exporter at the temp dir for this render.
+    const prev = process.env['MCP_RECONNECT_STATE_DIR'];
+    process.env['MCP_RECONNECT_STATE_DIR'] = dir;
+    try {
+      // Fresh child: wedged reconnect streak, cumulative counters, closed reason class.
+      persistMcpReconnectState({
+        agent: 'ni', server: 'pulse', consecutive_failures: 4,
+        failures_total: 11, success_total: 3, last_reason_class: 'conn_reset', updated_at: Date.now(),
+      });
+      // Stale child (removed service): must NOT be rendered immortal.
+      persistMcpReconnectState({
+        agent: 'ni', server: 'legacy', consecutive_failures: 9,
+        failures_total: 20, success_total: 1, last_reason_class: 'auth',
+        updated_at: Date.now() - 2 * 60 * 60_000,
+      });
+
+      const out = await renderMetrics();
+      expect(out).toContain(
+        'shizuha_mcp_reconnect_consecutive_failures{agent="ni",server="pulse"} 4',
+      );
+      expect(out).toContain(
+        'shizuha_mcp_reconnect_failures_total{agent="ni",server="pulse",reason_class="conn_reset"} 11',
+      );
+      expect(out).toContain(
+        'shizuha_mcp_reconnect_connect_success_total{agent="ni",server="pulse"} 3',
+      );
+      expect(out).not.toContain('server="legacy"');
+
+      // Rendering twice must not accumulate the counters (reset-and-set per render).
+      const out2 = await renderMetrics();
+      expect(out2).toContain(
+        'shizuha_mcp_reconnect_failures_total{agent="ni",server="pulse",reason_class="conn_reset"} 11',
+      );
+    } finally {
+      if (prev === undefined) delete process.env['MCP_RECONNECT_STATE_DIR'];
+      else process.env['MCP_RECONNECT_STATE_DIR'] = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

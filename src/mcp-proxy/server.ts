@@ -68,6 +68,11 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { ResultSchema, type ServerCapabilities, type Implementation } from '@modelcontextprotocol/sdk/types.js';
 import { fetchBrokerToken } from '../auth/broker-token.js';
+import {
+  classifyMcpReconnectError,
+  persistMcpReconnectState,
+  seedMcpReconnectTotals,
+} from './reconnect-state.js';
 
 // ── Config resolution (pure, unit-testable) ──
 
@@ -329,8 +334,36 @@ export class UpstreamConnection {
   private livenessInFlight = false;
   private livenessFailureCount = 0;
   private activeForwardRequests = 0;
+  // PLAT-11763: reconnect observability state persisted cross-process (see
+  // src/mcp-proxy/reconnect-state.ts) so the gateway parent can render the
+  // PLAT-4112/PLAT-8689 families for connections that moved into these
+  // mcp-proxy children.
+  private consecutiveFailures = 0;
+  private failuresTotal: number;
+  private successTotal: number;
 
-  constructor(private readonly config: McpProxyConfig) {}
+  constructor(private readonly config: McpProxyConfig) {
+    const seeded = seedMcpReconnectTotals(config.name);
+    this.failuresTotal = seeded.failuresTotal;
+    this.successTotal = seeded.successTotal;
+  }
+
+  /**
+   * Best-effort snapshot rewrite (called on connect success/failure and each
+   * liveness tick) so the parent sees freshness, not just the last value.
+   */
+  private persistReconnectState(reasonClass?: string): void {
+    const agent = process.env['AGENT_USERNAME'] || process.env['AGENT_NAME'] || 'unknown';
+    persistMcpReconnectState({
+      agent,
+      server: this.config.name,
+      consecutive_failures: this.consecutiveFailures,
+      failures_total: this.failuresTotal,
+      success_total: this.successTotal,
+      last_reason_class: reasonClass ?? 'other',
+      updated_at: Date.now(),
+    });
+  }
 
   /**
    * Background liveness probe (parity with the scaffold's SSEReconnectWrapper,
@@ -352,6 +385,9 @@ export class UpstreamConnection {
       try {
         await this.client.request({ method: 'ping', params: {} }, ResultSchema, { timeout: LIVENESS_PROBE_TIMEOUT_MS });
         this.livenessFailureCount = 0;
+        // PLAT-11763: freshness heartbeat — a healthy session keeps its snapshot
+        // young so the parent renders it and stale entries are distinguishable.
+        this.persistReconnectState();
       } catch (err) {
         if (isConnectionError(err)) {
           this.livenessFailureCount++;
@@ -419,6 +455,12 @@ export class UpstreamConnection {
         return await this.connectOnce();
       } catch (err) {
         attempt++;
+        // PLAT-11763: count the failure with a closed reason class and persist
+        // so the reconnect-wedge alert lane stays fed cross-process.
+        const reasonClass = classifyMcpReconnectError((err as Error).message);
+        this.consecutiveFailures += 1;
+        this.failuresTotal += 1;
+        this.persistReconnectState(reasonClass);
         const base = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1), RECONNECT_MAX_DELAY_MS);
         const jitter = base * 0.25 * (2 * Math.random() - 1);
         const delay = Math.max(0, Math.round(base + jitter));
@@ -456,6 +498,10 @@ export class UpstreamConnection {
     const sv = client.getServerVersion();
     this.serverInfo = sv ? { name: sv.name, version: sv.version } : undefined;
     this.instructions = client.getInstructions();
+    // PLAT-11763: success — reset the streak, count the (re)connect, persist.
+    this.consecutiveFailures = 0;
+    this.successTotal += 1;
+    this.persistReconnectState();
     log(`upstream "${this.config.name}" connected (serverInfo=${this.serverInfo?.name ?? '?'})`);
     return client;
   }

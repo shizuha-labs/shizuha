@@ -362,3 +362,34 @@ describe('resolveStdioProxyServices', () => {
     expect([...(r as Set<string>)].sort()).toEqual(['connect', 'pulse', 'wiki']);
   });
 });
+
+// ── PLAT-11763: cross-process reconnect observability ──
+
+describe('mcp-proxy reconnect-state (PLAT-11763)', () => {
+  it('classifies failure messages onto the closed reason-class union only', async () => {
+    const { classifyMcpReconnectError } = await import('../src/mcp-proxy/reconnect-state.js');
+    expect(classifyMcpReconnectError('Session failed: HTTP 401')).toBe('auth');
+    expect(classifyMcpReconnectError('upstream returned 405 Not Allowed')).toBe('route_missing');
+    expect(classifyMcpReconnectError('HTTP 502 from nginx')).toBe('http_5xx');
+    expect(classifyMcpReconnectError('request timed out after 8000ms')).toBe('timeout');
+    expect(classifyMcpReconnectError('socket hang up')).toBe('conn_reset');
+    expect(classifyMcpReconnectError('getaddrinfo ENOTFOUND shizuha-nginx')).toBe('dns');
+    expect(classifyMcpReconnectError('weird custom failure')).toBe('other');
+  });
+
+  it('persists an atomic snapshot and seeds cumulative totals across child restarts', async () => {
+    const { persistMcpReconnectState, seedMcpReconnectTotals } = await import('../src/mcp-proxy/reconnect-state.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-reconnect-'));
+    const env = { MCP_RECONNECT_STATE_DIR: dir } as unknown as NodeJS.ProcessEnv;
+    persistMcpReconnectState(
+      { agent: 'ni', server: 'pulse', consecutive_failures: 2, failures_total: 7, success_total: 5, last_reason_class: 'timeout', updated_at: Date.now() },
+      env,
+    );
+    const seeded = seedMcpReconnectTotals('pulse', env);
+    expect(seeded).toEqual({ failuresTotal: 7, successTotal: 5 });
+    // corrupt file must not break the next child
+    fs.writeFileSync(path.join(dir, 'pulse.json'), 'not-json', 'utf-8');
+    expect(seedMcpReconnectTotals('pulse', env)).toEqual({ failuresTotal: 0, successTotal: 0 });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
