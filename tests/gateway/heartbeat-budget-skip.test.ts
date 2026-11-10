@@ -34,6 +34,17 @@ describe('PLAT-6187 heartbeat budget-skip signal', () => {
     expect(parsed).toMatchObject({ agentId: 'saki', count: 2, reason: 'no_token' });
   });
 
+  it('records the PLAT-9203 context_over_budget hard stop as a first-class skip reason', () => {
+    const rec = recordHeartbeatBudgetSkip('hina', 'context_over_budget');
+    expect(rec.count).toBe(1);
+    expect(rec.reason).toBe('context_over_budget');
+    expect(getHeartbeatBudgetSkipCount('hina')).toBe(1);
+    const parsed = JSON.parse(
+      formatHeartbeatBudgetSkipLogLine(rec).slice(HEARTBEAT_BUDGET_SKIP_LOG_PREFIX.length).trim(),
+    );
+    expect(parsed).toMatchObject({ agentId: 'hina', reason: 'context_over_budget' });
+  });
+
   it('projects the skip count into the agent telemetry envelope', () => {
     const agentId = 'gateway-hb-skip-telemetry';
     const agent = new AgentProcess({

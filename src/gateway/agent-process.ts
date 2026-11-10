@@ -103,6 +103,7 @@ import {
   heartbeatBudgetSkipTelemetry,
   recordHeartbeatBudgetSkip,
 } from '../shared/heartbeat-budget-skip.js';
+import { HeartbeatOverBudgetError } from '../agent/heartbeat-hygiene.js';
 import { setActiveTelemetryWindow, createTurnTelemetrySink } from '../agent/loop.js';
 import { incompleteTurnError } from '../agent/incomplete-turn.js';
 import {
@@ -5045,6 +5046,22 @@ export class AgentProcess {
 
     } catch (err) {
       const errorMsg = (err as Error).message || 'Internal error';
+      // PLAT-9203 idle-poll hard stop: a heartbeat turn that threw the typed
+      // over-budget error never reached the provider — record it as a budget
+      // skip (not a provider failure, not an error notice) and end the tick.
+      // The transcript is untouched; the next compaction attempt retries.
+      if (err instanceof HeartbeatOverBudgetError) {
+        const agentId = this.config.agentId ?? this.config.agentName ?? 'unknown-agent';
+        try {
+          recordHeartbeatBudgetSkip(agentId, 'context_over_budget');
+          logger.warn(
+            { agentId, estimate: err.promptTokenEstimate, hardBudget: err.hardBudgetTokens },
+            'Idle heartbeat skipped: transcript over hard budget after compaction/trim (PLAT-9203)',
+          );
+          this.emitTelemetry();
+        } catch { /* telemetry is best-effort; the skip decision stands */ }
+        return false;
+      }
       const currentCompaction = !(err instanceof GatewayCompactionFailure)
         || (err.category === 'provider' && err.generation === this.sessionGeneration && err.sessionId === this.sessionId);
       const deferred = currentCompaction ? typedProviderDeferral(err instanceof GatewayCompactionFailure ? err.cause : err) : null;

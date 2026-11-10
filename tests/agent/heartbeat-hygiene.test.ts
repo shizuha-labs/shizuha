@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import type { Message } from '../../src/agent/types.js';
 import {
+  applyHeartbeatHardBudgetTrim,
   classifyPromptSource,
   estimatePromptTokenBudget,
   heartbeatBudgetConfig,
+  isToolResultMessage,
   keepHeartbeatNudgeOnly,
+  trimMessagesToTokenBudget,
   resolveContextPreflightGuardTokens,
   resolveInteractivePreflightCeilingTokens,
 } from '../../src/agent/heartbeat-hygiene.js';
@@ -25,6 +28,22 @@ describe('heartbeat context hygiene', () => {
     expect(keepHeartbeatNudgeOnly(history)).toEqual([heartbeat]);
     expect(keepHeartbeatNudgeOnly([msg('user', 'please explain this code')])).toEqual([]);
     expect(keepHeartbeatNudgeOnly([])).toEqual([]);
+  });
+
+  it('trims oldest messages until the hard budget fits, else the heartbeat nudge', () => {
+    const heartbeat = msg('user', '[HEARTBEAT] check pulse');
+    const history = [
+      msg('user', 'x'.repeat(50)),
+      msg('assistant', 'y'.repeat(50)),
+      heartbeat,
+    ];
+    const estimate = (candidate: Message[]) => candidate.reduce((n, m) => n + String(m.content).length, 0);
+    const dropped = trimMessagesToTokenBudget(history, 80, estimate);
+    expect(dropped.trimmed).toBe(true);
+    expect(dropped.messages[0]).toEqual(heartbeat);
+    const alreadyFit = trimMessagesToTokenBudget([heartbeat], 10_000, estimate);
+    expect(alreadyFit.trimmed).toBe(false);
+    expect(alreadyFit.messages).toEqual([heartbeat]);
   });
 
   it('classifies scheduler heartbeat prompts separately from user turns', () => {
@@ -162,5 +181,94 @@ describe('heartbeat context hygiene', () => {
       compactionAction: 'compact',
       preProviderBudgetExceeded: true,
     });
+  });
+
+  // PLAT-9203 re-review (ren CR P1): the oldest-first kept.shift() loop stops
+  // on a token boundary, not a tool-pair boundary. When the fit boundary lands
+  // inside a tool pair, the pre-fix loop left an orphaned tool_result at the
+  // kept head (Anthropic-style providers reject that with a 400).
+  it('drops orphaned kept-head tool_result when the fit boundary lands inside a tool pair', () => {
+    const heartbeat = msg('user', '[HEARTBEAT] check pulse');
+    const toolUse: Message = {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'pulse_get_my_tasks', input: {} }],
+      timestamp: Date.now(),
+    };
+    const toolResult: Message = {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'r'.repeat(40) }],
+      timestamp: Date.now(),
+    };
+    const filler = msg('user', 'f'.repeat(40));
+    const history = [filler, toolUse, toolResult, heartbeat];
+    const size = (m: Message) => (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length);
+    const estimate = (candidate: Message[]) => candidate.reduce((n, m) => n + size(m), 0);
+    // Budget fits [toolResult, heartbeat] but not [toolUse, toolResult, heartbeat]:
+    // the shift loop stops exactly between toolUse and toolResult.
+    const toolUseSize = size(toolUse);
+    const budget = size(toolResult) + size(heartbeat) + 1;
+    expect(estimate([toolResult, heartbeat])).toBeLessThanOrEqual(budget);
+    expect(estimate([toolUse, toolResult, heartbeat])).toBeGreaterThan(budget);
+    const trimmed = trimMessagesToTokenBudget(history, budget, estimate);
+    expect(trimmed.trimmed).toBe(true);
+    // Pre-fix: kept head was the orphaned tool_result (its tool_use shifted
+    // away). Post-fix: pair-complete head — no leading tool_result remains.
+    expect(isToolResultMessage(trimmed.messages[0])).toBe(false);
+    expect(trimmed.messages).toEqual([heartbeat]);
+  });
+
+  it('keeps the single over-budget non-nudge tail instead of wiping a non-heartbeat transcript', () => {
+    const bigUser = msg('user', 'z'.repeat(200));
+    const trimmed = trimMessagesToTokenBudget([bigUser], 50, (c) => c.reduce((n, m) => n + String(m.content).length, 0));
+    expect(trimmed.trimmed).toBe(true);
+    expect(trimmed.messages).toEqual([bigUser]);
+  });
+
+  it('pins an over-budget heartbeat nudge (fall-through) so the operative instruction survives', () => {
+    const hugeNudge = msg('user', `[HEARTBEAT] ${'n'.repeat(200)}`);
+    const trimmed = trimMessagesToTokenBudget([hugeNudge], 50, (c) => c.reduce((n, m) => n + String(m.content).length, 0));
+    expect(trimmed.trimmed).toBe(true);
+    expect(trimmed.messages).toEqual([hugeNudge]);
+  });
+
+  it('applyHeartbeatHardBudgetTrim unifies both turn paths (trim, persist, heartbeat-only)', () => {
+    const heartbeat = msg('user', '[HEARTBEAT] check pulse');
+    const history = [msg('user', 'x'.repeat(100)), heartbeat];
+    const estimate = (candidate: Message[]) => candidate.reduce((n, m) => n + String(m.content).length, 0);
+    const persisted: Array<[string, Message[]]> = [];
+    const live = history.slice();
+    const out = applyHeartbeatHardBudgetTrim({
+      messages: live,
+      sessionId: 'sess-1',
+      sourceKind: 'heartbeat',
+      hardBudgetTokens: 60,
+      estimate,
+      replaceMessages: (sid, next) => persisted.push([sid, next]),
+      turnIndex: 3,
+    });
+    expect(out.trimmed).toBe(true);
+    // In-place: the caller's live array reference now holds the trimmed head.
+    expect(live).toEqual([heartbeat]);
+    expect(persisted).toEqual([['sess-1', live]]);
+    // Non-heartbeat turns are never trimmed by the shared reset.
+    const interactive = [msg('user', 'y'.repeat(100))];
+    expect(applyHeartbeatHardBudgetTrim({
+      messages: interactive,
+      sessionId: 'sess-2',
+      sourceKind: 'user',
+      hardBudgetTokens: 10,
+      estimate,
+      replaceMessages: () => { throw new Error('must not persist'); },
+    })).toEqual({ trimmed: false });
+    // Already-fitting heartbeat is a no-op.
+    const fits = [heartbeat];
+    expect(applyHeartbeatHardBudgetTrim({
+      messages: fits,
+      sessionId: 'sess-3',
+      sourceKind: 'heartbeat',
+      hardBudgetTokens: 10_000,
+      estimate,
+      replaceMessages: () => { throw new Error('must not persist'); },
+    })).toEqual({ trimmed: false });
   });
 });
