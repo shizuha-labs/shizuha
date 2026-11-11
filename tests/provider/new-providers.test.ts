@@ -26,6 +26,21 @@ describe('new provider classes (xAI / Groq / Together)', () => {
     expect(ctxFor(p, 'grok-unknown')).toBe(131072); // sane default, not 32K
   });
 
+  it('XaiProvider attaches a stable per-session cache identity and does not invent one', () => {
+    const p = new XaiProvider('test-key') as unknown as {
+      extraCompletionHeaders(o: { sessionId?: string; model: string }): Record<string, string>;
+      extraCompletionBody(o: { sessionId?: string; model: string }): Record<string, unknown>;
+    };
+    const opts = { sessionId: 'sess-abc', model: 'grok-4.7' };
+    expect(p.extraCompletionHeaders(opts)['x-grok-conv-id']).toBe('sess-abc');
+    expect(p.extraCompletionBody(opts)['prompt_cache_key']).toBe('sess-abc');
+    // Same session => identical keys across turns (prefix cache hit).
+    expect(p.extraCompletionHeaders(opts)).toEqual(p.extraCompletionHeaders(opts));
+    const empty = { model: 'grok-4.7' };
+    expect(p.extraCompletionHeaders(empty)['x-grok-conv-id']).toBeUndefined();
+    expect(p.extraCompletionBody(empty)['prompt_cache_key']).toBeUndefined();
+  });
+
   it('GroqProvider has the correct endpoint, name, and context windows', () => {
     const p = new GroqProvider('test-key');
     expect(p.name).toBe('groq');

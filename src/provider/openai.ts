@@ -146,6 +146,18 @@ export class OpenAIProvider implements LLMProvider {
     return MODEL_CONTEXT[model] ?? 128000;
   }
 
+  /** Extra HTTP headers for chat.completions.create. xAI overrides this to
+   *  attach a stable x-grok-conv-id so prefix cache hits the same server. */
+  protected extraCompletionHeaders(_options: ChatOptions): Record<string, string> {
+    return {};
+  }
+
+  /** Extra body fields for chat.completions.create. xAI overrides this to
+   *  attach a stable prompt_cache_key (same identity as x-grok-conv-id). */
+  protected extraCompletionBody(_options: ChatOptions): Record<string, unknown> {
+    return {};
+  }
+
   /** Parse accumulated streamed tool-call arguments into an object. Subclasses
    *  override to handle provider-specific quirks (e.g. Groq fenced/double-encoded
    *  JSON). Must never throw — return {} on any malformed input. */
@@ -204,20 +216,29 @@ export class OpenAIProvider implements LLMProvider {
           reasoningParams['reasoning_effort'] = effortMap[options.thinkingLevel] ?? 'medium';
         }
 
-        const stream = await this.client.chat.completions.create({
-          model: options.model,
-          messages: openaiMessages,
-          max_tokens: options.maxTokens ?? 16384,
-          temperature: options.temperature ?? 0,
-          stream: true,
-          stream_options: { include_usage: true },
-          ...(tools?.length ? { tools } : {}),
-          ...(options.stopSequences?.length ? { stop: options.stopSequences } : {}),
-          // CTX-292: the OpenAI-standard `user` field carries our session id so
-          // Cortex pins the session to its prefix/KV-warm replica.
-          ...(options.sessionId ? { user: options.sessionId } : {}),
-          ...reasoningParams,
-        });
+        const extraHeaders = this.extraCompletionHeaders(options);
+        // extraCompletionBody is Record<string, unknown> (xAI prompt_cache_key).
+        // Spreading it (or casting the body `as any`) widens the request so
+        // create() resolves to the non-stream ChatCompletion overload and
+        // `for await` fails tsc (TS2504). Pin the streaming params type.
+        const stream = await this.client.chat.completions.create(
+          {
+            model: options.model,
+            messages: openaiMessages,
+            max_tokens: options.maxTokens ?? 16384,
+            temperature: options.temperature ?? 0,
+            stream: true,
+            stream_options: { include_usage: true },
+            ...(tools?.length ? { tools } : {}),
+            ...(options.stopSequences?.length ? { stop: options.stopSequences } : {}),
+            // CTX-292: the OpenAI-standard `user` field carries our session id so
+            // Cortex pins the session to its prefix/KV-warm replica.
+            ...(options.sessionId ? { user: options.sessionId } : {}),
+            ...reasoningParams,
+            ...this.extraCompletionBody(options),
+          } as OpenAI.ChatCompletionCreateParamsStreaming,
+          Object.keys(extraHeaders).length ? { headers: extraHeaders } : undefined,
+        );
 
         const toolCalls = new Map<number, { id: string; name: string; args: string }>();
         let inputTokens = 0;

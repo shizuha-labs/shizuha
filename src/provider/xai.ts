@@ -1,4 +1,5 @@
 import { OpenAIProvider } from './openai.js';
+import type { ChatOptions } from './types.js';
 
 /**
  * xAI (Grok) provider — OpenAI-compatible Chat Completions at api.x.ai.
@@ -37,5 +38,27 @@ export class XaiProvider extends OpenAIProvider {
 
   override contextWindowFor(model: string): number {
     return GROK_CONTEXT[model] ?? 131072;
+  }
+
+  /**
+   * Stable per-conversation cache identity for xAI prefix cache.
+   * Must be the durable session id (not a per-request UUID or timestamp)
+   * so heartbeats reuse the same cache server. Empty when no session is known
+   * — we never invent a volatile fallback that would force a miss every turn.
+   */
+  private conversationCacheKey(options: ChatOptions): string {
+    return (options.sessionId || '').trim();
+  }
+
+  protected override extraCompletionHeaders(options: ChatOptions): Record<string, string> {
+    const key = this.conversationCacheKey(options);
+    return key ? { 'x-grok-conv-id': key } : {};
+  }
+
+  protected override extraCompletionBody(options: ChatOptions): Record<string, unknown> {
+    const key = this.conversationCacheKey(options);
+    // Chat Completions contract is x-grok-conv-id; prompt_cache_key is the
+    // Responses-API / OpenAI-compatible twin. Send both with the same value.
+    return key ? { prompt_cache_key: key } : {};
   }
 }
