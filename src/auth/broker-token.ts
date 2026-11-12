@@ -206,7 +206,7 @@ export function fetchBrokerModelToken(
 
 export function reportBrokerModelTokenStatus(
   token: Pick<BrokerModelToken, 'entryId' | 'leaseId'>,
-  opts: { action?: 'cool' | 'deactivate'; cooldownSeconds?: number } = {},
+  opts: { action?: 'cool' | 'deactivate'; cooldownSeconds?: number; reason?: string } = {},
   timeoutMs = 5000,
 ): Promise<boolean> {
   const socketPath = brokerSocketPath();
@@ -216,6 +216,7 @@ export function reportBrokerModelTokenStatus(
     lease_id: token.leaseId,
     action: opts.action ?? 'cool',
     ...(opts.cooldownSeconds ? { cooldown_seconds: opts.cooldownSeconds } : {}),
+    ...(opts.reason ? { reason: opts.reason } : {}),
   });
   return new Promise((resolve) => {
     const req = http.request(

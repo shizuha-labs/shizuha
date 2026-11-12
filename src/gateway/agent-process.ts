@@ -46,6 +46,8 @@ import {
   hiveDirectXaiUpstreamModel,
   isHiveDirectXaiGrokModel,
   leaseHiveXaiAccess,
+  classifyHiveXaiLeaseFailure,
+  failoverHiveXaiLease,
   type HiveXaiLease,
 } from '../auth/xai-broker.js';
 import { isTransientProviderFailure } from '../provider/transient-errors.js';
@@ -3245,6 +3247,29 @@ export class AgentProcess {
           logger.warn({ label: rotated.token.label }, 'Hive xAI lease 401 — rotated access token via coordinator');
           return await doTurn(rotated.provider, hiveDirectXaiUpstreamModel(this.model || HIVE_XAI_GROK_MODEL), activeSettings.thinking, activeSettings.effort);
         }
+      }
+      // CTX-5382: an exhausted / rate-limited Hive-leased xAI account is a
+      // per-account condition. Cool it for the classified window and move the
+      // seat to another pool account once, instead of failing every turn on a
+      // sticky lease that will not recover for hours.
+      const leaseFailure = this.hiveXaiLease ? classifyHiveXaiLeaseFailure(primaryErr) : null;
+      if (this.hiveXaiLease && leaseFailure) {
+        const failed = this.hiveXaiLease;
+        const next = await failoverHiveXaiLease(
+          failed,
+          leaseFailure,
+          `agent:${this.config.agentUsername || this.config.agentId || 'gateway'}`,
+        );
+        if (next) {
+          this.hiveXaiLease = next;
+          this.provider = next.provider;
+          logger.warn(
+            { from: failed.token.label, to: next.token.label, kind: leaseFailure.kind, cooldownSeconds: leaseFailure.cooldownSeconds },
+            'Hive xAI lease account unusable — cooled and failed over to another pool account',
+          );
+          return await doTurn(next.provider, hiveDirectXaiUpstreamModel(this.model || HIVE_XAI_GROK_MODEL), activeSettings.thinking, activeSettings.effort);
+        }
+        logger.warn({ label: failed.token.label, kind: leaseFailure.kind }, 'Hive xAI lease account unusable and no other pool account routable');
       }
       if (!useFallbackChain || !AgentProcess.isFallbackEligible(primaryErr)) {
         throw primaryErr;
