@@ -36,6 +36,22 @@ const PROBE_PATTERNS = [
   /\bruby\s+-e\b/,
 ];
 
+/**
+ * PLAT-9038: a one-liner that only parses an origin/Forgejo/Pulse API read
+ * is not a stuck coding session. Counting it forced a fabricated file edit.
+ * A command that also writes a file stays a probe.
+ */
+const ORIGIN_API_READ = /(?:curl|urllib|requests\.|httpx\.|fetch\()[\s\S]{0,400}(?:origin\.shizuha\.com|git\.shizuha\.com|shizuha\.com\/api|ci-logs\.origin)/;
+const FILE_MUTATION = /\b(?:tee|sed\s+-i|rm\s+|mv\s+|cp\s+|mkdir\s+|chmod\s+|git\s+(?:commit|push|add)|apply_patch)\b|>\s*[^&|]/;
+
+export function isOriginApiReadProbe(command: string): boolean {
+  // search(), not test(): both regexes are /g, and test() advances lastIndex
+  // so a later call on a new string can miss (PLAT-9038 full-suite).
+  if (command.search(ORIGIN_API_READ) < 0) return false;
+  if (command.search(FILE_MUTATION) >= 0) return false;
+  return true;
+}
+
 /** Tool names that count as actual file writes. */
 const WRITE_TOOL_NAMES = new Set([
   'write', 'edit', 'notebook_edit', 'apply_patch', 'multi_edit',
@@ -60,7 +76,7 @@ function classifyCall(toolName: string, input: Record<string, unknown>): { isPro
   let isProbe = false;
   if (toolName === 'bash') {
     const cmd = typeof input['command'] === 'string' ? input['command'] : '';
-    isProbe = PROBE_PATTERNS.some((re) => re.test(cmd));
+    isProbe = PROBE_PATTERNS.some((re) => re.test(cmd)) && !isOriginApiReadProbe(cmd);
   }
   return { isProbe, isWrite };
 }
