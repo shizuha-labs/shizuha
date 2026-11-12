@@ -35,6 +35,8 @@ describe('Hive xAI access-only lease', () => {
       accessToken: 'xai-access-1',
       email: 'ops@shizuha.com',
       accountId: 'acct-1',
+      // CTX-5382: Hive TokenPool leases are OAuth grants → Grok CLI proxy.
+      authMode: 'oauth_subscription',
     });
 
     expect(parseBrokerXaiPayload(JSON.stringify({
