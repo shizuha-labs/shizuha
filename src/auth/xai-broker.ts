@@ -128,3 +128,56 @@ export async function coolHiveXaiLease(lease: HiveXaiLease | null): Promise<void
   if (!lease) return;
   await reportBrokerModelTokenStatus(lease.token, { action: 'cool', cooldownSeconds: 60 });
 }
+
+export type HiveXaiLeaseFailure =
+  | { kind: 'quota_exhausted'; cooldownSeconds: number }
+  | { kind: 'rate_limited'; cooldownSeconds: number };
+
+/** Default hold for a provider-confirmed exhausted subscription (rolling 24h window). */
+export const XAI_LEASE_QUOTA_COOLDOWN_SECONDS = 6 * 3600;
+export const XAI_LEASE_RATE_LIMIT_COOLDOWN_SECONDS = 60;
+
+/**
+ * CTX-5382: classify an upstream failure on a Hive-leased xAI account.
+ * SuperGrok free/included-usage exhaustion arrives as 429 ("used all the
+ * included free usage ... rolling 24-hour window") and an out-of-credit
+ * account as 403. Both are per-account and last hours, so the lease must be
+ * cooled for that long and the seat re-leased onto another account — retrying
+ * the same account only burns turns. Our own per-seat breaker
+ * (code xai_direct_budget_exhausted) is NOT an account failure.
+ */
+export function classifyHiveXaiLeaseFailure(err: unknown): HiveXaiLeaseFailure | null {
+  const e = err as { status?: number; code?: string; message?: string } | null;
+  if (!e) return null;
+  if (e.code === 'xai_direct_budget_exhausted') return null;
+  const status = Number(e.status || 0);
+  const msg = String(e.message || '');
+  const quotaText = /included free usage|rolling 24-hour|out of credits|credit balance|spending limit|exhausted|insufficient[_ ]quota/i;
+  if ((status === 429 || status === 403 || status === 402) && quotaText.test(msg)) {
+    return { kind: 'quota_exhausted', cooldownSeconds: XAI_LEASE_QUOTA_COOLDOWN_SECONDS };
+  }
+  if (status === 429) {
+    return { kind: 'rate_limited', cooldownSeconds: XAI_LEASE_RATE_LIMIT_COOLDOWN_SECONDS };
+  }
+  return null;
+}
+
+/**
+ * Cool the failing lease's account for the classified window and lease a
+ * different account (excludeEntryId). Returns null when the pool has nothing
+ * else routable — the caller then surfaces the original error.
+ */
+export async function failoverHiveXaiLease(
+  lease: HiveXaiLease,
+  failure: HiveXaiLeaseFailure,
+  stickyKey: string,
+): Promise<HiveXaiLease | null> {
+  await reportBrokerModelTokenStatus(lease.token, {
+    action: 'cool',
+    cooldownSeconds: failure.cooldownSeconds,
+    reason: failure.kind,
+  });
+  const next = await leaseHiveXaiAccess({ stickyKey, excludeEntryId: lease.token.entryId });
+  if (!next || next.token.entryId === lease.token.entryId) return null;
+  return next;
+}
