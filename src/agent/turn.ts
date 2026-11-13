@@ -55,6 +55,7 @@ function dumpTurnContext(model: string, systemPrompt: string, toolDefs: ToolDefi
   } catch { /* debug is best-effort, never break a turn */ }
 }
 import { logger } from '../utils/logger.js';
+import { recordWireRequest } from '../state/compaction-wire-snapshot.js';
 
 const prefixFingerprintTracker = new PrefixFingerprintTracker();
 
@@ -329,6 +330,18 @@ export async function executeTurn(
   const modelProfile = getModelProfile(model);
   const providerToolDefs = toolDefinitionsForProvider(toolDefs, provider, toolRegistry.definitions());
   const toolsEnabled = providerToolDefs.length > 0 && toolChoice !== 'none';
+  // CTX-5382: remember the exact wire request so a compaction that follows can
+  // re-send this cached prefix verbatim (cache-aligned) instead of a cold,
+  // differently-shaped summary request. No-op for non-prefix-cached providers.
+  recordWireRequest(provider, {
+    model,
+    systemPrompt,
+    tools: providerToolDefs.length > 0 ? providerToolDefs : undefined,
+    chatMessages,
+    sourceMessages: messages.slice(),
+    ...(context.sessionId ? { sessionId: context.sessionId } : {}),
+    at: Date.now(),
+  });
   const providerPrefixSnapshot = buildProviderPrefixSnapshot({
     model,
     contextWindow: providerPrefixContinuity?.contextWindow,
