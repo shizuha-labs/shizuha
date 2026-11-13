@@ -22,6 +22,12 @@ import {
   applyHeartbeatHardBudgetTrim,
   type HeartbeatCompactionAction,
 } from './heartbeat-hygiene.js';
+import {
+  isProviderDegraded,
+  recordProviderFailure,
+  recordProviderSuccess,
+  type ProviderFailureKind,
+} from '../shared/provider-health-breaker.js';
 import { resolveDynamicCompactionWindow, resolveEffectiveContextWindow, type CompactionWindowMode } from '../provider/context-window.js';
 import { MCPManager } from '../tools/mcp/manager.js';
 import { isLeanConversationalEnv, leanConversationalSkillNames, talkSeatSuppressesTools, talkSeatTurnTimeoutMs, PULSE_MCP_TOOL } from '../platform/lean-conversational.js';
@@ -855,6 +861,26 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
           if (!isTransient) {
             throw turnErr;
           }
+          // PLAT-11317: feed the provider-health circuit breaker. Transient
+          // provider failures (5xx / timeout / connection reset / stream drop)
+          // are exactly the degradation signal family; once the consecutive
+          // threshold trips, the idle-heartbeat scheduler skips ticks
+          // (accounted as provider_degraded) instead of burning turns — and
+          // ANDONs — into a dead provider.
+          try {
+            const failureKind: ProviderFailureKind = isStreamDrop
+              ? 'stream_drop'
+              : (code === 'ECONNRESET' || code === 'EPIPE')
+                ? 'connection_error'
+                : (code === 'ETIMEDOUT')
+                  ? 'timeout'
+                  : 'http_5xx';
+            const fr = recordProviderFailure('default', failureKind);
+            if (fr.becameDegraded) {
+              logger.warn({ failureKind, consecutiveFailures: fr.consecutiveFailures },
+                'PLAT-11317: provider circuit breaker OPEN — idle heartbeat ticks will be skipped until recovery');
+            }
+          } catch { /* best-effort — breaker must never break the turn */ }
           const jitter = transientRetryDelayMs(retryAttempt);
           logger.warn({ attempt: retryAttempt + 1, delay: Math.round(jitter), status, code },
             `Transient API error, retrying turn indefinitely...`);
@@ -1080,6 +1106,15 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
           if (avg > TTFT_WARN_THRESHOLD_MS) {
             if (!ttftDegraded) {
               ttftDegraded = true;
+              // PLAT-11317: sustained TTFT degradation is a breaker failure
+              // (timeout-class) — slow-lane providers skip idle ticks too.
+              try {
+                const fr = recordProviderFailure('default', 'timeout');
+                if (fr.becameDegraded) {
+                  logger.warn({ ttftAvgMs: Math.round(avg) },
+                    'PLAT-11317: provider circuit breaker OPEN (sustained TTFT) — idle heartbeat ticks skipped');
+                }
+              } catch { /* best-effort */ }
               logger.warn(
                 { model, ttftAvgMs: Math.round(avg), thresholdMs: TTFT_WARN_THRESHOLD_MS, window: ttftWindow.length },
                 'SCLI-22: sustained TTFT degradation detected',
@@ -1092,10 +1127,24 @@ export async function* runAgent(agentConfig: AgentConfig, initialPrompt?: string
               };
             }
           } else {
+            if (ttftDegraded) {
+              // PLAT-11317: TTFT window recovered below threshold — success feed.
+              try { recordProviderSuccess('default'); } catch { /* best-effort */ }
+            }
             ttftDegraded = false; // recovery — next degradation episode will re-emit
           }
         }
       }
+
+      // PLAT-11317: a completed turn is a provider success — reset the
+      // failure streak (and recover the breaker if it was degraded).
+      try {
+        const rec = recordProviderSuccess('default');
+        if (rec.recovered) {
+          logger.info({ degradedMs: rec.degradedMs },
+            'PLAT-11317: provider circuit breaker RECOVERED — idle heartbeat ticks resume');
+        }
+      } catch { /* best-effort */ }
 
       turnIndex++;
 
