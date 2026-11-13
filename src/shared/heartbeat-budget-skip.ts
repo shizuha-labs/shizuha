@@ -19,10 +19,15 @@ export type HeartbeatBudgetSkipReason =
   | 'no_token'             // preflight had no usable Pulse token / emails
   | 'preflight_http_error' // preflight HTTP failure (fail-closed)
   | 'preflight_exception'  // preflight threw (fail-closed)
-  | 'context_over_budget'; // PLAT-9203: transcript still over the hard
+  | 'context_over_budget' // PLAT-9203: transcript still over the hard
                            // budget after compaction/trim — idle poll must
                            // not ship a ~200k uncached prompt (hritik
                            // directive, supersedes never-skip for idle polls)
+  | 'provider_degraded';   // PLAT-11317: provider circuit breaker is open
+                           // (consecutive 5xx/timeout/stream-drop or sustained
+                           // TTFT degradation) — skip the tick entirely instead
+                           // of burning a turn (and an ANDON) into a dead
+                           // provider; auto re-probes after the degraded TTL.
 
 export interface HeartbeatBudgetSkipRecord {
   agentId: string;

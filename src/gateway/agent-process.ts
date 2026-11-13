@@ -105,6 +105,7 @@ import {
   heartbeatBudgetSkipTelemetry,
   recordHeartbeatBudgetSkip,
 } from '../shared/heartbeat-budget-skip.js';
+import { isProviderDegraded } from '../shared/provider-health-breaker.js';
 import { HeartbeatOverBudgetError } from '../agent/heartbeat-hygiene.js';
 import { setActiveTelemetryWindow, createTurnTelemetrySink } from '../agent/loop.js';
 import { incompleteTurnError } from '../agent/incomplete-turn.js';
@@ -2811,6 +2812,25 @@ export class AgentProcess {
         }
         const ch = [...this.channels.values()][0];
         if (!ch) return;                                                    // no channel to run a turn on
+        // PLAT-11317: provider-health gate — while the circuit breaker is open
+        // (consecutive provider failures / sustained TTFT degradation), skip
+        // the tick ENTIRELY: no Pulse preflight, no model call, no ANDON burn.
+        // The beat re-arms at the normal cadence; the breaker half-opens after
+        // its TTL so the next tick re-probes the provider.
+        // Key parity with the loop.ts feeds: one harness process serves one
+        // seat, so both sides use the singleton 'default' breaker key.
+        if (isProviderDegraded('default')) {
+          const agentId = this.config.agentId ?? this.config.agentName ?? 'unknown-agent';
+          const skip = recordHeartbeatBudgetSkip(agentId, 'provider_degraded');
+          console.log(formatHeartbeatBudgetSkipLogLine(skip));
+          logger.info({
+            agentId,
+            skippedModel: true,
+            reason: 'provider_degraded',
+          }, 'idle_tick skipped model: provider circuit breaker open (PLAT-11317)');
+          this.nextHeartbeatDueAt = now + this.idleHeartbeatMs;
+          return;
+        }
         this.lastHeartbeatAt = now;
         this.firstHeartbeatPending = false;
         this.nextHeartbeatDueAt = now + Math.max(this.idleHeartbeatMs, this.heartbeatDebounceMs);
