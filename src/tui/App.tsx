@@ -27,6 +27,7 @@ import { isModeCycleKey } from './utils/keys.js';
 import { useTerminalSize } from './hooks/useTerminalSize.js';
 import { loadSettings, saveSettings } from './utils/settings.js';
 import { maybeAutoUpdateTui, restartInstalledTui } from './auto-update.js';
+import { acquireSessionLock, releaseSessionLock, describeSessionLockConflict } from './session-lock.js';
 import {
   ConversationViewport,
   remainingViewportRows,
@@ -345,6 +346,11 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
         if (cancelled) return;
         exit();
         setTimeout(() => {
+          // Hand the session lock over BEFORE spawning the replacement: this
+          // process stays alive waiting on the child's exit code, so the
+          // child must be able to acquire. SHIZUHA_TUI_TAKEOVER=1 is the
+          // safety net if release raced with another acquirer.
+          if (sessionId) releaseSessionLock({ sessionId });
           const replacement = restartInstalledTui(restart);
           replacement.on('error', (err) => {
             console.error(`Unable to restart updated Shizuha TUI: ${err.message}`);
@@ -1135,7 +1141,7 @@ const App: React.FC<AppProps> = ({ cwd, initialModel, initialMode, initialResume
 };
 
 /** Launch the TUI — called from CLI entry point */
-export function launchTUI(options: { cwd?: string; model?: string; mode?: PermissionMode; resumeSessionId?: string } = {}): void {
+export function launchTUI(options: { cwd?: string; model?: string; mode?: PermissionMode; resumeSessionId?: string; takeOver?: boolean } = {}): void {
   const cwd = options.cwd ?? process.cwd();
 
   // SCLI-722: the interactive TUI requires a TTY stdin. Ink's input hook
@@ -1155,6 +1161,34 @@ export function launchTUI(options: { cwd?: string; model?: string; mode?: Permis
   // Interactive sessions should fail fast and show a clear timeout budget.
   // Batch/daemon paths keep the longer Cortex/vLLM queue-tolerant defaults.
   process.env['SHIZUHA_INTERACTIVE_TUI'] ??= '1';
+
+  // Single-instance guard: a resumed session must never have two live TUI
+  // processes (stacked resumes keep stale pre-restart processes writing
+  // transcript state behind the visible TUI's back). New sessions mint a
+  // fresh id, so only resumed sessions need the lock.
+  if (options.resumeSessionId) {
+    const lockResult = acquireSessionLock({
+      sessionId: options.resumeSessionId,
+      cwd,
+      takeover: options.takeOver === true || process.env['SHIZUHA_TUI_TAKEOVER'] === '1',
+    });
+    if (!lockResult.acquired) {
+      console.error(`\n ⚠ ${describeSessionLockConflict(options.resumeSessionId, lockResult)}`);
+      process.exitCode = 1;
+      return;
+    }
+    const releaseSessionLockOnce = (): void => {
+      releaseSessionLock({ sessionId: options.resumeSessionId! });
+    };
+    process.once('exit', releaseSessionLockOnce);
+    // Signal exits bypass Ink; release the lock, then exit with signal semantics.
+    for (const signal of ['SIGTERM', 'SIGHUP'] as const) {
+      process.once(signal, () => {
+        releaseSessionLockOnce();
+        process.exit(0);
+      });
+    }
+  }
 
   // Fullscreen owner: history lives in the source-backed conversation
   // viewport, not tmux's incomplete pane scrollback. Mouse reports are routed

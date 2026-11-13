@@ -144,6 +144,7 @@ program
   .option('--cwd <dir>', 'Working directory')
   .option('--mode <mode>', 'Permission mode (plan/supervised/autonomous)')
   .option('--resume <session-id>', 'Resume an existing session by ID')
+  .option('--take-over', 'With --resume: replace an already-running TUI on that session (SIGTERM it, then acquire the session lock)')
   .option('--json', 'Output NDJSON events (with -p)')
   .action(async (opts) => {
     // SCLI-400/PLAT-5893/SCLI-492: the root action exposes --mode/--resume and
@@ -228,6 +229,7 @@ program
       model: opts.model as string | undefined,
       mode: pf.mode as PermissionMode | undefined,
       resumeSessionId: opts.resume as string | undefined,
+      takeOver: opts.takeOver === true,
     });
   });
 
@@ -237,6 +239,7 @@ program
   .option('--cwd <dir>', 'Override the stored session working directory')
   .option('--model <model>', 'Override the stored session model')
   .option('--mode <mode>', 'Permission mode (plan/supervised/autonomous)')
+  .option('--take-over', 'Replace an already-running TUI on this session (SIGTERM it, then acquire the session lock)')
   .action((sessionId: string, opts) => {
     // PLAT-5893/SCLI-178/SCLI-523: resume exposes --mode/--cwd like the
     // root/exec/gateway actions. Run the same shared option-domain preflight
@@ -314,6 +317,7 @@ program
       model: opts.model as string | undefined,
       mode: pf.mode as PermissionMode | undefined,
       resumeSessionId: sessionId,
+      takeOver: opts.takeOver === true,
     });
   });
 
