@@ -119,7 +119,7 @@ export class HumanBrowserSession {
         });
         const localPort = await this.socksForwarder.start();
         proxyUrl = `socks5://127.0.0.1:${localPort}`;
-        console.log(`[human-browser] SOCKS5 forwarder: Chrome → :${localPort} → ${url.hostname}:${url.port} (authenticated)`);
+        console.error(`[human-browser] SOCKS5 forwarder: Chrome → :${localPort} → ${url.hostname}:${url.port} (authenticated)`);
       } else {
         proxyUrl = buildProxyUrl(this.config.proxy);
       }
@@ -163,7 +163,7 @@ export class HumanBrowserSession {
     // (the old behaviour) silently produced "connect ECONNREFUSED 127.0.0.1:9222"
     // for the very next CDP call (BRW-37).
     if (await isCdpUsable(cdpPort)) {
-      console.log('[human-browser] Reusing existing Chrome CDP on port 9222');
+      console.error('[human-browser] Reusing existing Chrome CDP on port 9222');
       await this.injectStealthViaCDP(cdpPort, reuseStealthConfig, fingerprintSeed);
       this.mouse = new VirtualMouse({ cdpPort, screenWidth: this.config.stealth?.viewportWidth ?? 1920, screenHeight: this.config.stealth?.viewportHeight ?? 1080 });
       this.keyboard = new VirtualKeyboard({ cdpPort });
@@ -197,7 +197,7 @@ export class HumanBrowserSession {
       });
 
       this.chrome.on('exit', (code) => {
-        console.log(`[human-browser] Chrome exited with code ${code}`);
+        console.error(`[human-browser] Chrome exited with code ${code}`);
         this.chrome = null;
       });
     };
@@ -212,7 +212,7 @@ export class HumanBrowserSession {
       // Chrome may have died on the first (cold) launch. Reclaim and relaunch
       // once before giving up — this clears the transient state that produced
       // the BRW-37 ECONNREFUSED avalanche.
-      console.warn('[human-browser] CDP not ready on first launch — reclaiming port and relaunching');
+      console.error('[human-browser] CDP not ready on first launch — reclaiming port and relaunching');
       if (this.chrome) {
         this.chrome.kill('SIGKILL');
         this.chrome = null;
@@ -251,7 +251,7 @@ export class HumanBrowserSession {
     await this.keyboard.start();
 
     this._started = true;
-    console.log(`[human-browser] Started (display=${displayId}, chrome=${chromePath}, cdp=:${cdpPort})`);
+    console.error(`[human-browser] Started (display=${displayId}, chrome=${chromePath}, cdp=:${cdpPort})`);
   }
 
   /**
@@ -272,9 +272,9 @@ export class HumanBrowserSession {
       // Rebuild font cache
       execSync('fc-cache -f 2>/dev/null || true', { timeout: 10_000, stdio: 'pipe' });
       fs.writeFileSync(marker, new Date().toISOString());
-      console.log('[human-browser] Fonts installed');
+      console.error('[human-browser] Fonts installed');
     } catch (err) {
-      console.warn(`[human-browser] Font install failed (non-fatal): ${(err as Error).message}`);
+      console.error(`[human-browser] Font install failed (non-fatal): ${(err as Error).message}`);
     }
   }
 
@@ -377,14 +377,14 @@ export class HumanBrowserSession {
           setTimeout(() => { socket.destroy(); reject(new Error('CDP timeout')); }, 5000);
         });
 
-        console.log('[human-browser] Stealth patches injected via CDP');
+        console.error('[human-browser] Stealth patches injected via CDP');
         return;
       } catch (err) {
         if (attempt < 7) {
           await new Promise((r) => setTimeout(r, 500));
           continue;
         }
-        console.warn(`[human-browser] CDP injection failed after retries: ${(err as Error).message}`);
+        console.error(`[human-browser] CDP injection failed after retries: ${(err as Error).message}`);
       }
     }
   }
@@ -422,7 +422,7 @@ export class HumanBrowserSession {
         `Chrome not found for ${process.arch}. Set CHROME_PATH or install Playwright Chromium under ${playwrightRoot}`,
       );
     }
-    console.log('[human-browser] Chrome not found — installing Google Chrome...');
+    console.error('[human-browser] Chrome not found — installing Google Chrome...');
     try {
       execSync(
         'wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb'
@@ -431,11 +431,11 @@ export class HumanBrowserSession {
         { timeout: 120_000, stdio: 'pipe' },
       );
       if (fs.existsSync('/usr/bin/google-chrome-stable')) {
-        console.log('[human-browser] Google Chrome installed');
+        console.error('[human-browser] Google Chrome installed');
         return '/usr/bin/google-chrome-stable';
       }
     } catch (err) {
-      console.warn(`[human-browser] Chrome auto-install failed: ${(err as Error).message}`);
+      console.error(`[human-browser] Chrome auto-install failed: ${(err as Error).message}`);
     }
 
     throw new Error(
@@ -483,11 +483,11 @@ export class HumanBrowserSession {
       const result = await this.cdpCommand('Page.navigate', { url }) as Record<string, unknown> | undefined;
       // Check for navigation error (e.g., "Aborted", "net::ERR_ABORTED")
       if (result?.errorText) {
-        console.warn(`[human-session] CDP navigate error: ${result.errorText}`);
+        console.error(`[human-session] CDP navigate error: ${result.errorText}`);
       }
     } catch (err) {
       // Fallback: try keyboard-based navigation if CDP fails
-      console.warn(`[human-session] CDP navigate failed (${(err as Error).message}), falling back to keyboard`);
+      console.error(`[human-session] CDP navigate failed (${(err as Error).message}), falling back to keyboard`);
       await this.keyboard.hotkey(['ctrl'], 'l');
       await new Promise((r) => setTimeout(r, 300));
       await this.keyboard.hotkey(['ctrl'], 'a');
@@ -517,7 +517,7 @@ export class HumanBrowserSession {
     }
 
     if (!committed) {
-      console.warn(`[human-session] Navigation to ${url} may not have committed after ${maxWait}ms`);
+      console.error(`[human-session] Navigation to ${url} may not have committed after ${maxWait}ms`);
     }
 
     // Additional wait for SPA hydration (React/Next.js render after initial load)
