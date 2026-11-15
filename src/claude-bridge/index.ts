@@ -28,6 +28,7 @@ import type { IncomingMessage } from 'node:http';
 import { StateStore } from '../state/store.js';
 import { isCurrentBridgeChild, isLatchStuck, runSerializedStuckRecovery } from '../shared/stuck-latch-recovery.js';
 import {
+  deriveWorkflowStage,
   formatHeartbeatQueueDrainOutcomeLogLine,
   heartbeatQueueDrainTelemetry,
   recordHeartbeatQueueDrainTurn,
@@ -3061,7 +3062,10 @@ export class ClaudeBridge {
       // (inside prunePlatformMcpKeys) intersects it with the env var when both are
       // present, so the operator lever always wins.
       const hiveAllowList = parseAgentEffectiveMcpServicesFromEnv();
-      const roleAllowed = hiveAllowList ? new Set(hiveAllowList) : resolveAllowedServers(agentRole, agentUsername, agentSkills);
+      // PLS-480 behavioral half: the live stage (AGENT_WORKFLOW_STAGE, discharged
+      // by the daemon when the held task's CURRENT stage is known) augments the
+      // role-derived grant; absent lever = null = strict no-op (back-compat).
+      const roleAllowed = hiveAllowList ? new Set(hiveAllowList) : resolveAllowedServers(agentRole, agentUsername, agentSkills, undefined, deriveWorkflowStage(process.env['AGENT_WORKFLOW_STAGE']));
       const roleAllowList = [...roleAllowed];
       mcpJson.mcpServers = prunePlatformMcpKeys(
         mcpJson.mcpServers as Record<string, unknown>,

@@ -7,6 +7,7 @@
  */
 
 import { PULSE_MCP_TOOL } from '../platform/lean-conversational.js';
+import { WORKFLOW_STAGE_CAPABILITIES } from '../platform/mcp-access-matrix.js';
 
 export type HeartbeatQueueDrainOutcome =
   | 'queue_empty'
@@ -741,6 +742,31 @@ function pulseTaskStatusRows(text: string): Array<{ status: string; ownerAwarene
       ownerAwareness: match[2]?.toLowerCase() === 'awareness-only',
     }))
     .filter(row => Boolean(row.status));
+}
+
+/**
+ * PLS-480 (behavioral half): derive the LIVE workflow stage from a pulse
+ * get-my-work snapshot. The grant for a stage-scoped surface (merger-plane
+ * `pulse`, operator-wait `+connect`) must come from the task's CURRENT stage —
+ * not the union of future task requirements (PLAT-3412: kubeconfig is mandatory
+ * for later privileged live acceptance but NOT for the current source review).
+ *
+ * FAIL CLOSED: returns a stage key ONLY when some held task's line-leading
+ * `Status:` matches a key of WORKFLOW_STAGE_CAPABILITIES; any other status
+ * (open/todo/in_progress/blocked/…) or an empty snapshot returns null — which
+ * is a strict no-op in resolveAllowedServers, identical to the pre-PLS-480
+ * resolver. Never invents a stage; never widens beyond a role could.
+ */
+export function deriveWorkflowStage(pulseWorkText: string | null | undefined): string | null {
+  if (!pulseWorkText) return null;
+  for (const row of pulseTaskStatusRows(pulseWorkText)) {
+    if (row.ownerAwareness) continue;
+    const status = row.status.trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(WORKFLOW_STAGE_CAPABILITIES, status)) {
+      return status;
+    }
+  }
+  return null;
 }
 
 export function parsePulseGetMyTasksResult(raw: string): Pick<HeartbeatQueueDrainInput, 'readyTaskCount' | 'blockedTaskCount' | 'futureDueCount'> {

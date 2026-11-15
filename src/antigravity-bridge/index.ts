@@ -48,6 +48,7 @@ import {
   heartbeatQueueDrainTelemetry,
   recordHeartbeatQueueDrainOutcome,
   recordHeartbeatQueueDrainTurn,
+  deriveWorkflowStage,
   type HeartbeatQueueDrainTurnToolCall,
   type HeartbeatQueueDrainTurnToolResult,
 } from '../shared/heartbeat-outcome.js';
@@ -779,7 +780,9 @@ export class AntigravityBridge {
         const agentRole = process.env['AGENT_ROLE'];
         const agentSkills = (process.env['AGENT_SKILLS'] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
         const hiveAllowList = parseAgentEffectiveMcpServicesFromEnv();
-        const roleAllowList = hiveAllowList ?? [...resolveAllowedServers(agentRole, this.opts.agentUsername ?? process.env['AGENT_USERNAME'], agentSkills)];
+        // PLS-480 behavioral half: live-stage lever (AGENT_WORKFLOW_STAGE) augments
+        // the role-derived grant; absent lever = null = strict no-op (back-compat).
+        const roleAllowList = hiveAllowList ?? [...resolveAllowedServers(agentRole, this.opts.agentUsername ?? process.env['AGENT_USERNAME'], agentSkills, undefined, deriveWorkflowStage(process.env['AGENT_WORKFLOW_STAGE']))];
         // PLAT-4023 verbatim shape (PLAT-9704 leg 2): strip the platform-managed
         // block from the existing map BEFORE merging so getPlatformMcpConfigs()
         // output is the single authoritative source for the platform block —
