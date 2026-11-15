@@ -65,6 +65,43 @@ describe('PLAT-1242 auto-andon bridge thrash detector', () => {
     });
   });
 
+  it('signals the third identical read-only call and stays quiet at the cap of two (PLAT-9825)', () => {
+    const agentId = 'agent-readonly';
+    const line = '[codex-rpc] item/completed item.type=mcpToolCall server=shizuha-pulse tool=pulse_get_my_work status=completed durationMs=40';
+
+    expect(observeAutoAndonLine(agentId, line, 'stdout', 1_000)).toBeNull();
+    expect(observeAutoAndonLine(agentId, line, 'stdout', 2_000)).toBeNull();
+    expect(observeAutoAndonLine(agentId, line, 'stdout', 3_000)).toMatchObject({
+      pattern: 'identical-read-only-call',
+      count: 3,
+    });
+  });
+
+  it('signals the third read-only call even when the tools differ (PLAT-9825 review 7417)', () => {
+    const agentId = 'agent-rotation';
+    const line = (tool: string) =>
+      `[codex-rpc] item/completed item.type=mcpToolCall server=shizuha-pulse tool=${tool} status=completed durationMs=40`;
+
+    expect(observeAutoAndonLine(agentId, line('pulse_get_my_work'), 'stdout', 1_000)).toBeNull();
+    expect(observeAutoAndonLine(agentId, line('pulse_get_task'), 'stdout', 2_000)).toBeNull();
+    expect(observeAutoAndonLine(agentId, line('pulse_list_comments'), 'stdout', 3_000)).toMatchObject({
+      pattern: 'identical-read-only-call',
+      count: 3,
+    });
+  });
+
+  it('a state-changing call resets the read-only streak (PLAT-9825)', () => {
+    const agentId = 'agent-write';
+    const read = '[codex-rpc] item/completed item.type=mcpToolCall server=shizuha-pulse tool=pulse_get_my_work status=completed durationMs=40';
+    const write = '[codex-rpc] item/completed item.type=mcpToolCall server=shizuha-pulse tool=pulse_add_comment status=completed durationMs=40';
+
+    expect(observeAutoAndonLine(agentId, read, 'stdout', 1_000)).toBeNull();
+    expect(observeAutoAndonLine(agentId, read, 'stdout', 2_000)).toBeNull();
+    expect(observeAutoAndonLine(agentId, write, 'stdout', 3_000)).toBeNull();
+    expect(observeAutoAndonLine(agentId, read, 'stdout', 4_000)).toBeNull();
+    expect(observeAutoAndonLine(agentId, read, 'stdout', 5_000)).toBeNull();
+  });
+
   it('signals repeated identical failing tool calls', () => {
     const agentId = 'agent-tool';
     const line = '[codex-rpc] item/completed item.type=mcpToolCall server=shizuha-pulse tool=pulse_get_my_tasks status=failed durationMs=22';

@@ -1,7 +1,7 @@
 import type { AgentInfo, DaemonConfig } from './types.js';
 import { sendConnectDm } from '../platform/connect-dm.js';
 
-export type AutoAndonPattern = 'empty-turn-streak' | 'same-error-streak' | 'identical-failing-tool-call';
+export type AutoAndonPattern = 'empty-turn-streak' | 'same-error-streak' | 'identical-failing-tool-call' | 'identical-read-only-call';
 
 export interface AutoAndonSignal {
   pattern: AutoAndonPattern;
@@ -24,6 +24,9 @@ interface AgentThrashState {
   lastToolSignature?: string;
   sameToolFailureCount: number;
   lastToolFailureAt?: number;
+  lastReadOnlySignature?: string;
+  sameReadOnlyCount: number;
+  lastReadOnlyAt?: number;
 }
 
 export interface AutoAndonMetricsSnapshot {
@@ -36,6 +39,10 @@ export const AUTO_ANDON_RATE_LIMIT_MS = 6 * 60 * 60 * 1000;
 export const AUTO_ANDON_EMPTY_TURN_THRESHOLD = 3;
 export const AUTO_ANDON_SAME_ERROR_THRESHOLD = 3;
 export const AUTO_ANDON_TOOL_FAILURE_THRESHOLD = 3;
+// PLAT-9825: two identical read-only calls in a row is the cap. The third
+// forces a decision (a state change, or this andon) instead of a sixth
+// identical read.
+export const AUTO_ANDON_READ_ONLY_THRESHOLD = 2;
 export const AUTO_ANDON_STREAK_WINDOW_MS = 15 * 60 * 1000;
 
 // PLAT-1254 invariant: when an agent thrashes past threshold, its cluster manager
@@ -151,8 +158,24 @@ function parseFailingToolCall(line: string): ToolFailureSample | null {
   return null;
 }
 
+const READ_ONLY_TOOLS = new Set([
+  'pulse_get_my_work', 'pulse_get_my_tasks', 'pulse_get_task', 'pulse_list_comments',
+  'pulse_get_available_transitions', 'pulse_list_tasks', 'pulse_search_tasks',
+  'wiki_search_pages', 'wiki_get_page', 'wiki_list_pages',
+]);
+
+function readOnlyToolName(line: string): string | null {
+  if (!line.includes('[codex-rpc]')) return null;
+  const itemType = parseKeyValue(line, 'item\\.type');
+  if (itemType !== 'mcpToolCall' && itemType !== 'mcp_tool_call') return null;
+  const status = parseKeyValue(line, 'status').toLowerCase();
+  if (status && status !== 'completed' && status !== 'success' && status !== 'ok') return null;
+  const tool = parseKeyValue(line, 'tool');
+  return READ_ONLY_TOOLS.has(tool) ? tool : null;
+}
+
 function buildSignalFromLine(agentId: string, line: string, stream: 'stdout' | 'stderr', now: number): AutoAndonSignal | null {
-  const state = agentStates.get(agentId) ?? { sameErrorCount: 0, sameToolFailureCount: 0 };
+  const state = agentStates.get(agentId) ?? { sameErrorCount: 0, sameToolFailureCount: 0, sameReadOnlyCount: 0 };
   agentStates.set(agentId, state);
 
   const empty = line.match(/\[codex-bridge\]\s+Empty turn #(\d+)/)
@@ -169,6 +192,38 @@ function buildSignalFromLine(agentId: string, line: string, stream: 'stdout' | '
       };
     }
     return null;
+  }
+
+  const readOnly = readOnlyToolName(line);
+  if (readOnly) {
+    // PLAT-9825 review 7417: the thrash is a seat rotating through read-only
+    // tools (get_my_work, get_task, list_comments) without ever changing state.
+    // Count the streak of read-only calls, not repeats of one tool name.
+    const signature = 'read-only-streak';
+    if (state.lastReadOnlyAt !== undefined && now - state.lastReadOnlyAt <= AUTO_ANDON_STREAK_WINDOW_MS) {
+      state.sameReadOnlyCount += 1;
+    } else {
+      state.sameReadOnlyCount = 1;
+    }
+    state.lastReadOnlySignature = signature;
+    state.lastReadOnlyAt = now;
+    if (state.sameReadOnlyCount > AUTO_ANDON_READ_ONLY_THRESHOLD) {
+      return {
+        pattern: 'identical-read-only-call',
+        signature,
+        count: state.sameReadOnlyCount,
+        detail: `${state.sameReadOnlyCount} consecutive read-only calls (latest ${readOnly}); cap is ${AUTO_ANDON_READ_ONLY_THRESHOLD}`,
+        excerpt: line.slice(0, 500),
+      };
+    }
+    return null;
+  }
+
+  // A completed state-changing tool call breaks the read-only streak, so real
+  // work between reads never trips the cap.
+  if (line.includes('[codex-rpc]') && /tool=/.test(line) && /status=(completed|success|ok)/.test(line)) {
+    state.sameReadOnlyCount = 0;
+    state.lastReadOnlyAt = undefined;
   }
 
   const failingTool = parseFailingToolCall(line);
