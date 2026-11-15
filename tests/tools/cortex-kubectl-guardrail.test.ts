@@ -139,6 +139,22 @@ describe('Cortex kubectl guardrail — namespace resolution (fail closed on unkn
     expect(decision.allowed).toBe(false);
   });
 
+  it('allows a non-serving mutation in ai-models (PLAT-9928)', () => {
+    const decision = evaluateCortexKubectlGuardrail(
+      'kubectl patch configmap forgejo-postgres -n ai-models --type merge -p \'{"data":{"pin":"node-a"}}\'',
+      {},
+    );
+    expect(decision.allowed).toBe(true);
+  });
+
+  it('still refuses a serving kind in ai-models (PLAT-9928)', () => {
+    const decision = evaluateCortexKubectlGuardrail(
+      'kubectl delete statefulset -n ai-models some-backend',
+      {},
+    );
+    expect(decision.allowed).toBe(false);
+  });
+
   it('allows read-only kubectl with --all-namespaces', () => {
     const decision = evaluateCortexKubectlGuardrail(
       'kubectl get pods --all-namespaces',

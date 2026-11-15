@@ -384,10 +384,12 @@ function touchesProtectedCortexSurface(invocation: KubectlInvocation): boolean {
   const protectedResource = PROTECTED_RESOURCE_RE.test(raw);
   const semanticKnob = SEMANTIC_KNOB_RE.test(raw);
 
-  // ai-models is dedicated to Cortex model backends; mutating it directly bypasses
-  // the Cortex deployment/orchestrator source of truth even when the exact resource
-  // name is hidden behind -f/apply JSON/YAML.
-  if (touchesAiModels) return true;
+  // PLAT-9928: the namespace string alone is not the boundary. A ConfigMap or
+  // postgres placement in ai-models is not a model backend. Refuse when the
+  // command is in that namespace AND names a serving kind or model. File input
+  // and --all-namespaces stay closed at the caller, because the kind can be
+  // hidden in the manifest.
+  if (touchesAiModels && (protectedResource || protectedModelName)) return true;
 
   // Also catch commands that omit -n but name a protected model-serving resource.
   return protectedModelName || (protectedResource && semanticKnob);
