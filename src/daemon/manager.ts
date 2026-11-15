@@ -7453,6 +7453,24 @@ async function startAgentProcess(
     SHIZUHA_AGENT_TOKEN: '',
     AGENT_ID: agent.id,
     AGENT_USERNAME: agent.username,
+    // PLS-480 leg 3 (transition-path discharge): the workspace HEARTBEAT.md is
+    // re-rendered per beat and carries the LIVE pulse get-my-work snapshot, so
+    // derive the held task's CURRENT workflow stage from it and hand the lever
+    // to the bridge launch env. resolveAllowedServers (via #631's thread-ins)
+    // augments the grant from that stage — fail-closed: an unreadable/absent
+    // file or a non-stage status leaves the env var unset, which is a strict
+    // no-op identical to pre-PLS-480. Explicit per-agent overrides still win;
+    // the sensitive trio stays role-gated.
+    ...(() => {
+      try {
+        const { deriveWorkflowStage } = require('../shared/heartbeat-outcome.js') as typeof import('../shared/heartbeat-outcome.js');
+        const heartbeatText = fs.readFileSync(path.join(getAgentWorkspaceDir(agent), 'HEARTBEAT.md'), 'utf8');
+        const stage = deriveWorkflowStage(heartbeatText);
+        return stage ? { AGENT_WORKFLOW_STAGE: stage } : {};
+      } catch {
+        return {};
+      }
+    })(),
     // SCLI-44: role drives the runtime MCP-server allow-list (resolveAllowedServers).
     ...(agent.role ? { AGENT_ROLE: agent.role } : {}),
     // Capability tags (skills[]) ALSO drive the MCP allow-list — unioned with role

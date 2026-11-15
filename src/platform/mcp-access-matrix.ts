@@ -396,11 +396,33 @@ export function normalizeRole(role: string | null | undefined): MatrixRole | nul
  *  2. mcp_access_matrix.yaml file (hot-reloadable, survives fleet rolls)
  *  3. Built-in MCP_ACCESS_MATRIX const (fallback — always present)
  */
+/**
+ * PLS-480: workflow-stage-scoped capability augmentation.
+ *
+ * A task's required capabilities must be resolved from the workflow stage the
+ * task is currently IN, not from whole-task metadata pinned at creation. This
+ * map carries the per-stage extra servers a legitimately-staged task may need
+ * on top of the agent's role/skill grants — e.g. a task sitting in
+ * `awaiting_merge` needs the merger-plane surface regardless of whether its
+ * creation-time metadata listed it.
+ *
+ * FAIL CLOSED: unknown/absent stage contributes nothing (behavior identical to
+ * the pre-PLS-480 resolver); stage keys not in this map are ignored, never
+ * granted. Sensitive servers (the SKILL_GATED trio) stay role-gated here too —
+ * a stage NEVER unlocks more than a role could.
+ */
+export const WORKFLOW_STAGE_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
+  awaiting_merge: ['pulse'],
+  in_review: ['pulse'],
+  operator_wait: ['pulse', 'connect'],
+};
+
 export function resolveAllowedServers(
   role: string | null | undefined,
   agentId?: string | null,
   capabilities?: readonly string[] | null,
   matrix?: McpAccessMatrix,
+  workflowStage?: string | null,
 ): Set<string> {
   // Resolve matrix: explicit arg → file → built-in const (fail-closed chain).
   const activeMatrix: McpAccessMatrix =
@@ -426,6 +448,21 @@ export function resolveAllowedServers(
     const key = normalizeRole(tag);
     if (key && activeMatrix?.roles && Array.isArray(activeMatrix.roles[key])) {
       for (const s of activeMatrix.roles[key]) if (!SKILL_GATED_SERVERS.has(s)) allowed.add(s);
+    }
+  }
+
+  // PLS-480: stage-scoped augmentation, applied BEFORE overrides so an explicit
+  // per-agent revoke ALWAYS wins (the override remove runs last, matching the
+  // base-trim doctrine), and BEFORE the lean trim so that trim stays
+  // authoritative for lean conversational seats. Unknown stage → no-op.
+  const stageKey = typeof workflowStage === 'string' ? workflowStage.trim().toLowerCase() : null;
+  if (stageKey) {
+    const stageServers = WORKFLOW_STAGE_CAPABILITIES[stageKey];
+    if (Array.isArray(stageServers)) {
+      for (const s of stageServers) {
+        // Tiering guard: a stage cannot unlock the SKILL_GATED sensitive trio.
+        if (!SKILL_GATED_SERVERS.has(s)) allowed.add(s);
+      }
     }
   }
 

@@ -93,6 +93,7 @@ import {
   isPulseGetMyTasksToolName,
   isPulseGetMyWorkToolName,
   heartbeatSnapshotHasReadyWork,
+  deriveWorkflowStage,
   recordHeartbeatQueueDrainTurn,
   recordObservedEmptyPulseQueue,
   recordObservedWorkProgress,
@@ -1651,7 +1652,9 @@ export class AgentProcess {
       // Capability tags (skills[]) unioned with role (operator 2026-06-24).
       const agentSkills = (process.env['AGENT_SKILLS'] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
       const hiveAllowList = parseAgentEffectiveMcpServicesFromEnv();
-      const allowed = hiveAllowList ? new Set(hiveAllowList) : resolveAllowedServers(agentRole, agentUsername, agentSkills);
+      // PLS-480 behavioral half: live-stage lever (AGENT_WORKFLOW_STAGE) augments
+      // the role-derived grant; absent lever = null = strict no-op (back-compat).
+      const allowed = hiveAllowList ? new Set(hiveAllowList) : resolveAllowedServers(agentRole, agentUsername, agentSkills, undefined, deriveWorkflowStage(process.env['AGENT_WORKFLOW_STAGE']));
       // SCLI-64: SHIZUHA_MCP_SERVICES is an optional further-narrowing lever.
       // When both the role matrix and the env var are set, intersect them so
       // the operator lever always wins (role = ceiling, env = narrowing).

@@ -1,4 +1,5 @@
 import { afterEach, describe, it, expect } from 'vitest';
+import { deriveWorkflowStage } from '../../src/shared/heartbeat-outcome.js';
 import {
   MCP_ACCESS_MATRIX,
   loadMatrixFromFile,
@@ -273,5 +274,87 @@ describe('mcp-access-matrix: PLAT-309 overrides (shizuha / shion) × SHIZUHA_MCP
     expect(final!.has('admin')).toBe(false);
     expect(final!.has('id')).toBe(false);
     expect(final!.has('cron')).toBe(false);
+  });
+});
+
+describe('mcp-access-matrix: PLS-480 workflow-stage-scoped capabilities', () => {
+  beforeEach(() => {
+    _resetMatrixCacheForTest();
+  });
+
+  const sorted = (s: Set<string>) => [...s].sort();
+
+  it('known stage augments the grant on top of role/skill resolution', () => {
+    const without = resolveAllowedServers('General Assistant', 'someone-else');
+    const withStage = resolveAllowedServers('General Assistant', 'someone-else', null, undefined, 'awaiting_merge');
+    // awaiting_merge adds the merger-plane surface (pulse is already in base;
+    // assert the stage path executes and never REMOVES anything).
+    expect(sorted(withStage)).toEqual(expect.arrayContaining(sorted(without)));
+  });
+
+  it('unknown stage is a no-op (fail closed)', () => {
+    const without = resolveAllowedServers('General Assistant', 'someone-else');
+    const withUnknown = resolveAllowedServers('General Assistant', 'someone-else', null, undefined, 'teleport_maintenance');
+    expect(sorted(withUnknown)).toEqual(sorted(without));
+  });
+
+  it('absent stage is a no-op (back-compat: existing call sites unchanged)', () => {
+    const without = resolveAllowedServers('General Assistant', 'someone-else');
+    const withNull = resolveAllowedServers('General Assistant', 'someone-else', null, undefined, null);
+    expect(sorted(withNull)).toEqual(sorted(without));
+  });
+
+  it('a stage NEVER unlocks the SKILL_GATED sensitive trio', () => {
+    const stage = resolveAllowedServers(null, 'someone-else', null, undefined, 'operator_wait');
+    for (const sensitive of ['cron', 'hive']) {
+      expect(stage.has(sensitive)).toBe(false);
+    }
+  });
+
+  it('an explicit per-agent override remove beats stage augmentation (revoke wins)', () => {
+    // Build an explicit matrix where overrides remove a stage-grantable server.
+    const matrix = {
+      base: ['pulse', 'connect', 'wiki'],
+      roles: {},
+      overrides: { 'revoked-agent': { remove: ['pulse'] } },
+    } as never;
+    const stage = resolveAllowedServers(null, 'revoked-agent', null, matrix, 'awaiting_merge');
+    expect(stage.has('pulse')).toBe(false);
+  });
+});
+
+describe('deriveWorkflowStage (PLS-480 behavioral half)', () => {
+  it('PLAT-3412 regression: a held task in in_review grants merger-plane without future-requirement union', () => {
+    // A task whose CURRENT stage is in_review: the grant augments from the held
+    // task's live Status, NOT from any later privileged-acceptance requirement.
+    const snapshot = [
+      'Found 1 task(s) — 1 actionable.',
+      '- Task CTX-1: source review of deploy acceptance triple',
+      '  ID: 4242',
+      '  Status: in_review | Priority: urgent',
+      '  PRs: shizuha-labs/deploy#588 (open)',
+    ].join('\n');
+    expect(deriveWorkflowStage(snapshot)).toBe('in_review');
+    // Routable at source review: the resolver admits the merger-plane surface.
+    const grant = resolveAllowedServers(null, 'review-seat', null, undefined, deriveWorkflowStage(snapshot));
+    expect(grant.has('pulse')).toBe(true);
+  });
+
+  it('a non-stage status (in_progress) returns null — resolver unchanged vs pre-PLS-480', () => {
+    const snapshot = 'Found 1 task(s)\n  Status: in_progress | Priority: high';
+    expect(deriveWorkflowStage(snapshot)).toBeNull();
+    const without = resolveAllowedServers('General Assistant', 'seat-x');
+    const withLever = resolveAllowedServers('General Assistant', 'seat-x', null, undefined, deriveWorkflowStage(snapshot));
+    expect(sorted(withLever)).toEqual(sorted(without));
+  });
+
+  it('awareness-only owner action does not discharge the stage', () => {
+    const snapshot = 'Status: operator_wait\n  Owner action: awareness-only';
+    expect(deriveWorkflowStage(snapshot)).toBeNull();
+  });
+
+  it('empty/undefined snapshot returns null (strict no-op)', () => {
+    expect(deriveWorkflowStage('')).toBeNull();
+    expect(deriveWorkflowStage(undefined)).toBeNull();
   });
 });

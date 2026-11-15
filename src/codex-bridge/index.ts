@@ -33,6 +33,7 @@ import { BROWSER_MCP_TOKEN_ENV, resolveBrowserMcpServer } from '../browser-mcp.j
 import { shouldEscalateEmptyTurnAsProviderFailure } from '../shared/connect-inject.js';
 import {
   formatHeartbeatQueueDrainOutcomeLogLine,
+  deriveWorkflowStage,
   heartbeatQueueDrainTelemetry,
   recordHeartbeatQueueDrainOutcome,
   recordHeartbeatQueueDrainTurn,
@@ -4620,7 +4621,9 @@ ${envLines ? `\n[mcp_servers.${browserMcp.name}.env]\n${envLines}\n` : ''}
       // Capability tags (skills[]) unioned with role (operator 2026-06-24).
       const agentSkills = (process.env['AGENT_SKILLS'] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
       const hiveAllowList = parseAgentEffectiveMcpServicesFromEnv();
-      const roleAllowList = hiveAllowList ?? [...resolveAllowedServers(agentRole, this.opts.agentUsername ?? process.env['AGENT_USERNAME'], agentSkills)];
+      // PLS-480 behavioral half: live-stage lever (AGENT_WORKFLOW_STAGE) augments
+      // the role-derived grant; absent lever = null = strict no-op (back-compat).
+      const roleAllowList = hiveAllowList ?? [...resolveAllowedServers(agentRole, this.opts.agentUsername ?? process.env['AGENT_USERNAME'], agentSkills, undefined, deriveWorkflowStage(process.env['AGENT_WORKFLOW_STAGE']))];
       const tokenFile = this.mcpUpstreamTokenFile(workDir);
       try { fs.writeFileSync(tokenFile, jwtToken, { mode: 0o600 }); } catch { /* stdio proxy falls back to env seed */ }
       const proxyPlatformConfigs = prunePlatformMcpKeys(
