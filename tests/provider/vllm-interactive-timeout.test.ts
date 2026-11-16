@@ -217,6 +217,48 @@ describe('vLLM interactive timeout behavior', () => {
     expect(metrics).toContain('scli_inference_errors_total{provider="vllm",model="deepseek-v4-flash",error_class="no_first_chunk"}');
   });
 
+  it('SCLI-874: an accepted Cortex SSE response with no chunk still hits the first-token timeout', async () => {
+    process.env['SHIZUHA_INTERACTIVE_TUI'] = '1';
+    process.env['VLLM_FIRST_TOKEN_TIMEOUT_MS'] = '80';
+    process.env['VLLM_FIRST_TOKEN_MAX_MS'] = '80';
+    process.env['VLLM_REQUEST_STATUS_INTERVAL_MS'] = '20';
+
+    globalThis.fetch = vi.fn(async (url) => {
+      const requestUrl = String(url);
+      if (requestUrl.endsWith('/v1/models')) {
+        return new Response(JSON.stringify({
+          data: [{ id: 'GLM-5.3-Flash', max_model_len: 4096 }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (requestUrl.endsWith('/v1/chat/completions')) {
+        const stream = new ReadableStream({
+          start() {
+            // Headers are already accepted. No chunk, no [DONE].
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }
+      throw new Error(`unexpected URL ${requestUrl}`);
+    }) as typeof globalThis.fetch;
+
+    const provider = new VLlmProvider('http://vllm.test', 4096);
+    const statuses: Extract<StreamChunk, { type: 'status' }>[] = [];
+    const started = Date.now();
+    await expect((async () => {
+      for await (const chunk of provider.chat(
+        [{ role: 'user', content: 'hi' }],
+        { model: 'GLM-5.3-Flash', maxTokens: 8 },
+      )) {
+        if (chunk.type === 'status') statuses.push(chunk);
+      }
+    })()).rejects.toThrow(/no first chunk/);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(statuses.some((status) => status.code === 'stall_timeout')).toBe(true);
+  });
+
   it('bounds Cortex admission retries for an ordinary fleet/gateway turn', async () => {
     let completionAttempts = 0;
     globalThis.fetch = vi.fn(async (url) => {

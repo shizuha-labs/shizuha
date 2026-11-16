@@ -2004,6 +2004,11 @@ export class VLlmProvider implements LLMProvider {
       Math.max(FIRST_TOKEN_TIMEOUT_MS, Math.ceil((promptTokenEstimate / PREFILL_FLOOR_TPS) * 1000) + 60_000),
     );
     const stallController = new AbortController();
+    // SCLI-874: undici stops honoring the fetch signal once headers are
+    // accepted, so a silent SSE body sits in reader.read() forever. The
+    // timer also cancels the reader directly.
+    let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let bodyBytes = 0;
     let stallTimer: ReturnType<typeof setTimeout> | null = null;
     let gotFirstChunk = false;
     let cortexStreamingResponseAccepted = false;
@@ -2024,6 +2029,9 @@ export class VLlmProvider implements LLMProvider {
       // data frame: DeepSeek can decode an entire first tool call while Cortex
       // sends only comment heartbeats. Keep the caller's AbortSignal active, and
       // re-arm only for the short post-finish drain below.
+      // Accepted Cortex streams stay alive through comment heartbeats, but the
+      // short post-finish drain must still arm: vLLM/GLM often never sends
+      // [DONE] after finish_reason.
       if (cortexStreamingResponseAccepted && !sawFinishReason) return;
       // PLAT-507: use a short drain window after finish_reason so a non-closing
       // vLLM/GLM connection doesn't block for the full STREAM_STALL_MS.
@@ -2034,6 +2042,7 @@ export class VLlmProvider implements LLMProvider {
           : useStream
             ? firstTokenBudgetMs
             : Math.max(NONSTREAM_RESPONSE_TIMEOUT_MS, firstTokenBudgetMs);
+      const scheduledMs = ms;
       stallTimer = setTimeout(() => {
         const reason = sawFinishReason
           ? 'finish drain timeout'
@@ -2042,8 +2051,8 @@ export class VLlmProvider implements LLMProvider {
             : useStream
               ? 'no first chunk'
               : 'non-streaming response timeout';
-        stallController.abort(new Error(`vLLM ${reason}: no events for ${Math.round(ms / 1000)}s`));
-      }, ms);
+        stallController.abort(new Error(`vLLM ${reason}: no events for ${Math.round(scheduledMs / 1000)}s`));
+      }, scheduledMs);
     };
     // Combine caller's abort + our stall abort
     const combinedSignal = options.abortSignal
@@ -2798,10 +2807,15 @@ export class VLlmProvider implements LLMProvider {
       );
     }
 
-    if (useStream && this.name === 'cortex') {
+    // An accepted Cortex SSE response is not the first model token. Comment
+    // heartbeats keep that stream alive (resetStallTimer returns early once
+    // this flag is set). A body that never sends a byte is still raced below
+    // against the stall signal, because undici stops honoring the fetch abort
+    // after headers and reader.read() would otherwise sit forever.
+    if (useStream && response.ok && this.name === 'cortex') {
       cortexStreamingResponseAccepted = true;
-      clearStallTimer();
     }
+    resetStallTimer();
 
     // ── Non-streaming branch (tool-bearing turns) ──
     // Reliable tool_call parsing: vLLM's tool parsers only work correctly non-streamed.
@@ -2957,6 +2971,52 @@ export class VLlmProvider implements LLMProvider {
 
     const reader = response.body?.getReader();
     if (!reader) throw new Error('No response body from vLLM');
+    activeReader = reader;
+    // SCLI-874: undici stops honoring the fetch abort once headers are
+    // accepted. Race the body read against the stall signal so a silent
+    // SSE body still hits the first-token budget.
+    const readBody = () => {
+      const read = reader.read();
+      // SCLI-874: only a body that has produced nothing is raced. Any byte,
+      // including a Cortex comment heartbeat, means the accepted stream is
+      // alive and the caller abort owns it. Do not key this off the provider
+      // name: a Cortex response whose body never sends a byte is the stall
+      // this budget exists for, and a heartbeat still sets bodyBytes.
+      if (gotFirstChunk || bodyBytes > 0) return read;
+      if (stallController.signal.aborted) {
+        void reader.cancel(stallController.signal.reason).catch(() => {});
+        return Promise.reject(stallController.signal.reason ?? new Error('vLLM no first chunk'));
+      }
+      return new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+        let settled = false;
+        const onAbort = () => {
+          if (settled || gotFirstChunk || bodyBytes > 0) return;
+          settled = true;
+          // Cancel the in-flight read. Leaving it pending makes the next
+          // reader.read() throw "ReadableStream reader is locked" / a
+          // disturbed-stream error, which the stall tests see as
+          // "no events for 0s" instead of the caller's abort reason.
+          void reader.cancel(stallController.signal.reason).catch(() => {});
+          reject(stallController.signal.reason ?? new Error('vLLM no first chunk'));
+        };
+        stallController.signal.addEventListener('abort', onAbort, { once: true });
+        read.then(
+          (value) => {
+            if (settled) return;
+            settled = true;
+            stallController.signal.removeEventListener('abort', onAbort);
+            bodyBytes += value.value?.byteLength ?? 0;
+            resolve(value);
+          },
+          (err) => {
+            if (settled) return;
+            settled = true;
+            stallController.signal.removeEventListener('abort', onAbort);
+            reject(err);
+          },
+        );
+      });
+    };
 
     const decoder = new TextDecoder();
     let buffer = '';
@@ -3138,7 +3198,7 @@ export class VLlmProvider implements LLMProvider {
     streamReadLoop: while (true) {
       let readResult: Awaited<ReturnType<typeof reader.read>>;
       try {
-        readResult = await reader.read();
+        readResult = await readBody();
       } catch (err) {
         // Caller cancellation (TUI Esc / harness abort) is an intentional
         // terminal boundary, not a retryable stream failure. Preserve the
@@ -3153,7 +3213,9 @@ export class VLlmProvider implements LLMProvider {
         // PLAT-507: finish drain timeout — the server never sent [DONE] after finish_reason.
         // This is the GLM/vLLM keep-alive-without-closing bug. Treat it as a clean stream
         // end (stop_reason was already yielded; don't emit stall_timeout noise).
-        const isFinishDrain = sawFinishReason && msg.includes('vLLM finish drain timeout');
+        const isFinishDrain = sawFinishReason && (
+          msg.includes('vLLM finish drain timeout') || msg.includes('vLLM stream stalled')
+        );
         if (isFinishDrain) {
           logger.debug({ ms: FINISH_DRAIN_MS }, 'vLLM finish drain timeout — stream closed cleanly');
           finishDrainCompleted = true;
@@ -3244,7 +3306,10 @@ export class VLlmProvider implements LLMProvider {
         throw err;
       }
       const { done, value } = readResult;
-      if (done) break;
+      if (done) {
+        clearStallTimer();
+        break;
+      }
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -3254,7 +3319,20 @@ export class VLlmProvider implements LLMProvider {
         const trimmed = line.trim();
         if (!trimmed) continue;
 
-        // SSE format: "data: {...}" or "data: [DONE]"
+        // SSE format: "data: {...}" or "data: [DONE]".
+        // A Cortex comment (`: cortex upstream-wait`) is not a data frame,
+        // but it proves the accepted body is alive. Arm the post-first-chunk
+        // stall budget so the short first-token timer does not abort a stream
+        // that is only heartbeating while a tool call is buffered. Blank
+        // newlines are not that proof — direct vLLM must still hit the
+        // first-token budget when the body carries no SSE event.
+        if (trimmed.startsWith(':') && this.name === 'cortex') {
+          gotFirstChunk = true;
+          // A heartbeat after finish_reason must not clear the short drain
+          // timer — that is how GLM keeps the body open forever.
+          if (!sawFinishReason) resetStallTimer();
+          continue;
+        }
         if (!trimmed.startsWith('data:')) continue;
         const payload = trimmed.slice(5).trim();
         if (payload !== '[DONE]') pushSseRing(payload);
@@ -3918,5 +3996,6 @@ export class VLlmProvider implements LLMProvider {
       yield emitInferenceTelemetry({ outcome: 'success', inputTokens: finalInputTokens, outputTokens: completionTokens });
     }
     yield { type: 'done' };
+    clearStallTimer();
   }
 }
