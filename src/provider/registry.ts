@@ -225,6 +225,56 @@ function freshShizuhaAccessToken(): string | undefined {
   return auth.accessToken;
 }
 
+export interface CortexAuthResolverDeps {
+  /** Injectable for tests. Default: the real on-demand refresh
+   *  (getValidShizuhaAccessToken — refreshes via the stored refresh token
+   *  under the auth lock when the access JWT is expired or within its skew
+   *  window). */
+  getValidAccessToken?: () => Promise<string | null>;
+}
+
+/**
+ * Await-capable auth resolver for the Cortex provider.
+ *
+ * `resolveCortexAuthToken` is sync and deliberately refuses to serve the login
+ * JWT once it is within the 10-minute expiry-skew window (it must not send a
+ * JWT Cortex will reject). But with NO sk-cortex API key configured, that
+ * refusal composed into a request with NO Authorization header at all — Cortex
+ * answered "Authentication credentials were not provided", surfaced as
+ * "Cortex needs authentication" — for every request landing in the ~5-minute
+ * window before the auto-refresh tick rewrote auth.json (observed live
+ * 2026-09-26: token exp 15:45Z, resolver gave up from 15:35Z, refresh tick
+ * landed 15:39:46Z; requests in between failed).
+ *
+ * This resolver keeps the same precedence, then falls back to the on-demand
+ * refresh (getValidShizuhaAccessToken) which mints a fresh token from the
+ * stored refresh token — so the FIRST attempt goes out authenticated instead
+ * of failing over to a 401 path that only matches "Signature has expired".
+ * Agents keep the strict env/own-token precedence (never borrow the human's
+ * identity): the fallback applies only to interactive sessions with an
+ * existing auth.json login.
+ */
+export function createCortexAuthResolver(
+  config?: ShizuhaConfig,
+  deps: CortexAuthResolverDeps = {},
+): () => Promise<string | undefined> {
+  return async () => {
+    const resolved = resolveCortexAuthToken(config);
+    if (resolved) return resolved;
+    // No usable credential from the sync read. Interactive sessions with a
+    // stored login can still mint a fresh token on demand.
+    if (isAgentRuntime()) return undefined;
+    if (!readShizuhaAuth()) return undefined;
+    const getValid = deps.getValidAccessToken
+      ?? (async () => {
+        const { getValidShizuhaAccessToken } = await import('../config/shizuhaAuth.js');
+        return getValidShizuhaAccessToken();
+      });
+    const fresh = await getValid().catch(() => null);
+    return fresh ?? undefined;
+  };
+}
+
 function jwtAlg(token: string): string | undefined {
   const [header] = token.split('.');
   if (!header) return undefined;
@@ -526,6 +576,9 @@ export class ProviderRegistry {
     const cortexBase = cortexUrl.replace(/\/+$/, '').replace(/\/v1$/, '');
     // Resolver (not a frozen string): re-read JWT/API key on every request so
     // auto-refresh + sk-cortex fallback work after the ~1h login JWT expires.
+    // Await-capable: when the sync read refuses the login JWT (pre-expiry skew
+    // window, no API key configured), the resolver refreshes on demand instead
+    // of letting the request go out with no Authorization header.
     // forceRefreshKey: on 401 "Signature has expired" (RS256 key rotation),
     // force a token refresh and retry with the fresh JWT.
     this.providers.set(
@@ -533,7 +586,7 @@ export class ProviderRegistry {
       new VLlmProvider(
         cortexBase,
         undefined,
-        () => resolveCortexAuthToken(config),
+        createCortexAuthResolver(config),
         'cortex',
         async () => {
           const { forceRefreshShizuhaAccessToken } = await import('../config/shizuhaAuth.js');
