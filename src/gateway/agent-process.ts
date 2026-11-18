@@ -52,7 +52,7 @@ import {
 } from '../auth/xai-broker.js';
 import { isTransientProviderFailure } from '../provider/transient-errors.js';
 import { resolveEffectiveContextWindow, resolveModelContextWindow } from '../provider/context-window.js';
-import { fetchBrokerToken } from '../auth/broker-token.js';
+import { brokerExpected, fetchBrokerToken } from '../auth/broker-token.js';
 import type { HookEngine } from '../hooks/engine.js';
 import { CronStore } from '../cron/store.js';
 import { CronScheduler } from '../cron/scheduler.js';
@@ -1460,13 +1460,47 @@ export class AgentProcess {
     this.sandboxConfig = cfg.sandbox?.mode !== 'unrestricted' ? cfg.sandbox : undefined;
 
     if (isHiveDirectXaiGrokModel(this.model)) {
-      const leased = await leaseHiveXaiAccess({
-        stickyKey: `agent:${this.config.agentUsername || this.config.agentId || 'gateway'}`,
-      });
-      if (!leased) {
+      const xaiStickyKey = `agent:${this.config.agentUsername || this.config.agentId || 'gateway'}`;
+      // Config face (fail-loud, unchanged): the pod-local broker is absent
+      // entirely, so this seat can never serve its configured model — a
+      // supervised wait would hide a provisioning defect.
+      if (!brokerExpected()) {
         throw new Error(
-          'Hive xAI TokenPool lease failed: Grok Build direct (xai:grok-*) needs '
-          + 'an access-only coordinator lease. Refresh tokens stay in Hive.',
+          'Hive xAI TokenPool lease failed: broker not configured for the '
+          + 'Grok Build direct (xai:grok-*) lane. The lease request is '
+          + 'access-only (refresh tokens stay in Hive); the credential '
+          + 'broker must be present to serve it.',
+        );
+      }
+      // PLAT-879 discipline, xAI direct lane: an empty/cooling xAI pool must
+      // NOT crash-loop the seat. The lease request already honors the
+      // access-only contract (refresh tokens never leave Hive); a null lease
+      // means pool capacity (entries cooling after quota exhaustion /
+      // refresh) — saki 2026-11-18 boot-crashed 3x on this window and healed
+      // on the 4th boot. Stay SUPERVISED and retry with bounded exponential
+      // backoff + jitter until the pool recovers, exactly like the
+      // claude-bridge Anthropic lane. Heartbeats/needs_help keep the wait
+      // observable; a fresh spawn re-enters the same loop restart-safely.
+      let leased = await leaseHiveXaiAccess({ stickyKey: xaiStickyKey });
+      if (!leased) {
+        const floorMs = Number(process.env['SHIZUHA_XAI_LEASE_BACKOFF_INITIAL_MS'] ?? 60_000);
+        const capMs = Number(process.env['SHIZUHA_XAI_LEASE_BACKOFF_MAX_MS'] ?? 10 * 60_000);
+        let waitMs = floorMs;
+        const unavailableSince = Date.now();
+        while (!leased) {
+          const delayMs = Math.round(waitMs * (0.8 + Math.random() * 0.4));
+          logger.error(
+            { waitSeconds: Math.round(delayMs / 1000), model: this.model },
+            'PLAT-879 (xAI direct lane): Hive xAI TokenPool empty/cooling for '
+            + 'xai:grok-* — staying supervised, retrying (no crash-loop)',
+          );
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          waitMs = Math.min(waitMs * 2, capMs);
+          leased = await leaseHiveXaiAccess({ stickyKey: xaiStickyKey });
+        }
+        logger.info(
+          { waitedSeconds: Math.round((Date.now() - unavailableSince) / 1000) },
+          'PLAT-879 (xAI direct lane): Hive xAI TokenPool recovered — resuming initialize',
         );
       }
       this.hiveXaiLease = leased;
