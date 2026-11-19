@@ -274,9 +274,9 @@ export async function executeTurn(
     /** Caller-authoritative prompt estimate used by live token progress. */
     inputTokenEstimate?: number;
     /**
-     * Cortex cold-prefill attribution tag. After compaction, the next
-     * interactive call is expected-cold (`post_compaction`); mid-session
-     * interactive high TTFT without this tag is the ideally-zero surface.
+     * Cortex cold-prefill attribution tag. After a real compaction commit,
+     * the caller sets `post_compaction` on the next interactive call.
+     * A prefix-cache break alone is not compaction (PLAT-11417).
      */
     requestKind?: string;
     /** Set when Cortex reports that the exact current session home is in
@@ -361,8 +361,10 @@ export async function executeTurn(
       timestamp: Date.now(),
     });
   }
-  const requestKind = providerPrefixContinuity?.requestKind
-    || (providerPrefixObservation?.cacheBreaking ? 'post_compaction' : undefined);
+  // PLAT-11417: do not synthesize post_compaction from a cache break.
+  // That label means a preceding compaction commit. Callers that actually
+  // compacted (loop/session/server) pass requestKind explicitly.
+  const requestKind = providerPrefixContinuity?.requestKind;
 
   // Stream LLM response
   let text = '';

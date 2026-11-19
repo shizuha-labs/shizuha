@@ -598,6 +598,34 @@ describe('executeTurn — events', () => {
     expect((contentEvents[0] as { text: string }).text).toContain('Hello');
   });
 
+  it('does not stamp post_compaction on a cache break without a compaction commit (PLAT-11417)', async () => {
+    provider.queueResponse(ResponseBuilder.textOnly('ok'));
+    await executeTurn(
+      [{ role: 'user', content: 'hi' }],
+      provider, MODEL, SYSTEM,
+      [], registry, permissions, emitter, ctx,
+      16384, 0,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      {
+        observe: () => ({ cacheBreaking: true, appendOnly: false, reasons: ['tools'], primaryReason: 'tools' }),
+      },
+    );
+    expect(provider.capturedOptions[0]?.requestKind).toBeUndefined();
+  });
+
+  it('keeps an explicit post_compaction requestKind from the caller (PLAT-11417)', async () => {
+    provider.queueResponse(ResponseBuilder.textOnly('ok'));
+    await executeTurn(
+      [{ role: 'user', content: 'hi' }],
+      provider, MODEL, SYSTEM,
+      [], registry, permissions, emitter, ctx,
+      16384, 0,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { requestKind: 'post_compaction' },
+    );
+    expect(provider.capturedOptions[0]?.requestKind).toBe('post_compaction');
+  });
+
   it('events include correct toolName', async () => {
     registry.register(makeDummyTool('named_tool', 'ok'));
     provider.queueResponse(
