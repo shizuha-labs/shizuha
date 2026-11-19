@@ -25,7 +25,24 @@ import { launchTUI } from './tui/App.js';
 import { StateStore } from './state/store.js';
 import type { AgentConfig, MCPServerConfig } from './agent/types.js';
 import type { PermissionMode } from './permissions/types.js';
-import { logger } from './utils/logger.js';
+import { logger, registerStdoutMirrorGate } from './utils/logger.js';
+
+// PLAT-11338: one-shot CLI invocations own stdout as a machine contract —
+// `config` emits JSON, `exec`/`-p` emit results/NDJSON, `pipe` speaks NDJSON,
+// and the stdio MCP surfaces (browser-mcp, mcp-proxy, mcp-multiplexer, the
+// *-bridge commands) speak JSON-RPC. The SCLI-6xx stdout mirror (agent pods
+// run with SCLI_LOG_STDOUT_MIRROR=1) interleaves pino lines into those
+// streams and breaks every JSON.parse caller (e2e-smoke config assertions
+// red-line on mirror-enabled runners). Default: suppress the mirror; only the
+// surfaces where stdout is NOT a machine contract re-enable it (interactive
+// TUI launch, serve, gateway) via allowStdoutMirror() below. Mirrored lines
+// still land in the rotating file stream, so post-hibernation evidence is
+// intact either way (SCLI-6xx doctrine).
+let stdoutMirrorSuppressed = true;
+registerStdoutMirrorGate(() => stdoutMirrorSuppressed);
+function allowStdoutMirror(): void {
+  stdoutMirrorSuppressed = false;
+}
 import { assertWorkspaceDir } from './utils/fs.js';
 import { inert, isInert } from './utils/display.js';
 import {
@@ -223,6 +240,10 @@ program
     // `shizuha login`, never forced at launch.
 
     // Default: launch interactive TUI
+    // PLAT-11338: the TUI is the long-running surface — stdout is not a
+    // machine contract here (and the fullscreen gate from PLAT-11268 owns the
+    // active-screen case), so the SCLI-6xx mirror re-activates for it.
+    allowStdoutMirror();
     launchTUI({
       cwd: opts.cwd as string,
       model: opts.model as string | undefined,
@@ -685,6 +706,9 @@ program
   .option('-p, --port <n>', 'Port number', '8015')
   .option('-h, --host <addr>', 'Host address', '0.0.0.0')
   .action(async (opts) => {
+    // PLAT-11338: long-running HTTP server — stdout is a log surface, not a
+    // machine contract; the SCLI-6xx mirror re-activates for it.
+    allowStdoutMirror();
     // PLAT-5893/SCLI-566: legacy serve shares the SCLI-400 port AND host
     // preflight. Invalid ports and invalid/empty hosts reject pre-start with a
     // bounded diagnostic — never a raw ERR_SOCKET_BAD_PORT / node:dns
@@ -741,6 +765,9 @@ program
   .option('--imessage-webhook-port <n>', 'iMessage webhook port', '8019')
   .option('--imessage-handles <handles>', 'Comma-separated allowed iMessage handles')
   .action(async (opts) => {
+    // PLAT-11338: long-running gateway — stdout is a log surface, not a
+    // machine contract; the SCLI-6xx mirror re-activates for it.
+    allowStdoutMirror();
     // SCLI-400/PLAT-5893: validate mode/thinking/effort/port/channel-modes/
     // webhook-ports before any runtime init. Explicit-empty/whitespace/case-
     // mismatch must fail closed with a bounded diagnostic, never reach a bind

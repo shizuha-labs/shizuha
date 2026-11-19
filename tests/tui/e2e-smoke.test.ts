@@ -39,6 +39,20 @@ describe('TUI E2E smoke tests', () => {
       expect(config.agent.defaultModel).toBeTruthy();
     });
 
+    it('PLAT-11338: config stdout stays pure JSON with SCLI_LOG_STDOUT_MIRROR=1 (dev mode)', () => {
+      // Agent pods run with the SCLI-6xx stdout mirror enabled; the one-shot
+      // CLI must suppress it so machine-readable stdout remains parseable.
+      const output = execSync('npx tsx src/index.ts config', {
+        cwd: projectDir,
+        encoding: 'utf-8',
+        env: { ...process.env, SCLI_LOG_STDOUT_MIRROR: '1' },
+      });
+      const config = JSON.parse(output); // throws on mirrored pino lines
+      expect(config).toHaveProperty('agent');
+      expect(config.agent.defaultModel).toBeTruthy();
+      expect(output).not.toContain('"src":"scli"');
+    });
+
     it('TUI launches and renders before raw mode error in non-TTY', () => {
       try {
         execSync('npx tsx src/index.ts 2>&1', {
@@ -127,6 +141,26 @@ describe('TUI E2E smoke tests', () => {
           expect((err as Error).message).toContain('worker');
         }
       }
+    });
+
+    it('PLAT-11338: config stdout stays pure JSON with SCLI_LOG_STDOUT_MIRROR=1 (built bundle)', () => {
+      let stdout = '';
+      try {
+        stdout = execSync('node dist/shizuha.js config 2>/dev/null', {
+          cwd: projectDir, encoding: 'utf-8',
+          env: { ...process.env, SCLI_LOG_STDOUT_MIRROR: '1' },
+        });
+      } catch (err) {
+        stdout = ((err as any).stdout as string) ?? '';
+        if (!stdout) {
+          // Known issue: pino worker.js not found in bundled mode
+          expect((err as Error).message).toContain('worker');
+          return;
+        }
+      }
+      const config = JSON.parse(stdout); // throws on mirrored pino lines
+      expect(config).toHaveProperty('agent');
+      expect(stdout).not.toContain('"src":"scli"');
     });
   });
 });
