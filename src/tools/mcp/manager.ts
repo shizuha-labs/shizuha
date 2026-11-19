@@ -148,7 +148,17 @@ export class MCPManager {
   async connectAll(configs: MCPServerConfig[]): Promise<void> {
     this.disposed = false; // allow reuse after a prior disconnectAll()
     (this.failedServers as Array<{ name: string; error: string }>).length = 0;
-    for (const config of configs) this.configs.set(config.name, config);
+    for (const config of configs) {
+      this.configs.set(config.name, config);
+      // PLAT-8694 residual (PLAT-11611): materialize the failures gauge series
+      // at 0 for every configured server at startup, BEFORE the first failure.
+      // Without this the series only exists after a reconnect success/failure
+      // path, so a healthy agent that never fails never creates it and the
+      // ShizuhaAgentRuntimeMetricsAbsent absent-family alert fires on a healthy
+      // fleet. (Jun's #445 connectAll hunk; dropped in the #367 -> #378
+      // supersession.)
+      setMcpReconnectConsecutiveFailures(config.name, 0);
+    }
     logger.info({ total: configs.length, concurrency: CONNECT_CONCURRENCY, timeoutMs: CONNECT_TIMEOUT_MS }, 'MCP startup connect plan');
     await runBounded(prioritizeConfigs(configs), CONNECT_CONCURRENCY, async (config) => {
       if (this.userDisabled.has(config.name)) return;
