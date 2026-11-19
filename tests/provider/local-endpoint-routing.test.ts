@@ -42,6 +42,12 @@ describe('local OpenAI-compatible routing (SCLI-593)', () => {
       'OLLAMA_BASE_URL',
       'LLAMACPP_BASE_URL',
       'LITELLM_PROXY_URL',
+      // PLAT-11611 gate-repro fix: fleet pods carry the broker sidecar socket;
+      // without scrubbing it readAllCodexAccounts() registers a synthetic
+      // 'codex' broker account and resolveAutoModel() returns 'gpt-5.5'
+      // before the ollama fallback — environment mismatch, not code
+      // (same hazard class test_plat4720_full_suite_gate.py documents).
+      'MCP_AUTH_PROXY_SOCKET',
     ]) {
       saved[key] = process.env[key];
       delete process.env[key];

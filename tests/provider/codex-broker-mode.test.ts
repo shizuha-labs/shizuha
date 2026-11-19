@@ -98,6 +98,12 @@ describe('CodexProvider broker mode (SCLI-101 / SCLI-99)', () => {
   it('is unavailable when CODEX_BROKER_URL is unset and no local codex accounts exist', () => {
     delete process.env['CODEX_BROKER_URL'];
     delete process.env['CODEX_API_KEY'];
+    // PLAT-11611 gate-repro fix: the broker sidecar socket (present on fleet
+    // pods and the CI Job) makes readAllCodexAccounts() return a synthetic
+    // hive-broker account — isAvailable() true with no real credentials.
+    // Hermetic per SCLI-601 must cover this env path too.
+    const savedProxySocket = process.env['MCP_AUTH_PROXY_SOCKET'];
+    delete process.env['MCP_AUTH_PROXY_SOCKET'];
     // Hermetic per SCLI-601: isolate HOME so a real ~/.shizuha/credentials.json
     // or ~/.codex on the runner cannot leak accounts into this assertion.
     const originalHome = process.env['HOME'];
@@ -109,6 +115,8 @@ describe('CodexProvider broker mode (SCLI-101 / SCLI-99)', () => {
       fs.rmSync(isolatedHome, { recursive: true, force: true });
       if (originalHome === undefined) delete process.env['HOME'];
       else process.env['HOME'] = originalHome;
+      if (savedProxySocket === undefined) delete process.env['MCP_AUTH_PROXY_SOCKET'];
+      else process.env['MCP_AUTH_PROXY_SOCKET'] = savedProxySocket;
     }
   });
 });
