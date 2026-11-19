@@ -21,6 +21,14 @@ export const DISABLE_MOUSE_REPORTING = '\x1b[?1006l\x1b[?1000l';
 
 let activeStream: NodeJS.WriteStream | null = null;
 
+// PLAT-11268: register the logger's stdout-mirror suppression gate at module
+// load, so the mirror honors its own contract ("never active where stdout is
+// the terminal") for as long as this module — i.e. the TUI — is in play.
+// Raw JSON log writes interleaved with Ink's alternate-screen frames corrupt
+// the render (header/status rows painted blank).
+import { registerStdoutMirrorGate } from '../../utils/logger.js';
+registerStdoutMirrorGate(() => activeStream !== null);
+
 export function enterInteractiveScreen(stream: NodeJS.WriteStream = process.stdout): boolean {
   if (!stream.isTTY || activeStream) return false;
   activeStream = stream;
