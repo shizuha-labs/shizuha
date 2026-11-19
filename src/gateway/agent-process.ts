@@ -2291,6 +2291,22 @@ export class AgentProcess {
       this.cronScheduler.start();
     } else if (platformLinked) {
       logger.info('Platform-linked runtime — local cron scheduler disabled (use Pulse recurring tasks)');
+      // SCLI-817: fail loud about stranded jobs. The INFO line above is easy
+      // to miss; enabled jobs.json entries on a platform-linked runtime will
+      // never dispatch, and their owners see `timesRun 0` + past-due with a
+      // healthy-looking seat. Name the count and the remediation.
+      try {
+        await this.cronStore?.load();
+        const stranded = this.cronStore?.listJobs(false) ?? [];
+        if (stranded.length > 0) {
+          logger.warn({
+            stranded: stranded.length,
+            jobs: stranded.map((j) => ({ id: j.id, name: j.name, nextRunAt: j.nextRunAt })),
+          }, 'Platform-linked runtime: enabled local cron jobs will NEVER dispatch (scheduler disabled by design) — route through Pulse or remove');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'SCLI-817: could not audit local cron jobs on platform-linked runtime');
+      }
     }
 
     // Fire SessionStart lifecycle hook

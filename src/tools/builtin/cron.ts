@@ -19,6 +19,24 @@ export function setCronDelivery(delivery: CronDelivery): void {
 }
 
 /**
+ * SCLI-817: on platform-linked runtimes the AgentProcess deliberately does
+ * NOT start the local cron scheduler (recurring work routes through Platform
+ * Pulse; heartbeat is bridge-driven). These tools must not silently accept
+ * jobs the runtime will never dispatch — that stranded every scheduled job at
+ * `timesRun 0` + past-due while the seat looked healthy (ichi seat,
+ * 2026-09-28). The tools stay available but honest: refuse to enqueue, and
+ * annotate listings with the disabled dispatcher.
+ */
+export function platformLinkedRuntime(): boolean {
+  return process.env['PLATFORM_PULSE_CONNECTED'] === '1';
+}
+
+const PLATFORM_CRON_DISABLED_NOTE =
+  'Platform-linked runtime — the local cron dispatcher is disabled by design ' +
+  '(recurring work routes through Platform Pulse; heartbeat is driven ' +
+  'operator-side by the bridge reading HEARTBEAT.md). This job will NOT fire.';
+
+/**
  * Read the currently active (enabled) cron jobs from the shared store.
  * Returns null when the cron system is not initialized (e.g. interactive TUI
  * without a gateway). Used by the TUI tasks pane (SCLI-621).
@@ -62,6 +80,16 @@ export const scheduleJobTool: ToolHandler = {
   async execute(params: unknown, _context: ToolContext): Promise<ToolResult> {
     if (!sharedStore) {
       return { toolUseId: '', content: 'Cron system not initialized', isError: true };
+    }
+    if (platformLinkedRuntime()) {
+      return {
+        toolUseId: '',
+        content:
+          'Schedule error: ' + PLATFORM_CRON_DISABLED_NOTE +
+          ' Route recurring work through Platform Pulse (pulse recurring task / ' +
+          'is_recurring=true) or schedule it operator-side.',
+        isError: true,
+      };
     }
     const { name, prompt, schedule, times } = (this as any).parameters.parse(params);
 
@@ -125,6 +153,9 @@ export const listJobsTool: ToolHandler = {
       loopKey: j.loop?.key,
       mode: j.loop?.mode,
       timesRun: j.repeat.completed,
+      // SCLI-817: surface the stranded-dispatcher state instead of implying
+      // delivery the runtime will never perform.
+      dispatch: platformLinkedRuntime() ? 'disabled (platform-linked runtime)' : 'local cron scheduler',
       prompt: j.prompt.length > 80 ? j.prompt.slice(0, 77) + '...' : j.prompt,
     }));
 
