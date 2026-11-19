@@ -57,6 +57,11 @@ tmuxE2eDescribe('TUI tmux renderer e2e tests', () => {
       expect(frame).toContain('Shizuha');
       expect(frame).toContain('Interactive Agent');
 
+      // PLAT-11268: the stdout log mirror (SCLI_LOG_STDOUT_MIRROR=1 in agent
+      // pods) must never paint raw JSON lines into the TUI frame — it used to
+      // interleave with Ink's alternate-screen output and blank the header.
+      expect(frame).not.toContain('"src":"scli"');
+
       // Input box present
       expect(frame).toMatch(/❯|Type a message/);
 

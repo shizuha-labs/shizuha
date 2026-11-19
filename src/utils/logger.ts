@@ -141,9 +141,29 @@ function canCreateDirUnder(dirPath: string): boolean {
 //   {pod=~"agent-X.*"} | json | src="scli"
 // Gated by SCLI_LOG_STDOUT_MIRROR=1 (set in the agent-runtime entrypoint);
 // never active for local TUI sessions where stdout is the terminal.
+// PLAT-11268: suppression gate for the stdout mirror. Registered by the TUI's
+// interactive-screen module at import time (logger itself must stay free of
+// project-relative imports — it is loaded standalone under native node TS
+// stripping by tests/utils/log-stdout-mirror.test.ts).
+type StdoutMirrorGate = () => boolean;
+let stdoutMirrorGate: StdoutMirrorGate | null = null;
+export function registerStdoutMirrorGate(gate: StdoutMirrorGate): void {
+  stdoutMirrorGate = gate;
+}
+
 class StdoutMirrorTransform extends Transform {
   constructor() {
     super({ transform(chunk: Buffer, _enc, cb) {
+      // PLAT-11268: honor the mirror's own contract — never write where
+      // stdout is the terminal. While the fullscreen TUI owns stdout (agent
+      // pods run with SCLI_LOG_STDOUT_MIRROR=1 and the TUI active), raw JSON
+      // writes interleave with Ink's alternate-screen frames and corrupt the
+      // render (startup header/status rows painted blank). Lines still land
+      // in the rotating file stream, so post-hibernation evidence is intact.
+      if (stdoutMirrorGate?.() === true) {
+        cb(null, Buffer.alloc(0));
+        return;
+      }
       // pino emits one JSON object per write; stamp the copy without
       // corrupting non-JSON fragments (defensive: pass those through).
       const text = chunk.toString('utf8');
