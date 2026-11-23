@@ -98,13 +98,93 @@ describe('PLAT-9226 gateway multiplexer collapse', () => {
     expect(result.collapsed).toEqual([]);
   });
 
-  it('stdio-only shizuha-* entries are not collapsible (no upstream URL)', () => {
+  it('non-proxy-form stdio shizuha-* entries are not collapsible (no recognized upstream shape)', () => {
     const configs: MCPServerConfig[] = [
       { name: 'shizuha-drive', transport: 'stdio', command: 'node', args: ['mcp-proxy'], platformManaged: true },
     ];
     const result = collapsePlatformMcpToMultiplexer(configs, { useMultiplexer: true, launcher: LAUNCHER });
     expect(result.configs).toBe(configs);
     expect(result.collapsed).toEqual([]);
+  });
+
+  it('PLAT-4013: stdio-PROXY form entries (fleet delivery shape) collapse into the single multiplexer', () => {
+    // The shape the fleet path actually materializes (PLAT-504 default-on
+    // stdio proxy): command = launcher, args = mcp-proxy --name <svc>
+    // --upstream-url <url>. Observed live on agent-shizuha-115 as 7 children.
+    const configs: MCPServerConfig[] = (['pulse', 'id', 'wiki', 'connect', 'drive', 'hive', 'scs'] as const).map((svc) => ({
+      name: `shizuha-${svc}`,
+      transport: 'stdio' as const,
+      command: LAUNCHER.command,
+      args: [...LAUNCHER.prefixArgs, 'mcp-proxy', '--name', svc, '--upstream-url', `https://platform.example/mcp/${svc}/mcp`],
+      env: { MCP_UPSTREAM_BEARER: 'seed-jwt', MCP_UPSTREAM_BEARER_FILE: '/run/shizuha/mcp-upstream-token' },
+      platformManaged: true,
+    }));
+    const result = collapsePlatformMcpToMultiplexer(configs, {
+      useMultiplexer: true,
+      launcher: LAUNCHER,
+      bearerFile: '/run/shizuha/mcp-upstream-token',
+    });
+    expect(result.collapsed).toHaveLength(7);
+    const aggregate = result.configs.filter((s) => s.name.startsWith('shizuha-'));
+    expect(aggregate).toHaveLength(1);
+    const mcp = aggregate[0]!;
+    expect(mcp.name).toBe('shizuha-mcp');
+    expect(mcp.transport).toBe('stdio');
+    expect(mcp.env?.['MCP_UPSTREAM_BEARER']).toBe('seed-jwt'); // seed preserved, fresh-per-dial rule unchanged
+    const services = manifestOf(mcp);
+    expect(services.map((s) => s.name)).toEqual(['pulse', 'id', 'wiki', 'connect', 'drive', 'hive', 'scs']);
+    expect(services.map((s) => s.url)).toEqual((['pulse', 'id', 'wiki', 'connect', 'drive', 'hive', 'scs'] as const).map((svc) => `https://platform.example/mcp/${svc}/mcp`));
+  });
+
+  it('PLAT-4013: launcher-command stdio entries with a WRONG arg shape pass through untouched', () => {
+    const configs: MCPServerConfig[] = [
+      { name: 'shizuha-pulse', transport: 'stdio', command: LAUNCHER.command, args: [...LAUNCHER.prefixArgs, 'mcp-proxy', '--name', 'pulse'], platformManaged: true },
+    ];
+    const result = collapsePlatformMcpToMultiplexer(configs, { useMultiplexer: true, launcher: LAUNCHER });
+    expect(result.configs).toBe(configs);
+    expect(result.collapsed).toEqual([]);
+  });
+
+  it('PLAT-4013: a stdio entry whose name disagrees with its --name service is not trusted', () => {
+    const configs: MCPServerConfig[] = [
+      { name: 'shizuha-pulse', transport: 'stdio', command: LAUNCHER.command, args: [...LAUNCHER.prefixArgs, 'mcp-proxy', '--name', 'wiki', '--upstream-url', 'https://platform.example/mcp/wiki/mcp'], platformManaged: true },
+    ];
+    const result = collapsePlatformMcpToMultiplexer(configs, { useMultiplexer: true, launcher: LAUNCHER });
+    expect(result.configs).toBe(configs);
+    expect(result.collapsed).toEqual([]);
+  });
+
+  it('san round-2: divergent per-entry org scope fails the collapse closed (pass-through, per-service identity preserved)', () => {
+    const configs: MCPServerConfig[] = [
+      { name: 'shizuha-pulse', transport: 'stdio', command: LAUNCHER.command, args: [...LAUNCHER.prefixArgs, 'mcp-proxy', '--name', 'pulse', '--upstream-url', 'https://platform.example/mcp/pulse/mcp'], env: { MCP_UPSTREAM_ORG: 'org-1' }, platformManaged: true },
+      { name: 'shizuha-wiki', transport: 'stdio', command: LAUNCHER.command, args: [...LAUNCHER.prefixArgs, 'mcp-proxy', '--name', 'wiki', '--upstream-url', 'https://platform.example/mcp/wiki/mcp'], env: { MCP_UPSTREAM_ORG: 'org-2' }, platformManaged: true },
+    ];
+    const result = collapsePlatformMcpToMultiplexer(configs, { useMultiplexer: true, launcher: LAUNCHER });
+    expect(result.configs).toBe(configs);
+    expect(result.collapsed).toEqual([]);
+  });
+
+  it('san round-2: divergent per-entry bearer seeds fail the collapse closed', () => {
+    const configs: MCPServerConfig[] = [
+      { name: 'shizuha-pulse', transport: 'stdio', command: LAUNCHER.command, args: [...LAUNCHER.prefixArgs, 'mcp-proxy', '--name', 'pulse', '--upstream-url', 'https://platform.example/mcp/pulse/mcp'], env: { MCP_UPSTREAM_BEARER: 'jwt-a' }, platformManaged: true },
+      { name: 'shizuha-wiki', transport: 'stdio', command: LAUNCHER.command, args: [...LAUNCHER.prefixArgs, 'mcp-proxy', '--name', 'wiki', '--upstream-url', 'https://platform.example/mcp/wiki/mcp'], env: { MCP_UPSTREAM_BEARER: 'jwt-b' }, platformManaged: true },
+    ];
+    const result = collapsePlatformMcpToMultiplexer(configs, { useMultiplexer: true, launcher: LAUNCHER });
+    expect(result.configs).toBe(configs);
+    expect(result.collapsed).toEqual([]);
+  });
+
+  it('san round-2: homogeneous entries collapse and carry the single org/bearer scope', () => {
+    const configs: MCPServerConfig[] = [
+      { name: 'shizuha-pulse', transport: 'stdio', command: LAUNCHER.command, args: [...LAUNCHER.prefixArgs, 'mcp-proxy', '--name', 'pulse', '--upstream-url', 'https://platform.example/mcp/pulse/mcp'], env: { MCP_UPSTREAM_BEARER: 'jwt-a', MCP_UPSTREAM_ORG: 'org-1' }, platformManaged: true },
+      { name: 'shizuha-wiki', transport: 'stdio', command: LAUNCHER.command, args: [...LAUNCHER.prefixArgs, 'mcp-proxy', '--name', 'wiki', '--upstream-url', 'https://platform.example/mcp/wiki/mcp'], env: { MCP_UPSTREAM_BEARER: 'jwt-a', MCP_UPSTREAM_ORG: 'org-1' }, platformManaged: true },
+    ];
+    const result = collapsePlatformMcpToMultiplexer(configs, { useMultiplexer: true, launcher: LAUNCHER });
+    expect(result.collapsed).toEqual(['shizuha-pulse', 'shizuha-wiki']);
+    const mcp = result.configs.find((s) => s.name === 'shizuha-mcp')!;
+    expect(mcp.env?.['MCP_UPSTREAM_ORG']).toBe('org-1');
+    expect(mcp.env?.['MCP_UPSTREAM_BEARER']).toBe('jwt-a');
+    expect(manifestOf(mcp).map((s) => s.name)).toEqual(['pulse', 'wiki']);
   });
 
   it('non-platform servers are preserved alongside the collapsed aggregate', () => {

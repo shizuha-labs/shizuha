@@ -350,30 +350,72 @@ export function collapsePlatformMcpToMultiplexer(
   // Never double-emit: an aggregate entry (PLAT-3195 derivation path or a
   // platform-delivered aggregate) already represents the multiplexer.
   if (configs.some((s) => s.name === 'shizuha-mcp')) return { configs, collapsed };
-  // Only URL-bearing platform entries are collapsible: stdio `shizuha-*`
-  // entries are already-local processes with no upstream URL to hand the
-  // multiplexer (the gateway-mcp block leaves those untouched too).
-  const upstreams = configs.filter(
-    (s): s is MCPServerConfig & { url: string } => (
-      s.name.startsWith('shizuha-') && s.transport !== 'stdio' && !!s.url
-    ),
-  );
+  // Collapsible platform entries, two forms:
+  //   - URL-bearing HTTP entries (direct dial form);
+  //   - stdio-PROXY entries (PLAT-504 form: command = the proxy launcher with
+  //     `mcp-proxy --name <svc> --upstream-url <url>` args) — the form the
+  //     fleet delivery path actually materializes. PLAT-4013: the original
+  //     predicate accepted only the HTTP form, so fleet pods whose agentCfg
+  //     carried the stdio-proxy form kept one mcp-proxy child per service
+  //     even with SHIZUHA_MCP_MULTIPLEXER=true (7 children observed live on
+  //     agent-shizuha-115). Recognizing the proxy form gives the gateway
+  //     path the same single-process outcome without touching the stdio
+  //     safety filter: the launcher/broker contract is identical, and the
+  //     multiplexer keeps the fresh-per-dial bearer rule (no baked secrets).
+  // Non-platform stdio entries (anything not shizuha-*, or a shizuha-* stdio
+  // entry that is not the known proxy-launcher shape) still pass through
+  // untouched — the gateway-mcp block leaves those alone too.
+  const upstreams: Array<{ name: string; url: string; headers: Record<string, string>; command?: string; args?: string[]; env?: Record<string, string> }> = [];
+  for (const s of configs) {
+    if (!s.name.startsWith('shizuha-')) continue;
+    if (s.transport !== 'stdio') {
+      if (s.url) upstreams.push({ name: s.name, url: s.url, headers: { ...(s.headers ?? {}) } });
+      continue;
+    }
+    const proxyForm = parseStdioProxyEntry(s as MCPServerConfig & { transport: 'stdio' }, opts.launcher);
+    if (proxyForm) {
+      upstreams.push({ name: s.name, url: proxyForm.url, headers: { ...(s.headers ?? {}) }, command: s.command, args: s.args, env: s.env });
+    }
+  }
   if (upstreams.length === 0) return { configs, collapsed };
 
-  const services: Array<{ name: string; url: string; headers: Record<string, string> }> = [];
-  let seedBearer = '';
-  let organizationId = '';
+  // san review scope (PLAT-4013 round 2): collapse is valid ONLY when the
+  // entries are credential- and scope-homogeneous. Divergent per-entry env,
+  // auth, or org values cannot be represented by ONE multiplexer process —
+  // silently unifying them would route one credential to another service's
+  // upstream. Fail closed: pass the config through untouched so per-service
+  // identity is preserved exactly.
+  const seedBearers = new Set<string>();
+  const orgIds = new Set<string>();
+  const bearerFiles = new Set<string>();
   for (const s of upstreams) {
-    const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries(s.headers ?? {})) {
+    for (const [k, v] of Object.entries(s.headers)) {
       if (typeof v !== 'string') continue;
       const key = k.toLowerCase();
-      if (key === 'x-organization-id' && v.trim()) {
-        headers['X-Organization-ID'] = v;
-        if (!organizationId) organizationId = v.trim();
-      } else if (key === 'authorization' && !seedBearer) {
-        seedBearer = v.replace(/^Bearer\s+/i, '').trim();
-      }
+      if (key === 'x-organization-id' && v.trim()) orgIds.add(v.trim());
+      else if (key === 'authorization' && v.replace(/^Bearer\s+/i, '').trim()) seedBearers.add(v.replace(/^Bearer\s+/i, '').trim());
+    }
+    const envBearer = s.env?.['MCP_UPSTREAM_BEARER'];
+    if (typeof envBearer === 'string' && envBearer.trim()) seedBearers.add(envBearer.trim());
+    const envFile = s.env?.['MCP_UPSTREAM_BEARER_FILE'];
+    if (typeof envFile === 'string' && envFile.trim()) bearerFiles.add(envFile.trim());
+    const envOrg = s.env?.['MCP_UPSTREAM_ORG'];
+    if (typeof envOrg === 'string' && envOrg.trim()) orgIds.add(envOrg.trim());
+  }
+  if (seedBearers.size > 1 || orgIds.size > 1 || bearerFiles.size > 1) {
+    return { configs, collapsed };
+  }
+  const seedBearer = [...seedBearers][0] ?? '';
+  const organizationId = [...orgIds][0] ?? '';
+  const entryBearerFile = [...bearerFiles][0] ?? '';
+
+  const services: Array<{ name: string; url: string; headers: Record<string, string> }> = [];
+  for (const s of upstreams) {
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(s.headers)) {
+      if (typeof v !== 'string') continue;
+      const key = k.toLowerCase();
+      if (key === 'x-organization-id' && v.trim()) headers['X-Organization-ID'] = v;
     }
     services.push({ name: s.name.slice('shizuha-'.length), url: s.url, headers });
   }
@@ -385,6 +427,7 @@ export function collapsePlatformMcpToMultiplexer(
     args: [...opts.launcher.prefixArgs, 'mcp-multiplexer', '--services', JSON.stringify(services)],
     env: {
       ...(seedBearer ? { MCP_UPSTREAM_BEARER: seedBearer } : {}),
+      ...(entryBearerFile ? { MCP_UPSTREAM_BEARER_FILE: entryBearerFile } : {}),
       ...(opts.bearerFile ? { MCP_UPSTREAM_BEARER_FILE: opts.bearerFile } : {}),
       ...(organizationId ? { MCP_UPSTREAM_ORG: organizationId } : {}),
     },
@@ -395,6 +438,31 @@ export function collapsePlatformMcpToMultiplexer(
     configs: [...configs.filter((s) => !collapsedNames.has(s.name)), multiplexerEntry],
     collapsed: [...collapsedNames],
   };
+}
+
+/**
+ * PLAT-4013: recognize the PLAT-504 stdio-proxy form of a shizuha-* entry:
+ * command === the proxy launcher and args === [...prefixArgs, 'mcp-proxy',
+ * '--name', <svc>, '--upstream-url', <url>]. Returns the upstream URL (and
+ * service sanity) or null when the entry is not that shape — anything else
+ * passes through untouched.
+ */
+function parseStdioProxyEntry(
+  s: MCPServerConfig & { transport: 'stdio' },
+  launcher: { command: string; prefixArgs: string[] },
+): { url: string } | null {
+  if (s.command !== launcher.command) return null;
+  const args = s.args ?? [];
+  if (args.length !== launcher.prefixArgs.length + 5) return null;
+  for (let i = 0; i < launcher.prefixArgs.length; i++) {
+    if (args[i] !== launcher.prefixArgs[i]) return null;
+  }
+  const rest = args.slice(launcher.prefixArgs.length);
+  if (rest[0] !== 'mcp-proxy' || rest[1] !== '--name' || rest[3] !== '--upstream-url') return null;
+  const expectedName = `shizuha-${rest[2]}`;
+  if (s.name !== expectedName) return null;
+  const url = rest[4];
+  return typeof url === 'string' && url.trim() ? { url } : null;
 }
 
 /** User-facing copy for a failed provider turn; raw diagnostics stay in logs/hooks. */
