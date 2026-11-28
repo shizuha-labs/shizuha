@@ -963,4 +963,36 @@ describe('recovery_action v1 policy', () => {
       hash: '0123456789abcdef'.repeat(4),
     });
   });
+
+  it('echoes correlation identity verbatim in the result frame (PLAT-7626)', async () => {
+    // The live round trip dropped every result: baseResult ran the identity
+    // fields through the secret sanitizer, whose HIGH_ENTROPY_RE matches
+    // 36-char dashed UUIDs, so Hive received action_id='[redacted-secret]'
+    // and logged "recovery_result for unknown action — dropping". The
+    // identity fields must survive verbatim; payload material stays scoped.
+    const actionId = '59907469-db8a-45a9-a35c-528936a6fb85';
+    const correlationId = '164b72bc-0a64-4ec6-9e09-42f2f8ae3115';
+    const result = await executeRecoveryAction(
+      recoveryFrame({ action_id: actionId, correlation_id: correlationId }),
+      recoveryDeps(),
+    );
+    expect(result.action_id).toBe(actionId);
+    expect(result.correlation_id).toBe(correlationId);
+    expect(result.action_id).not.toBe('[redacted-secret]');
+    // Payload material remains sanitized even when it looks secret-like.
+    const secretish = await executeRecoveryAction(
+      recoveryFrame({
+        action_id: actionId,
+        correlation_id: correlationId,
+        params: { note: 'ghp_abcdefghijklmnopqrstuvwxyz0123456789' },
+      }),
+      recoveryDeps(),
+    );
+    const summaries = JSON.stringify({
+      before: secretish.before_summary,
+      after: secretish.after_summary,
+      reason: secretish.reason,
+    });
+    expect(summaries).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+  });
 });
