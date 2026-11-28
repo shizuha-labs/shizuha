@@ -115,10 +115,19 @@ function safeEcho(value: unknown): string {
 function baseResult(frame: RecoveryActionFrame): RecoveryResultFrame {
   return {
     type: 'recovery_result',
-    action_id: safeEcho(frame.action_id),
-    correlation_id: safeEcho(frame.correlation_id),
-    action_type: safeEcho(frame.action_type),
-    mode: safeEcho(frame.mode || 'dry_run'),
+    // Identity fields are server-generated correlation identity (UUIDs and
+    // frame-controlled enums) from the authenticated frame — the contract is
+    // to echo them verbatim so Hive can match the result to its action row.
+    // They must NOT run through the secret sanitizer: HIGH_ENTROPY_RE
+    // (^[A-Za-z0-9_+/=-]{32,}$) matches 36-char dashed UUIDs and the
+    // pure-hex exemption does not, so sanitizing here redacted every
+    // action_id/correlation_id to '[redacted-secret]' and Hive dropped every
+    // result as "unknown action" (PLAT-7626 live round-trip, 2026-09-16).
+    // The sanitizer stays scoped to payload material (reason, summaries).
+    action_id: String(frame.action_id ?? '').trim(),
+    correlation_id: String(frame.correlation_id ?? '').trim(),
+    action_type: String(frame.action_type ?? '').trim(),
+    mode: String(frame.mode || 'dry_run').trim(),
     result: 'failed',
     reason: '',
     before_summary: {},
